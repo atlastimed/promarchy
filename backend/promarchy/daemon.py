@@ -19,6 +19,7 @@ import fcntl
 import json
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -38,6 +39,7 @@ from .store import SessionStore, StoreUnavailable
 STAMP_CHECK_SECONDS = 5
 LOCK_WAIT_SECONDS = 15
 MAX_BACKOFF = 300
+STORE_RETRY_MAX = 120
 
 
 def _clamp(value: Any, low: int, high: int, default: int) -> int:
@@ -89,7 +91,7 @@ class Account:
     status: str = "starting"  # starting | ok | offline | error | auth-expired
     error: str = ""
     failures: int = 0
-    next_poll: float = 0.0
+    next_poll: float = 0.0  # on the monotonic clock
     extra: dict = field(default_factory=dict)
 
 
@@ -103,6 +105,7 @@ class Daemon:
         watermarks: Watermarks | None = None,
         avatars: Avatars | None = None,
         clock: Callable[[], float] = time.time,
+        mono: Callable[[], float] = time.monotonic,
         client_factory: Callable[..., ProtonClient] = ProtonClient,
         state_path: str | None = None,
     ) -> None:
@@ -111,7 +114,10 @@ class Daemon:
         self.notifier = notifier or Notifier()
         self.watermarks = watermarks or Watermarks()
         self.avatars = avatars or Avatars()
+        # Wall clock for mail timestamps and window ages; monotonic clock for
+        # scheduling, so a clock correction cannot stall polling.
         self.clock = clock
+        self.mono = mono
         self.client_factory = client_factory
         self.state_path = state_path
         self.config = Config()
@@ -119,6 +125,10 @@ class Daemon:
         self.commands: queue.Queue[dict] = queue.Queue()
         self.generation: int | None = None
         self.store_error = ""
+        self.store_failures = 0
+        self.store_retry_at = 0.0
+        self.missing: set[str] = set()  # in the index, but no session in the keyring
+        self.unsaved: dict[str, Session] = {}  # rotated tokens not yet persisted
         self.configured = False
         self.stopping = False
         self._last_payload = ""
@@ -135,6 +145,9 @@ class Daemon:
             )
             return 3
         threading.Thread(target=self._read_commands, args=(stdin or sys.stdin,), daemon=True).start()
+        # The shell stops us with SIGTERM; finish the current step (a token
+        # refresh must be persisted) and leave through the normal path.
+        signal.signal(signal.SIGTERM, lambda *_: self.commands.put({"cmd": "quit"}))
         try:
             self._sync_accounts()
             self.emit(force=True)
@@ -147,6 +160,7 @@ class Daemon:
                     break
                 self._drain(timeout=self._sleep_for())
         finally:
+            self._persist_unsaved()
             for account in self.accounts.values():
                 account.client.close()
             os.close(lock_fd)
@@ -157,8 +171,9 @@ class Daemon:
             self.emit(force=self._force_emit)
             self._force_emit = False
             return
+        self._persist_unsaved()
         self._sync_accounts()
-        now = self.clock()
+        now = self.mono()
         for account in list(self.accounts.values()):
             if account.next_poll <= now:
                 try:
@@ -172,14 +187,14 @@ class Daemon:
         self._force_emit = False
 
     def _sleep_for(self) -> float:
-        now = self.clock()
-        wake = now + STAMP_CHECK_SECONDS
+        mono, wall = self.mono(), self.clock()
+        delay = float(STAMP_CHECK_SECONDS)
         for account in self.accounts.values():
-            wake = min(wake, account.next_poll)
-            boundary = account.mailbox.next_boundary(int(now)) if account.mailbox.synced else None
+            delay = min(delay, account.next_poll - mono)
+            boundary = account.mailbox.next_boundary(int(wall)) if account.mailbox.synced else None
             if boundary is not None:
-                wake = min(wake, boundary)
-        return max(0.05, wake - now)
+                delay = min(delay, boundary - wall)
+        return max(0.05, delay)
 
     # ------------------------------------------------------------- commands
 
@@ -204,7 +219,10 @@ class Daemon:
         except queue.Empty:
             return
         while True:
-            self.handle(command)
+            try:
+                self.handle(command)
+            except Exception:  # a bad command or a bug must not end the session
+                traceback.print_exc(file=sys.stderr)
             try:
                 command = self.commands.get_nowait()
             except queue.Empty:
@@ -240,7 +258,7 @@ class Daemon:
                 account.next_poll = 0
                 account.extra["force"] = True
             elif config.poll_seconds < old.poll_seconds:
-                account.next_poll = min(account.next_poll, self.clock() + config.poll_seconds)
+                account.next_poll = min(account.next_poll, self.mono() + config.poll_seconds)
 
     def _mark_read(self, email: str, ids: list[Any]) -> None:
         account = self.accounts.get(email)
@@ -251,6 +269,9 @@ class Daemon:
             self._after_sync(account)
         except ProtonError as exc:
             self._record_failure(account, exc)
+        except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
+            self._record_failure(account, ProtonError(f"Internal error: {exc.__class__.__name__}"))
         self.emit()
 
     # -------------------------------------------------------------- accounts
@@ -259,39 +280,55 @@ class Daemon:
         generation = self.store.generation()
         if generation == self.generation:
             return
-        self.generation = generation
+        if self.store_error and self.mono() < self.store_retry_at:
+            return
         emails = self.store.accounts()
         for email in list(self.accounts):
             if email not in emails:
                 self.accounts.pop(email).client.close()
+                self.unsaved.pop(email, None)
                 self.watermarks.forget(email)
-        self.store_error = ""
+        missing: set[str] = set()
         for email in emails:
             try:
                 session = self.store.load(email)
-            except StoreUnavailable as exc:
-                self.store_error = str(exc)
-                return
-            except Exception as exc:  # keyring backends raise their own types
-                self.store_error = f"Could not read the keyring: {exc.__class__.__name__}"
+            except Exception as exc:  # keyring locked, not up yet, D-Bus hiccup
+                self._store_failed(exc)
                 return
             current = self.accounts.get(email)
             if session is None:
-                if current:
-                    self.accounts.pop(email).client.close()
+                # Keep a running account: a dismissed unlock prompt looks the
+                # same as a missing item, and we still hold working tokens.
+                if current is None:
+                    missing.add(email)
                 continue
             if current and current.client.session and current.client.session.uid == session.uid:
                 continue
             if current:
                 current.client.close()
+            self.unsaved.pop(email, None)
             self.accounts[email] = self._make_account(email, session)
+        self.generation = generation
+        self.store_error = ""
+        self.store_failures = 0
+        self.missing = missing
+
+    def _store_failed(self, exc: Exception) -> None:
+        """Remember the failure and try again later instead of giving up."""
+        self.generation = None
+        self.store_failures += 1
+        self.store_retry_at = self.mono() + min(STORE_RETRY_MAX, 5 * 2 ** min(self.store_failures, 5))
+        if isinstance(exc, StoreUnavailable):
+            self.store_error = str(exc)
+        else:
+            self.store_error = f"Could not read the keyring: {exc.__class__.__name__}"
 
     def _make_account(self, email: str, session: Session) -> Account:
         def persist(updated: Session) -> None:
-            try:
-                self.store.save(updated, announce=False)
-            except Exception as exc:  # never lose the in-memory session over this
-                print(f"promarchy: could not save rotated tokens: {exc.__class__.__name__}", file=sys.stderr)
+            # Refresh tokens are single-use: until this lands in the keyring,
+            # a restart would sign the account out. Retried every tick.
+            self.unsaved[email] = updated
+            self._persist_unsaved()
 
         client = self.client_factory(session, on_refresh=persist)
         mailbox = Mailbox(
@@ -303,6 +340,17 @@ class Daemon:
             clock=self.clock,
         )
         return Account(email=email, client=client, mailbox=mailbox)
+
+    def _persist_unsaved(self) -> None:
+        for email, session in list(self.unsaved.items()):
+            try:
+                self.store.update_tokens(session)
+            except Exception as exc:
+                print(f"promarchy: could not save rotated tokens: {exc.__class__.__name__}", file=sys.stderr)
+                continue
+            # Saved, or deliberately skipped because the account was signed
+            # out or replaced by a newer sign-in meanwhile.
+            self.unsaved.pop(email, None)
 
     # ------------------------------------------------------------------ poll
 
@@ -324,12 +372,12 @@ class Daemon:
         account.status = "ok"
         account.error = ""
         account.failures = 0
-        account.next_poll = self.clock() + self.config.poll_seconds
+        account.next_poll = self.mono() + self.config.poll_seconds
         if changed:
             self._after_sync(account)
 
     def _record_failure(self, account: Account, exc: ProtonError) -> None:
-        now = self.clock()
+        now = self.mono()
         account.error = str(exc)
         if isinstance(exc, AuthExpired):
             account.status = "auth-expired"
@@ -350,7 +398,10 @@ class Daemon:
         if self.config.notify and new:
             urls = {m["id"]: mailbox.web_url(m) for m in new}
             self.notifier.announce(new, urls, mailbox.web_url())
-        self.watermarks.set(account.email, mark)
+        try:
+            self.watermarks.set(account.email, mark)
+        except OSError:
+            traceback.print_exc(file=sys.stderr)
         if self.config.sender_images and mailbox.recent:
             self.emit()  # show the list now; logos follow
             try:
@@ -405,8 +456,10 @@ class Daemon:
         }
 
     def _overall_status(self, accounts: list[dict], synced_any: bool) -> tuple[str, str]:
-        if self.store_error:
+        if self.store_error and not accounts:
             return "error", self.store_error
+        if not accounts and self.missing:
+            return "auth-expired", f"No saved session for {sorted(self.missing)[0]}. Sign in again."
         if not accounts:
             return "signed-out", self._last_login_failure() or "Sign in to see your mail"
         statuses = {a["status"] for a in accounts}

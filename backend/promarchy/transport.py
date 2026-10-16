@@ -14,6 +14,7 @@ import json as jsonlib
 import os
 import ssl
 import time
+import zlib
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
@@ -85,7 +86,10 @@ class HttpTransport:
                 if len(content) > MAX_BODY:
                     raise TransportError("response too large")
                 if resp.getheader("Content-Encoding", "").lower() == "gzip":
-                    content = gzip.decompress(content)
+                    try:
+                        content = gzip.decompress(content)
+                    except (OSError, EOFError, zlib.error) as exc:
+                        raise TransportError("Proton sent a corrupt response") from exc
                 header_map = {k.lower(): v for k, v in resp.getheaders()}
                 if resp.will_close:
                     self.close()

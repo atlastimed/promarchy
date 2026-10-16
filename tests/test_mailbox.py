@@ -256,3 +256,28 @@ def test_summarize_cleans_untrusted_text():
 def test_group_threads_respects_limit():
     rows = [summarize({"ID": f"m{i}", "ConversationID": f"c{i}", "Time": 100 - i}, "me") for i in range(5)]
     assert len(group_threads(rows, 3)) == 3
+
+
+def test_failed_resync_is_retried_on_the_next_poll():
+    api = FakeProton()
+    box = make(api)
+    box.full_sync()
+    new = api.add(5)
+    api.queue_event(Messages=[{"ID": new["ID"], "Action": 1, "Message": {"LabelIDs": ["0"]}}])
+    real_call = api.call
+
+    def failing_list(method, path, **kw):
+        if path == "/mail/v4/messages":
+            raise NetworkError("timeout")
+        return real_call(method, path, **kw)
+
+    api.call = failing_list
+    try:
+        box.poll()
+    except NetworkError:
+        pass
+    api.call = real_call
+    assert box.dirty is True
+    assert box.poll() is True  # no new event, but the owed resync happens
+    assert box.counts(NOW)["1h"] == 1
+    assert box.dirty is False

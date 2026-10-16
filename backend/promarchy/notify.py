@@ -2,8 +2,10 @@
 
 Notifications go through ``omarchy-notification-send`` so they look and behave
 like every other Omarchy toast (theme, Do Not Disturb, history), and a click
-opens the message. The command takes the click action as discrete argv words,
-so sender names and subjects can never be interpreted as options or commands.
+opens the message. Everything is passed as discrete argv words (never through
+a shell), and because that script keeps parsing options until the first
+unknown word, any sender name or subject starting with "-" has its first dash
+swapped for a look-alike hyphen so it can never become an option.
 """
 
 from __future__ import annotations
@@ -12,7 +14,6 @@ import json
 import os
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 from .paths import state_dir
@@ -99,6 +100,7 @@ class Notifier:
             )
 
     def _toast(self, title: str, body: str, url: str) -> None:
+        title, body = defang(title), defang(body)
         if self._send:
             argv = [self._send, "--app-name", "Proton Mail", "-u", "normal", "-g", GLYPH]
             if self.icon:
@@ -121,5 +123,6 @@ class Notifier:
             pass
 
 
-def now() -> int:
-    return int(time.time())
+def defang(text: str) -> str:
+    """Make sure untrusted text cannot be parsed as a command-line option."""
+    return "\u2010" + text[1:] if text.startswith("-") else text

@@ -60,7 +60,7 @@ def test_toast_argv_keeps_untrusted_text_as_data(monkeypatch):
     argv = calls[0]
     assert argv[0] == "/usr/bin/omarchy-notification-send"
     exec_at = argv.index("--exec")
-    assert argv[exec_at - 2 : exec_at] == ["--exec rm", "$(reboot)"]
+    assert argv[exec_at - 2 : exec_at] == ["\u2010-exec rm", "$(reboot)"]
     assert argv[exec_at + 1 :] == ["omarchy-launch-browser", "https://mail.proton.me/inbox/c/a"]
 
 
@@ -73,3 +73,18 @@ def test_burst_collapses_into_one_summary(monkeypatch):
     assert len(calls) == 1
     assert "8 new messages" in calls[0]
     assert calls[0][-1] == "https://mail.proton.me/inbox"
+
+
+def test_flag_shaped_sender_and_subject_cannot_become_options(monkeypatch):
+    calls = []
+    monkeypatch.setattr(notify.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: calls.append(argv))
+    Notifier().announce(
+        [msg("a", 5, sender="--urgency=critical", subject="-r 5")], {"a": "https://mail.proton.me/x"}, "inbox"
+    )
+    argv = calls[0]
+    exec_at = argv.index("--exec")
+    title, body = argv[exec_at - 2 : exec_at]
+    assert not title.startswith("-") and not body.startswith("-")
+    assert title.endswith("-urgency=critical") and body.endswith("r 5")
+    assert "--urgency=critical" not in argv

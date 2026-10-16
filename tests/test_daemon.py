@@ -10,7 +10,7 @@ from promarchy.api import AuthExpired, NetworkError, Session
 from promarchy.avatars import Avatars
 from promarchy.daemon import Config, Daemon
 from promarchy.notify import Watermarks
-from promarchy.store import SessionStore
+from promarchy.store import SessionStore, StoreUnavailable
 
 
 class RecordingNotifier:
@@ -32,6 +32,7 @@ def env(tmp_path):
 
     def factory(session, on_refresh=None):
         api.session = session
+        api.on_refresh = on_refresh
         return api
 
     daemon = Daemon(
@@ -41,6 +42,7 @@ def env(tmp_path):
         watermarks=Watermarks(tmp_path / "notified.json"),
         avatars=Avatars(root=tmp_path / "logos"),
         clock=clock,
+        mono=clock,
         client_factory=factory,
         state_path=str(tmp_path / "state.json"),
     )
@@ -243,3 +245,166 @@ def test_demo_mode_needs_no_account_or_network(env):
     assert state["status"] == "ok"
     assert len(state["messages"]) == 5
     assert env.api.calls == []
+
+
+class FlakyStore(SessionStore):
+    """A store whose keyring reads can be made to fail."""
+
+    fail = False
+    hide = False
+
+    def load(self, email):
+        if self.fail:
+            raise StoreUnavailable("keyring locked")
+        if self.hide:
+            return None
+        return super().load(email)
+
+
+def make_daemon(env, store):
+    def factory(session, on_refresh=None):
+        env.api.session = session
+        env.api.on_refresh = on_refresh
+        return env.api
+
+    return Daemon(
+        store,
+        out=env.out,
+        notifier=env.notifier,
+        watermarks=Watermarks(env.tmp / "n2.json"),
+        avatars=Avatars(root=env.tmp / "logos2"),
+        clock=env.clock,
+        mono=env.clock,
+        client_factory=factory,
+        state_path=str(env.tmp / "state2.json"),
+    )
+
+
+def test_keyring_failure_is_retried(env):
+    store = FlakyStore(secrets=MemorySecrets(), root=env.tmp / "flaky")
+    (env.tmp / "flaky").mkdir()
+    store.save(Session(uid="u", access_token="a", refresh_token="r", email="me@proton.me"))
+    daemon = make_daemon(env, store)
+    store.fail = True
+    daemon.tick()
+    assert env.states()[-1]["status"] == "error"
+    store.fail = False
+    daemon.tick()  # still inside the backoff window
+    assert env.states()[-1]["status"] == "error"
+    env.clock.advance(15)
+    daemon.tick()
+    assert env.states()[-1]["status"] == "ok"
+
+
+def test_empty_keyring_answer_keeps_a_running_account(env):
+    store = FlakyStore(secrets=MemorySecrets(), root=env.tmp / "flaky")
+    (env.tmp / "flaky").mkdir()
+    store.save(Session(uid="u", access_token="a", refresh_token="r", email="me@proton.me"))
+    daemon = make_daemon(env, store)
+    daemon.tick()
+    assert env.states()[-1]["status"] == "ok"
+    store.hide = True  # e.g. a dismissed unlock prompt
+    store.save(Session(uid="u", access_token="a", refresh_token="r", email="other@proton.me"))
+    daemon.tick()
+    assert "me@proton.me" in daemon.accounts
+    assert env.states()[-1]["status"] == "ok"
+
+
+def test_missing_session_asks_to_sign_in_again(env):
+    store = FlakyStore(secrets=MemorySecrets(), root=env.tmp / "flaky")
+    (env.tmp / "flaky").mkdir()
+    store.save(Session(uid="u", access_token="a", refresh_token="r", email="me@proton.me"))
+    store.hide = True
+    daemon = make_daemon(env, store)
+    daemon.tick()
+    state = env.states()[-1]
+    assert state["status"] == "auth-expired"
+    assert "me@proton.me" in state["message"]
+
+
+def test_rotated_tokens_are_saved_and_retried(env, monkeypatch):
+    env.sign_in()
+    env.daemon.tick()
+    rotated = Session(uid="uid-me@proton.me", access_token="a2", refresh_token="r2", email="me@proton.me")
+    calls = {"n": 0}
+    real = env.store.update_tokens
+
+    def flaky(session):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StoreUnavailable("keyring busy")
+        return real(session)
+
+    monkeypatch.setattr(env.store, "update_tokens", flaky)
+    env.daemon.unsaved["me@proton.me"] = rotated  # what the on_refresh callback records
+    env.daemon._persist_unsaved()
+    assert "me@proton.me" in env.daemon.unsaved  # first save failed, kept for retry
+    env.daemon.tick()
+    assert env.daemon.unsaved == {}
+    assert env.store.load("me@proton.me").refresh_token == "r2"
+
+
+def test_rotation_does_not_resurrect_a_signed_out_account(env):
+    env.sign_in()
+    env.daemon.tick()
+    env.store.remove("me@proton.me")
+    stale = Session(uid="uid-me@proton.me", access_token="a2", refresh_token="r2", email="me@proton.me")
+    assert env.store.update_tokens(stale) is False
+    assert env.store.accounts() == []
+
+
+def test_rotation_does_not_clobber_a_newer_sign_in(env):
+    env.sign_in()
+    env.store.save(Session(uid="newer", access_token="n", refresh_token="nr", email="me@proton.me"))
+    stale = Session(uid="uid-me@proton.me", access_token="a2", refresh_token="r2", email="me@proton.me")
+    assert env.store.update_tokens(stale) is False
+    assert env.store.load("me@proton.me").uid == "newer"
+
+
+def test_bad_command_does_not_stop_the_daemon(env, monkeypatch):
+    env.sign_in()
+    env.daemon.tick()
+
+    def boom(*a, **kw):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(env.daemon, "_mark_read", boom)
+    env.daemon.commands.put({"cmd": "markRead", "account": "me@proton.me", "ids": ["x"]})
+    env.daemon._drain(timeout=0.01)
+    assert env.daemon.stopping is False
+
+
+def test_mark_read_internal_error_is_contained(env, monkeypatch):
+    env.sign_in()
+    env.daemon.tick()
+
+    def boom(ids):
+        raise ValueError("unexpected")
+
+    monkeypatch.setattr(env.daemon.accounts["me@proton.me"].mailbox, "mark_read", boom)
+    env.daemon.handle({"cmd": "markRead", "account": "me@proton.me", "ids": ["x"]})
+    assert env.daemon.accounts["me@proton.me"].status == "error"
+
+
+def test_wall_clock_jumping_back_does_not_stall_polling(env):
+    wall = Clock()
+    env.daemon.clock = wall
+    env.sign_in()
+    env.daemon.tick()
+    calls = len(env.api.calls)
+    wall.advance(-3600)  # NTP correction at boot
+    env.clock.advance(31)  # monotonic time moves on
+    env.daemon.tick()
+    assert len(env.api.calls) > calls
+
+
+def test_token_rotation_reaches_the_keyring(env):
+    env.sign_in()
+    env.daemon.tick()
+    generation = env.store.generation()
+    session = env.api.session
+    session.access_token, session.refresh_token = "a2", "r2"
+    env.api.on_refresh(session)  # what ProtonClient.refresh() calls
+    assert env.store.load("me@proton.me").refresh_token == "r2"
+    assert env.daemon.unsaved == {}
+    assert env.store.generation() == generation  # not mistaken for a new sign-in

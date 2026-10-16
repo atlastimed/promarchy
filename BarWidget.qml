@@ -15,6 +15,8 @@ Panel {
 
   readonly property string pluginId: "atlastimed.promarchy"
   property var mail: null
+  // Panel (unlike BarWidget) does not define these.
+  readonly property bool vertical: bar ? bar.vertical : false
 
   // ---- settings ------------------------------------------------------------
   function flag(name, fallback) {

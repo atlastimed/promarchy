@@ -133,7 +133,11 @@ def _login(username: str | None) -> str:
         previous = store.load(email)
     except Exception:
         previous = None
-    store.save(pending.session)
+    try:
+        store.save(pending.session)
+    except Exception as exc:
+        logout(client)  # do not leave an unreachable session behind on Proton's side
+        raise LoginFailed(f"Signed in, but could not save the session to your keyring: {exc}") from exc
     if previous and previous.uid != pending.session.uid:
         logout(ProtonClient(previous))  # revoke the session we just replaced
     return email

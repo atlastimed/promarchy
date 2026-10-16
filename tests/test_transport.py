@@ -151,3 +151,9 @@ def test_no_proxy_is_honoured(monkeypatch):
     FakeConnection.script = [FakeResponse()]
     HttpTransport().request("GET", "https://mail-api.proton.me/a")
     assert FakeConnection.instances[0].tunnel is None
+
+
+def test_corrupt_gzip_is_a_transport_error():
+    FakeConnection.script = [FakeResponse(body=b"not gzip", headers=[("Content-Encoding", "gzip")])] * 2
+    with pytest.raises(TransportError, match="corrupt"):
+        HttpTransport().request("GET", "https://mail-api.proton.me/a")

@@ -154,6 +154,22 @@ class SessionStore:
             if announce:
                 self._bump()
 
+    def update_tokens(self, session: Session) -> bool:
+        """Persist rotated tokens, but only onto the same live session.
+
+        A sign-out or a fresh sign-in from the terminal may have happened
+        while the daemon was refreshing; writing then would resurrect the
+        account or clobber the newer session. Returns True when written.
+        """
+        with self._locked():
+            if session.email not in self.accounts():
+                return False
+            stored = self.load(session.email)
+            if stored is not None and stored.uid != session.uid:
+                return False
+            self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
+            return True
+
     def remove(self, email: str) -> None:
         with self._locked():
             self.secrets.delete(_key(email))

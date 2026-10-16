@@ -29,6 +29,9 @@ Item {
     return decodeURIComponent(url.replace(/^file:\/\//, "")).replace(/\/$/, "")
   }
   readonly property string backend: pluginDir + "/backend/promarchyctl"
+  // The system interpreter, not whatever is first on PATH: a mise-managed
+  // python would lack python-proton-core.
+  readonly property string python: "/usr/bin/python3"
   readonly property string iconPath: pluginDir + "/assets/promarchy.svg"
 
   property var _settings: null
@@ -88,13 +91,13 @@ Item {
   function signIn() {
     Quickshell.execDetached([
       "uwsm-app", "--", "xdg-terminal-exec",
-      "--app-id=org.omarchy.terminal", "--title=Proton Mail sign-in",
-      "-e", "python3", "-I", backend, "login", "--wait"
+      "--app-id=org.omarchy.terminal", "--title=Promarchy sign-in",
+      "-e", python, "-I", backend, "login", "--wait"
     ])
   }
 
   function signOut() {
-    Quickshell.execDetached(["python3", "-I", backend, "logout", "--all"])
+    Quickshell.execDetached([python, "-I", backend, "logout", "--all"])
   }
 
   function ingest(line) {
@@ -119,7 +122,7 @@ Item {
 
   Process {
     id: daemon
-    command: ["python3", "-I", root.backend, "daemon", "--icon", root.iconPath]
+    command: [root.python, "-I", root.backend, "daemon", "--icon", root.iconPath]
     stdinEnabled: true
     stdout: SplitParser {
       onRead: function(line) { root.ingest(line) }

@@ -148,6 +148,9 @@ class Mailbox:
         self.recent: list[dict] = []
         self.fresh: list[dict] = []  # newest unread (matching filters), for notifications
         self.synced = False
+        # Set while a resync is owed. The event cursor moves before we re-read,
+        # so a failed re-read must be retried even if no new event arrives.
+        self.dirty = False
 
     # ------------------------------------------------------------ settings
 
@@ -167,18 +170,20 @@ class Mailbox:
         self.resync()
 
     def resync(self) -> None:
+        self.dirty = True
         now = int(self.clock())
         self._sync_unread_window(now)
         self._sync_recent()
         self._sync_totals()
         self.synced = True
+        self.dirty = False
 
     def poll(self) -> bool:
         """Advance the event cursor. True when state was re-read."""
         if self.event_id is None or not self.synced:
             self.full_sync()
             return True
-        relevant = False
+        relevant = self.dirty
         for _ in range(MAX_EVENT_PAGES):
             try:
                 event = self.client.call("GET", f"/core/v4/events/{self.event_id}")
@@ -192,6 +197,7 @@ class Mailbox:
             self.event_id = str(event.get("EventID") or self.event_id)
             if event.get("Refresh") or self.event_is_relevant(event):
                 relevant = True
+                self.dirty = True
             if not event.get("More"):
                 break
         if relevant:
