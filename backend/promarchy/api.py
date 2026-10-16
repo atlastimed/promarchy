@@ -12,9 +12,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-import requests
-
 from . import __version__
+from .transport import HttpTransport, Response, TransportError
 
 API_BASE = "https://mail-api.proton.me"
 
@@ -25,7 +24,7 @@ API_BASE = "https://mail-api.proton.me"
 APP_VERSION = "Other"
 USER_AGENT = f"Promarchy/{__version__} (Linux; Omarchy)"
 
-TIMEOUT = (10, 20)  # (connect, read) seconds; the daemon must never hang.
+TIMEOUT = 20  # seconds per socket operation; the daemon must never hang.
 
 CODE_OK = (1000, 1001)
 CODE_WRONG_CREDENTIALS = 8002
@@ -106,7 +105,7 @@ class Session:
 
 
 class ProtonClient:
-    """Thin wrapper over ``requests`` that knows Proton's auth conventions.
+    """Thin HTTPS client that knows Proton's auth conventions.
 
     ``on_refresh`` is called with the session right after its tokens rotate.
     Refresh tokens are single-use, so the caller must persist the new pair
@@ -119,12 +118,12 @@ class ProtonClient:
         *,
         on_refresh: Callable[[Session], None] | None = None,
         base: str = API_BASE,
-        http: requests.Session | None = None,
+        http: HttpTransport | None = None,
     ) -> None:
         self.session = session
         self.base = base.rstrip("/")
         self._on_refresh = on_refresh
-        self._http = http or requests.Session()
+        self._http = http or HttpTransport(timeout=TIMEOUT)
         self._http.headers.update(
             {
                 "x-pm-appversion": APP_VERSION,
@@ -207,7 +206,7 @@ class ProtonClient:
 
     # --------------------------------------------------------------- helpers
 
-    def _send(self, method, path, *, params, body, auth, headers) -> requests.Response:
+    def _send(self, method, path, *, params, body, auth, headers) -> Response:
         request_headers: dict[str, str] = {}
         if auth and self.session:
             request_headers["x-pm-uid"] = self.session.uid
@@ -223,11 +222,11 @@ class ProtonClient:
                 headers=request_headers,
                 timeout=TIMEOUT,
             )
-        except requests.RequestException as exc:
-            raise NetworkError(_describe_network_error(exc)) from exc
+        except (TransportError, OSError) as exc:
+            raise NetworkError(str(exc) or "Cannot reach Proton") from exc
 
     @staticmethod
-    def _parse(resp: requests.Response) -> dict:
+    def _parse(resp: Response) -> dict:
         status = resp.status_code
         try:
             payload = resp.json()
@@ -256,20 +255,12 @@ class ProtonClient:
         return payload
 
 
-def _retry_after(resp: requests.Response) -> int:
+def _retry_after(resp: Response) -> int:
     value = resp.headers.get("retry-after", "")
     try:
         return max(5, min(int(value), 3600))
     except ValueError:
         return 60
-
-
-def _describe_network_error(exc: Exception) -> str:
-    if isinstance(exc, requests.Timeout):
-        return "Proton did not respond in time"
-    if isinstance(exc, requests.ConnectionError):
-        return "Cannot reach Proton (offline?)"
-    return f"Network error: {exc.__class__.__name__}"
 
 
 def now() -> int:

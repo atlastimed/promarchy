@@ -311,8 +311,10 @@ class Mailbox:
             self.recent = []
             return
         fetch = min(100, self.recent_limit * (3 if self.threads else 1))
+        # PageSize is exact; Limit is floored at 50 by the API.
         params = label_params(self.categories) + [
-            ("Limit", str(fetch)),
+            ("Page", "0"),
+            ("PageSize", str(fetch)),
             ("Sort", "Time"),
             ("Desc", "1"),
         ]

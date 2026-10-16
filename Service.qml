@@ -79,7 +79,7 @@ Item {
   }
 
   function compose(openWith) {
-    openUrl("https://mail.proton.me/inbox#mailto=mailto%3A", openWith)
+    openUrl("https://mail.proton.me/inbox/#mailto=mailto%3A", openWith)
   }
 
   // Sign-in is interactive (password, 2FA, maybe a CAPTCHA), so it runs in

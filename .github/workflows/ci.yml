@@ -17,7 +17,7 @@ jobs:
       - name: Install toolchain
         run: >
           pacman -Syu --noconfirm --needed
-          git jq nodejs python python-requests python-keyring python-proton-core
+          git jq nodejs python
           python-pytest ruff qt6-declarative
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

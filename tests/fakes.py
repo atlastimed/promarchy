@@ -125,7 +125,7 @@ class FakeProton:
         if "AnchorID" in single:
             ids = [m["ID"] for m in matches]
             matches = matches[ids.index(single["AnchorID"]) + 1 :]
-        limit = int(single.get("Limit", 50))
+        limit = int(single.get("PageSize") or max(50, int(single.get("Limit", 50))))
         return {"Code": 1000, "Total": total, "Messages": [dict(m) for m in matches[:limit]]}
 
     def _counts(self) -> dict:

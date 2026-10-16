@@ -1,7 +1,7 @@
 """Where sessions live.
 
 Tokens go into the desktop keyring (GNOME Keyring's Secret Service on
-Omarchy). Only the list of signed-in addresses is kept in a plain file so the
+Omarchy) via libsecret's ``secret-tool``. Only the list of signed-in addresses is kept in a plain file so the
 daemon can enumerate accounts without touching secrets. Writers take a file
 lock, and every change bumps a stamp file the daemon watches with a cheap
 ``stat()`` so a sign-in from the terminal shows up in the bar within seconds.
@@ -13,6 +13,8 @@ import contextlib
 import fcntl
 import json
 import os
+import shutil
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Protocol
@@ -33,28 +35,65 @@ class SecretBackend(Protocol):
     def delete(self, key: str) -> None: ...
 
 
-class KeyringBackend:
+class SecretToolBackend:
+    """Secret Service access through libsecret's ``secret-tool``.
+
+    A short-lived subprocess per read or write (they happen at start-up and
+    when tokens rotate, about once a day) keeps the long-running daemon free
+    of a D-Bus and crypto stack it would otherwise carry around.
+    """
+
+    LEGACY_APPLICATION = "Python keyring library"  # items written by 0.1.0 pre-releases
+
     def __init__(self) -> None:
+        tool = shutil.which("secret-tool")
+        if not tool:
+            raise StoreUnavailable("secret-tool is missing. Install it with:\n  omarchy pkg add libsecret")
+        self.tool = tool
+
+    def _run(self, *args: str, secret: str | None = None) -> subprocess.CompletedProcess:
         try:
-            import keyring
-            from keyring.backends import fail
-        except ImportError as exc:
-            raise StoreUnavailable(
-                "python-keyring is not installed. Install it with:\n  omarchy pkg add python-keyring"
-            ) from exc
-        if isinstance(keyring.get_keyring(), fail.Keyring):
-            raise StoreUnavailable("No desktop keyring is available (is gnome-keyring running?)")
-        self._keyring = keyring
+            return subprocess.run(
+                [self.tool, *args],
+                input=secret,
+                capture_output=True,
+                text=True,
+                timeout=60,  # an unlock prompt may be waiting for the user
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise StoreUnavailable(f"Could not talk to the keyring: {exc.__class__.__name__}") from exc
 
     def get(self, key: str) -> str | None:
-        return self._keyring.get_password(KEYRING_SERVICE, key)
+        result = self._run("lookup", "service", KEYRING_SERVICE, "username", key)
+        if result.returncode != 0:
+            if result.stderr.strip():
+                raise StoreUnavailable(f"Keyring lookup failed: {result.stderr.strip()[:200]}")
+            return None  # no such item
+        return result.stdout.rstrip("\n") or None
 
     def set(self, key: str, value: str) -> None:
-        self._keyring.set_password(KEYRING_SERVICE, key, value)
+        label = f"Promarchy: Proton Mail session ({key.removeprefix('session:')})"
+        result = self._run(
+            "store",
+            "--label",
+            label,
+            "service",
+            KEYRING_SERVICE,
+            "username",
+            key,
+            "application",
+            "promarchy",
+            secret=value,
+        )
+        if result.returncode != 0:
+            raise StoreUnavailable(f"Could not save to the keyring: {result.stderr.strip()[:200]}")
+        self._run(
+            "clear", "service", KEYRING_SERVICE, "username", key, "application", self.LEGACY_APPLICATION
+        )
 
     def delete(self, key: str) -> None:
-        with contextlib.suppress(self._keyring.errors.PasswordDeleteError):
-            self._keyring.delete_password(KEYRING_SERVICE, key)
+        self._run("clear", "service", KEYRING_SERVICE, "username", key)
 
 
 class SessionStore:
@@ -69,7 +108,7 @@ class SessionStore:
     def secrets(self) -> SecretBackend:
         # Resolved lazily so listing accounts never needs the keyring.
         if self._secrets is None:
-            self._secrets = KeyringBackend()
+            self._secrets = SecretToolBackend()
         return self._secrets
 
     # ------------------------------------------------------------- queries

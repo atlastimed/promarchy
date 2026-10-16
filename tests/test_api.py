@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 
 import pytest
-import requests
 
 from promarchy.api import (
     APP_VERSION,
@@ -144,7 +143,7 @@ def test_wrong_password_is_distinct():
 
 
 def test_network_failure_maps_to_network_error():
-    http = FakeHttp([requests.ConnectionError("down")])
+    http = FakeHttp([ConnectionRefusedError("down")])
     with pytest.raises(NetworkError):
         ProtonClient(http=http).call("GET", "/x", auth=False)
 

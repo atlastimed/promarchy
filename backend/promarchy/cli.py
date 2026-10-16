@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import webbrowser
+from pathlib import Path
 from urllib.parse import quote
 
 from . import __version__
@@ -278,6 +279,22 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_notify_test(_: argparse.Namespace) -> int:
+    """Show what a new-mail notification looks like, using the newest message."""
+    from .notify import Notifier
+
+    icon = Path(__file__).resolve().parents[2] / "assets" / "promarchy.svg"
+    try:
+        state = json.loads((runtime_dir() / "state.json").read_text())
+        message = (state.get("messages") or [])[0]
+    except (OSError, ValueError, IndexError):
+        message = {"id": "", "senderName": "Promarchy", "subject": "Notifications are working", "url": ""}
+    url = message.get("url") or "https://mail.proton.me/inbox"
+    Notifier(icon=str(icon) if icon.exists() else "").announce([message], {message["id"]: url}, url)
+    print(f"Sent a sample notification for: {message.get('senderName')}")
+    return 0
+
+
 def cmd_daemon(args: argparse.Namespace) -> int:
     from .daemon import Daemon
     from .notify import Notifier
@@ -307,6 +324,10 @@ def main(argv: list[str] | None = None) -> int:
     status.add_argument("--json", action="store_true", help="print the full state snapshot")
     status.add_argument("--window", choices=("1h", "24h", "7d", "all"), help="print one count only")
     status.set_defaults(func=cmd_status)
+
+    sub.add_parser("notify-test", help="show a sample new-mail notification").set_defaults(
+        func=cmd_notify_test
+    )
 
     daemon = sub.add_parser("daemon", help="run the bar backend (started by the shell)")
     daemon.add_argument("--icon", default="", help=argparse.SUPPRESS)
