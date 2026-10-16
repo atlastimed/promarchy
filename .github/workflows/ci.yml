@@ -27,8 +27,8 @@ jobs:
 
       - name: Lint and format
         run: |
-          ruff check backend tests
-          ruff format --check backend tests
+          ruff check backend tests scripts
+          ruff format --check backend tests scripts
 
       - name: Backend tests
         run: python -m pytest -q

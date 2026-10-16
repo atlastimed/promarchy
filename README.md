@@ -146,6 +146,8 @@ scripts/check-plugin.sh        # Omarchy plugin contract + QML syntax
 
 `omarchy bar set atlastimed.promarchy demo true` swaps in sample data (no account or network), handy for screenshots and UI work. CI runs all of the above on Arch Linux.
 
+`python3 -I scripts/proton_probe.py [--roundtrip]` checks the parsers against the live API through your signed-in session and compares the bar's counts with an independent recount. It prints only shapes, numbers and aliases (never tokens, IDs, senders or subjects) and never renews the session; `--roundtrip` marks one single-message unread conversation read, watches the bar react, and restores it.
+
 ## License
 
 [MIT](LICENSE)
