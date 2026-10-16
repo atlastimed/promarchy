@@ -28,7 +28,9 @@ class Avatars:
         self.root = root or cache_dir() / "logos"
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.clock = clock
-        self.mode = "dark"
+        # Proton's logos are drawn for light backgrounds; the widget puts them
+        # on a light tile in every theme.
+        self.mode = "light"
 
     def attach(self, rows: list[dict], client: ProtonClient) -> bool:
         """Set row["avatar"] where a logo is known. True if anything changed."""

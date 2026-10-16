@@ -64,7 +64,6 @@ class Config:
     threads: bool = True
     notify: bool = True
     sender_images: bool = True
-    theme: str = "dark"
 
     @classmethod
     def from_dict(cls, data: dict) -> Config:
@@ -76,7 +75,6 @@ class Config:
             threads=_flag(data.get("groupThreads"), base.threads),
             notify=_flag(data.get("notify"), base.notify),
             sender_images=_flag(data.get("senderImages"), base.sender_images),
-            theme="light" if str(data.get("theme", "")).lower() == "light" else "dark",
         )
 
 
@@ -227,12 +225,11 @@ class Daemon:
         old = self.config
         self.config = config
         self.configured = True
-        self.avatars.mode = config.theme
         for account in self.accounts.values():
             needs_sync = account.mailbox.configure(
                 categories=config.categories, recent_limit=config.recent_limit, threads=config.threads
             )
-            if needs_sync or (config.sender_images and not old.sender_images) or config.theme != old.theme:
+            if needs_sync or (config.sender_images and not old.sender_images):
                 account.next_poll = 0
                 account.extra["force"] = True
             elif config.poll_seconds < old.poll_seconds:

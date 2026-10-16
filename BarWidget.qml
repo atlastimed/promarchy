@@ -27,15 +27,13 @@ Panel {
   readonly property string headerWindow: countWindow === "off" ? "24h" : countWindow
   readonly property bool notifyEnabled: flag("notify", true)
   readonly property string openWith: setting("openWith", "browser") === "webapp" ? "webapp" : "browser"
-  readonly property bool lightTheme: Color.background.hslLightness > 0.5
   readonly property var daemonConfig: ({
     pollSeconds: Number(setting("pollSeconds", 30)),
     recentLimit: Number(setting("recentCount", 8)),
     categories: String(setting("categories", "all")),
     groupThreads: flag("groupThreads", true),
     notify: notifyEnabled,
-    senderImages: flag("senderImages", true),
-    theme: lightTheme ? "light" : "dark"
+    senderImages: flag("senderImages", true)
   })
 
   // ---- state -----------------------------------------------------------------
@@ -318,8 +316,6 @@ Panel {
             meta: root.signedIn && root.healthy
               ? Model.headline(root.headerCount, root.headerWindow, root.capped)
               : Model.statusLine(root.status, root.mail ? root.mail.message : "")
-            detail: root.mail && root.mail.accounts.length === 1 ? root.mail.accounts[0].email
-              : (root.mail && root.mail.accounts.length > 1 ? root.mail.accounts.length + " accounts" : "")
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
@@ -344,20 +340,37 @@ Panel {
             }
           }
 
-          ButtonGroup {
+          RowLayout {
             visible: root.signedIn
-            options: [
-              { value: "1h", label: "1h", tooltip: "Unread from the last hour (1)" },
-              { value: "24h", label: "24h", tooltip: "Unread from the last 24 hours (2)" },
-              { value: "7d", label: "7d", tooltip: "Unread from the last 7 days (3)" },
-              { value: "all", label: "All", tooltip: "All unread in the inbox (4)" }
-            ]
-            value: root.countWindow
-            focusable: false
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            onChanged: function(v) { root.setWindow(v) }
+            width: parent.width
+            spacing: Style.space(10)
+
+            ButtonGroup {
+              options: [
+                { value: "1h", label: "1h", tooltip: "Unread from the last hour (1)" },
+                { value: "24h", label: "24h", tooltip: "Unread from the last 24 hours (2)" },
+                { value: "7d", label: "7d", tooltip: "Unread from the last 7 days (3)" },
+                { value: "all", label: "All", tooltip: "All unread in the inbox (4)" }
+              ]
+              value: root.countWindow
+              focusable: false
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              onChanged: function(v) { root.setWindow(v) }
+            }
+
+            Text {
+              Layout.fillWidth: true
+              textFormat: Text.PlainText
+              horizontalAlignment: Text.AlignRight
+              text: !root.mail ? "" : (root.mail.accounts.length === 1 ? root.mail.accounts[0].email
+                : root.mail.accounts.length + " accounts")
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideLeft
+            }
           }
 
           // Sign-in, expired session, offline and error states.
@@ -682,12 +695,13 @@ Panel {
     implicitWidth: Style.space(30)
     implicitHeight: Style.space(30)
 
+    // Proton serves brand logos for light backgrounds (as its web app shows
+    // them), so a logo gets a light tile; otherwise a themed initial.
     BorderSurface {
       anchors.fill: parent
       radius: Style.cornerRadius > 0 ? width / 2 : 0
-      color: Style.normalFillFor(root.foreground, Color.accent)
-      borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
-      visible: logo.status !== Image.Ready
+      color: logo.status === Image.Ready ? "#f4f4f5" : Style.normalFillFor(root.foreground, Color.accent)
+      borderSpec: logo.status === Image.Ready ? Border.none() : Border.controlSpec("normal", root.foreground, Color.accent)
     }
 
     Text {
@@ -704,7 +718,7 @@ Panel {
     Image {
       id: logo
       anchors.fill: parent
-      anchors.margins: Style.space(2)
+      anchors.margins: Style.space(5)
       source: avatar.source
       visible: status === Image.Ready
       asynchronous: true
