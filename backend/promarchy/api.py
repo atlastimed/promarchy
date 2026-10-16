@@ -94,14 +94,24 @@ class Session:
 
     @classmethod
     def from_dict(cls, data: dict) -> Session:
+        """Strict: every field must already have its type (a null token
+        must not become the string "None")."""
+        email, user_id = data.get("email") or "", data.get("user_id") or ""
+        scopes, created_at = data.get("scopes") or [], data.get("created_at") or 0.0
+        if not isinstance(email, str) or not isinstance(user_id, str):
+            raise ValueError("malformed session")
+        if not isinstance(scopes, list) or not all(isinstance(s, str) for s in scopes):
+            raise ValueError("malformed session")
+        if isinstance(created_at, bool) or not isinstance(created_at, (int, float)):
+            raise ValueError("malformed session")
         return cls(
             uid=checked_token(data["uid"]),
             access_token=checked_token(data["access_token"]),
             refresh_token=checked_token(data["refresh_token"]),
-            email=str(data.get("email") or ""),
-            user_id=str(data.get("user_id") or ""),
-            scopes=[str(s) for s in data.get("scopes") or []],
-            created_at=float(data.get("created_at") or 0.0),
+            email=email.strip().lower(),
+            user_id=user_id,
+            scopes=list(scopes),
+            created_at=float(created_at),
         )
 
 
@@ -114,10 +124,9 @@ def checked_token(value: Any) -> str:
     A corrupted value would otherwise reach an HTTP header, and the library
     exception for a bad header quotes the value back, token and all.
     """
-    text = str(value)
-    if not _TOKEN.fullmatch(text):
+    if not isinstance(value, str) or not _TOKEN.fullmatch(value):
         raise ValueError("malformed session value")  # never echo the value itself
-    return text
+    return value
 
 
 class ProtonClient:

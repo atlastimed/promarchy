@@ -29,7 +29,7 @@ from promarchy.avatars import Avatars
 from promarchy.daemon import Daemon
 from promarchy.notify import Watermarks
 from promarchy.paths import open_private, runtime_dir
-from promarchy.store import SessionStore, StoreUnavailable
+from promarchy.store import SaveIndeterminate, SecretToolBackend, SessionStore, StoreUnavailable
 
 
 def make_store(tmp_path):
@@ -372,29 +372,133 @@ def test_without_a_bar_sign_in_replaces_under_the_lock(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("reply", "saved"),
-    [({"error": "busy"}, False), ({"error": "no answer"}, False), ({"error": "no answer"}, True)],
+    ("reply", "kept"),
+    [
+        ({"error": "busy"}, False),  # it never ran and never will: revoke
+        ({"saved": False, "unchanged": True, "error": "keyring locked"}, False),  # nothing written
+        ({"saved": False, "indeterminate": True, "error": "timed out"}, True),  # may have landed
+        ({"saved": False, "error": "from an older bar"}, True),  # not stated: assume it may have
+        ({"error": "no answer"}, True),  # unknown: never revoke on a guess
+    ],
 )
-def test_an_unanswered_hand_over_trusts_only_the_keyring(tmp_path, monkeypatch, capsys, reply, saved):
+def test_the_new_session_is_revoked_only_when_it_was_certainly_not_saved(tmp_path, monkeypatch, reply, kept):
+    store = make_store(tmp_path)
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    revoked = pending_sign_in(monkeypatch)
+    monkeypatch.setattr(control, "ask", lambda request: dict(reply))
+    with pytest.raises(cli.LoginFailed) as failure:
+        cli._login("me@proton.me")
+    assert revoked == ([] if kept else ["u2"])
+    if kept:
+        assert "did not confirm" in str(failure.value)
+
+
+def test_a_lost_answer_after_the_bar_saved_is_a_success(tmp_path, monkeypatch, capsys):
     store = make_store(tmp_path)
     monkeypatch.setattr(cli, "SessionStore", lambda: store)
     revoked = pending_sign_in(monkeypatch)
 
     def ask(request):
-        if saved:  # it ran before the connection broke
-            store.replace(Session.from_dict(request["session"]))
-        return dict(reply)
+        store.replace(Session.from_dict(request["session"]))  # it ran, then the connection broke
+        return {"error": "no answer"}
 
     monkeypatch.setattr(control, "ask", ask)
-    if saved:
-        assert cli._login("me@proton.me") == "me@proton.me"
-        assert revoked == []
-        assert "could not confirm whether an older session" in capsys.readouterr().err
-    else:
-        with pytest.raises(cli.LoginFailed):
-            cli._login("me@proton.me")
-        assert revoked == ["u2"]
-        assert store.accounts() == []
+    assert cli._login("me@proton.me") == "me@proton.me"
+    assert revoked == []
+    assert "could not confirm whether an older session" in capsys.readouterr().err
+
+
+def test_ctrl_c_right_after_the_hand_over_keeps_the_new_session(tmp_path, monkeypatch):
+    """F2: SIGINT delivered the moment the handler is restored."""
+    store = make_store(tmp_path)
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    revoked = pending_sign_in(monkeypatch)
+
+    @contextlib.contextmanager
+    def interrupted_on_exit():
+        yield
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_uninterruptible", interrupted_on_exit)
+    with pytest.raises(KeyboardInterrupt):
+        cli._login("me@proton.me")
+    assert revoked == []
+    assert store.load("me@proton.me").uid == "u2"
+
+
+def test_a_rejected_replaced_session_is_reported(tmp_path, monkeypatch, capsys):
+    """F4: rejected credentials cannot prove the old session ended."""
+    store = make_store(tmp_path)
+    store.save(Session(uid="u1", access_token="a", refresh_token="r", email="me@proton.me"))
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    pending_sign_in(monkeypatch)
+    monkeypatch.setattr(sessions, "end_displaced", lambda client: REJECTED)
+    assert cli._login("me@proton.me") == "me@proton.me"
+    assert "cannot confirm it ended" in capsys.readouterr().err
+
+
+# ------------------------------------------------------- adopt consistency (F3, F5)
+
+
+@pytest.mark.parametrize("field", ["uid", "access_token", "refresh_token"])
+def test_adopt_refuses_null_or_non_string_tokens(field):
+    good = {"uid": "u2", "access_token": "a", "refresh_token": "r", "email": "me@proton.me"}
+    for bad in (None, 17, ["x"]):
+        with pytest.raises(control.BadRequest):
+            control.parse(json.dumps({"cmd": "adopt", "session": {**good, field: bad}}).encode())
+
+
+def test_a_case_variant_address_replaces_rather_than_deletes(tmp_path):
+    store = make_store(tmp_path)
+    store.save(Session(uid="u1", access_token="a", refresh_token="r", email="me@proton.me", user_id="U"))
+    displaced = store.replace(
+        Session(uid="u2", access_token="a", refresh_token="r", email="Me@Proton.ME", user_id="U")
+    )
+    assert store.accounts() == ["me@proton.me"]
+    assert store.load("me@proton.me").uid == "u2"
+    assert [s.uid for s in displaced] == ["u1"]
+
+
+def test_the_same_session_under_another_address_is_never_revoked(tmp_path):
+    store = make_store(tmp_path)
+    store.save(Session(uid="X", access_token="a", refresh_token="r", email="old@example.com", user_id="U"))
+    ended = []
+    result = sessions.adopt(
+        store,
+        Session(uid="X", access_token="a", refresh_token="r", email="new@proton.me", user_id="U"),
+        lambda old: ended.append(old.uid) or REVOKED,
+    )
+    assert ended == [] and result["displaced"] == []
+    assert store.accounts() == ["new@proton.me"]
+
+
+def test_adopt_switches_accounts_even_if_the_keyring_cannot_be_read_afterwards(tmp_path):
+    """F5: the bar must not keep polling the session it just ended."""
+    store = make_store(tmp_path)
+    store.save(Session(uid="u1", access_token="a", refresh_token="r", email="old@example.com", user_id="U"))
+    daemon = make_daemon(store, tmp_path, shared_api_factory(FakeProton()))
+    daemon._sync_accounts()
+    real_replace, real_get = store.replace, store.secrets.get
+    broken = {"now": False}
+
+    def replace_then_break(session, **kw):
+        result = real_replace(session, **kw)
+        broken["now"] = True
+        return result
+
+    def get(key):
+        if broken["now"]:
+            raise StoreUnavailable("keyring locked")
+        return real_get(key)
+
+    store.replace = replace_then_break
+    store.secrets.get = get
+    new = Session(uid="u2", access_token="n1", refresh_token="n2", email="me@proton.me", user_id="U")
+    ticket = control.Ticket()
+    daemon.handle({"cmd": "adopt", "session": new, "ticket": ticket})
+    assert ticket.result["saved"] is True
+    assert list(daemon.accounts) == ["me@proton.me"]
+    assert daemon.accounts["me@proton.me"].client.session.uid == "u2"
 
 
 # ------------------------------------------------------------------- N08
@@ -437,3 +541,158 @@ def test_daemon_prefers_the_newer_sign_in_of_one_account(tmp_path):
     daemon = make_daemon(store, tmp_path, factory)
     daemon._sync_accounts()
     assert list(daemon.accounts) == ["new@proton.me"]
+
+
+# ----------------------------------------- GPT 6 Pro design review (A to D)
+
+
+def test_a_keyring_helper_that_times_out_mid_write_is_indeterminate(monkeypatch):
+    backend = SecretToolBackend.__new__(SecretToolBackend)
+    backend.tool = "/usr/bin/secret-tool"
+
+    def run(*args, secret=None):
+        if args[0] == "store":
+            raise StoreUnavailable("Could not talk to the keyring: TimeoutExpired")
+        raise AssertionError("no cleanup after an indeterminate write")
+
+    monkeypatch.setattr(backend, "_run", run)
+    with pytest.raises(SaveIndeterminate):
+        backend.set("session:x", "{}")
+
+
+def test_failed_legacy_cleanup_does_not_turn_a_save_into_a_failure(monkeypatch):
+    import subprocess
+
+    backend = SecretToolBackend.__new__(SecretToolBackend)
+    backend.tool = "/usr/bin/secret-tool"
+
+    def run(*args, secret=None):
+        if args[0] == "store":
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        raise StoreUnavailable("Could not talk to the keyring: TimeoutExpired")
+
+    monkeypatch.setattr(backend, "_run", run)
+    backend.set("session:x", "{}")  # no exception: the session is stored
+
+
+def test_after_the_save_lands_replace_reports_leftovers_instead_of_raising(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    store.save(Session(uid="u1", access_token="a", refresh_token="r", email="old@example.com", user_id="U"))
+
+    def broken(accounts):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_write_index", broken)
+    displaced = store.replace(
+        Session(uid="u2", access_token="a", refresh_token="r", email="me@proton.me", user_id="U")
+    )
+    assert [s.uid for s in displaced] == ["u1"]  # still returned for revocation
+    assert store.index_failed is True
+    assert store.load("me@proton.me").uid == "u2"
+
+
+def test_a_write_that_may_have_landed_is_never_called_unchanged(tmp_path):
+    store = make_store(tmp_path)
+
+    def flaky(key, value):
+        raise RuntimeError("helper crashed")
+
+    store.secrets.set = flaky
+    with pytest.raises(SaveIndeterminate):
+        store.replace(Session(uid="u2", access_token="a", refresh_token="r", email="me@proton.me"))
+
+
+def test_the_bar_says_whether_a_failed_adopt_changed_anything(tmp_path):
+    store = make_store(tmp_path)
+    daemon = make_daemon(store, tmp_path, shared_api_factory(FakeProton()))
+    new = Session(uid="u2", access_token="n1", refresh_token="n2", email="me@proton.me")
+
+    def refuse(key, value):
+        raise StoreUnavailable("keyring locked")
+
+    def crash(key, value):
+        raise SaveIndeterminate("timed out")
+
+    for failure, expected in ((refuse, "unchanged"), (crash, "indeterminate")):
+        store.secrets.set = failure
+        ticket = control.Ticket()
+        daemon.handle({"cmd": "adopt", "session": new, "ticket": ticket})
+        assert ticket.result["saved"] is False and ticket.result.get(expected) is True
+
+
+def test_a_held_session_is_ended_even_if_its_saved_copy_cannot_be_read(tmp_path):
+    """B: the bar holds the old session, but the keyring returns nothing for it."""
+    server = AuthServer(uid="old")
+    store = make_store(tmp_path)
+    store.save(
+        Session(uid="old", access_token=server.access, refresh_token=server.refresh, email="me@proton.me")
+    )
+    daemon = auth_daemon(store, tmp_path, server)
+    daemon._sync_accounts()
+    store.secrets.data.clear()  # a dismissed unlock prompt looks just like this
+    new = Session(uid="new", access_token="n1", refresh_token="n2", email="me@proton.me")
+    ticket = control.Ticket()
+    daemon.handle({"cmd": "adopt", "session": new, "ticket": ticket})
+    assert ticket.result["displaced"] == [{"email": "me@proton.me", "outcome": REVOKED}]
+    assert server.revoked is True
+
+
+def test_renewed_tokens_are_never_written_over_an_unreadable_entry(tmp_path):
+    """B: no blind writes; the caller keeps the tokens and retries."""
+    store = make_store(tmp_path)
+    store.save(Session(uid="u1", access_token="a", refresh_token="r", email="me@proton.me"))
+    store.secrets.data.clear()
+    with pytest.raises(StoreUnavailable):
+        store.update_tokens(Session(uid="u1", access_token="a2", refresh_token="r2", email="me@proton.me"))
+    assert store.secrets.data == {}
+
+
+def test_a_repeat_of_a_held_session_keeps_the_bars_newer_tokens(tmp_path):
+    store = make_store(tmp_path)
+    store.save(Session(uid="u1", access_token="a", refresh_token="r", email="me@proton.me"))
+    daemon = make_daemon(store, tmp_path, shared_api_factory(FakeProton()))
+    daemon._sync_accounts()
+    daemon.accounts["me@proton.me"].client.session.refresh_token = "newer"
+    ticket = control.Ticket()
+    stale = Session(uid="u1", access_token="a", refresh_token="r", email="me@proton.me")
+    daemon.handle({"cmd": "adopt", "session": stale, "ticket": ticket})
+    assert ticket.result["saved"] is True and ticket.result["displaced"] == []
+    assert daemon.accounts["me@proton.me"].client.session.refresh_token == "newer"
+
+
+def test_an_abandoned_sign_in_that_cannot_be_ended_says_so(tmp_path, monkeypatch, capsys):
+    """C: Ctrl+C at the 2FA prompt while Proton is unreachable."""
+    store = make_store(tmp_path)
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    pending_sign_in(monkeypatch)
+    monkeypatch.setattr(cli, "logout", lambda client: False)
+
+    def interrupt(client):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_two_factor", interrupt)
+    monkeypatch.setattr(cli, "begin_login", lambda c, u, p, hv: PendingLogin(Session("u2", "a", "r"), 1))
+    with pytest.raises(KeyboardInterrupt):
+        cli._login("me@proton.me")
+    assert "could not be ended on Proton's side" in capsys.readouterr().err
+
+
+def test_tokens_kept_only_in_memory_are_shown(tmp_path):
+    """D: the bar must not look healthy while a restart would sign you out."""
+    store = make_store(tmp_path)
+    store.save(Session(uid="u1", access_token="a", refresh_token="r", email="me@proton.me"))
+    daemon = make_daemon(store, tmp_path, shared_api_factory(FakeProton()))
+    daemon.tick()
+    assert daemon.snapshot()["status"] == "ok"
+
+    def refuse(key, value):
+        raise StoreUnavailable("keyring locked")
+
+    store.secrets.set = refuse
+    daemon.unsaved["me@proton.me"] = Session(
+        uid="u1", access_token="a2", refresh_token="r2", email="me@proton.me"
+    )
+    daemon._persist_unsaved(force=True)
+    state = daemon.snapshot()
+    assert state["status"] == "partial"
+    assert "not yet saved to the keyring" in state["message"]

@@ -72,7 +72,7 @@ def parse(line: bytes) -> dict:
             raise BadRequest("invalid request") from None
         if not session.email:
             raise BadRequest("invalid request")
-        return {"cmd": "adopt", "session": session}
+        return {"cmd": "adopt", "session": session}  # from_dict lowercased the address
     raise BadRequest("unsupported request")
 
 

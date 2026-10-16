@@ -355,8 +355,10 @@ def main(argv: list[str] | None = None) -> int:
     out["requests"] = probe.requests
     json.dump(out, sys.stdout, indent=2, ensure_ascii=False)
     print()
-    if status:
+    if status == 3:
         print("Round trip: the restore could not be confirmed; see roundtrip.action.", file=sys.stderr)
+    elif status == 130:
+        print("Round trip interrupted; the conversation was restored and verified.", file=sys.stderr)
     return status
 
 

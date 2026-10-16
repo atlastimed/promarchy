@@ -32,7 +32,7 @@ from .auth import (
     submit_totp,
 )
 from .paths import runtime_dir, state_dir, write_private
-from .store import SessionStore, StoreUnavailable
+from .store import SaveIndeterminate, SessionStore, StoreUnavailable
 
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -135,7 +135,7 @@ def _login(username: str | None) -> str:
         # it behind the owner's back; this step is short.
         with _uninterruptible():
             handed = _hand_over(store, pending.session)
-        committed = True
+            committed = True  # before Ctrl+C can reach the cleanup below
     except WrongCredentials as exc:
         raise LoginFailed(str(exc)) from exc
     except ProtonError as exc:
@@ -143,8 +143,12 @@ def _login(username: str | None) -> str:
     finally:
         # Anything short of a saved session (an error, a wrong 2FA code,
         # Ctrl+C) must not leave a live session behind on Proton's side.
-        if not committed:
-            logout(client)
+        if not committed and not logout(client):
+            print(
+                "Note: the unfinished sign-in could not be ended on Proton's side (Proton unreachable).\n"
+                "You can end it under Proton's Settings → Security → Session management.",
+                file=sys.stderr,
+            )
     _report_replacement(handed, email)
     return email
 
@@ -166,23 +170,30 @@ def _hand_over(store: SessionStore, session: Session) -> dict:
             raise LoginFailed(BAR_NOT_ANSWERING)
         try:
             return sessions.adopt(store, session, lambda old: sessions.end_displaced(ProtonClient(old)))
-        except Exception as exc:
+        except SaveIndeterminate:
+            return _unconfirmed(store, session)
+        except Exception as exc:  # nothing was written
             raise LoginFailed(f"Signed in, but could not save the session to your keyring: {exc}") from exc
         finally:
             os.close(lock)
     if reply.get("saved") is True:
         return reply
-    if reply.get("error") == "no answer":
-        # It may have run before the connection broke: the keyring tells.
-        with contextlib.suppress(Exception):
-            stored = store.load(session.email)
-            if stored is not None and stored.uid == session.uid:
-                return {"saved": True, "displaced": None, "cleanupFailures": []}
+    error = reply.get("error")
+    if error == "busy":  # it never ran, and never will
         raise LoginFailed(BAR_NOT_ANSWERING)
-    if reply.get("error") == "busy":  # it never ran
-        raise LoginFailed(BAR_NOT_ANSWERING)
-    detail = reply.get("error") or "unknown error"
-    raise LoginFailed(f"Signed in, but could not save the session to your keyring: {detail}")
+    if error in ("invalid request", "unsupported request") or reply.get("unchanged") is True:
+        raise LoginFailed(f"Signed in, but could not save the session to your keyring: {error}")
+    # A lost answer, or a save that may have landed: revoking now could end a
+    # session the bar has just saved. Keep it, and say what is unknown.
+    return _unconfirmed(store, session)
+
+
+def _unconfirmed(store: SessionStore, session: Session) -> dict:
+    saved = False
+    with contextlib.suppress(Exception):
+        stored = store.load(session.email)
+        saved = stored is not None and stored.uid == session.uid
+    return {"saved": True, "displaced": None, "cleanupFailures": [], "unconfirmed": not saved}
 
 
 @contextlib.contextmanager
@@ -198,10 +209,22 @@ def _uninterruptible():
 
 
 def _report_replacement(handed: dict, email: str) -> None:
+    if handed.get("unconfirmed"):
+        raise LoginFailed(
+            "Signed in, but Promarchy's background process did not confirm that it saved the session.\n"
+            "  If the bar does not show your mail within a minute, sign in again. Any session left\n"
+            "  behind can be ended under Proton's Settings → Security → Session management."
+        )
     for leftover in handed.get("cleanupFailures") or []:
         print(
             f"Note: the keyring entry for {leftover} (the same Proton account) could not be deleted.\n"
             "Promarchy no longer uses it; you can remove it in your keyring manager (Passwords and Keys).",
+            file=sys.stderr,
+        )
+    if handed.get("indexFailed"):
+        print(
+            "Note: the session is saved, but Promarchy's account list could not be updated.\n"
+            "If the account is missing after the bar restarts, sign in again.",
             file=sys.stderr,
         )
     displaced = handed.get("displaced")
@@ -217,12 +240,18 @@ def _report_replacement(handed: dict, email: str) -> None:
             continue
         if item.get("email") and item["email"] != email:
             print(f"{item['email']} is the same Proton account; it now appears as {email}.")
-        # REJECTED: its owner's current credentials no longer work, so there
-        # is nothing left to end (typically a session that had expired).
         if item.get("outcome") == UNCONFIRMED:
             print(
                 "Note: a session this sign-in replaced could not be ended (Proton unreachable or busy).\n"
                 "You can end it under Proton's Settings → Security → Session management.",
+                file=sys.stderr,
+            )
+        elif item.get("outcome") == REJECTED:
+            # Usually an expired session, but rejected credentials cannot prove it ended.
+            print(
+                "Note: Proton no longer accepts the credentials of the session this sign-in replaced\n"
+                "(it has most likely expired), so Promarchy cannot confirm it ended. To be sure, check\n"
+                "Proton's Settings → Security → Session management.",
                 file=sys.stderr,
             )
 

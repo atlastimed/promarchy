@@ -42,7 +42,7 @@ from .log import log_error
 from .mailbox import WEB_BASE, Mailbox, parse_categories
 from .notify import Notifier, Watermarks, select_new
 from .paths import open_private, runtime_dir, write_private
-from .store import SessionStore, StoreUnavailable
+from .store import SaveIndeterminate, SessionStore, StoreUnavailable
 
 STAMP_CHECK_SECONDS = 5
 LOCK_WAIT_SECONDS = 15
@@ -186,8 +186,10 @@ class Daemon:
             return 3
         threading.Thread(target=self._read_commands, args=(stdin or sys.stdin,), daemon=True).start()
         control_server = self._open_control()
-        # The shell stops us with SIGTERM; finish the current step (a token
-        # refresh must be persisted) and leave through the normal path.
+        # The shell stops us with SIGTERM; finish the current step and leave
+        # through the normal path, which tries once more to save renewed
+        # tokens. That is best effort: the watchdog below may cut a slow
+        # keyring prompt short (see "Known limits" in the README).
         if threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGTERM, self._on_sigterm)
         try:
@@ -495,13 +497,50 @@ class Daemon:
                 self._record_failure(owned, exc)
                 return UNCONFIRMED
 
+        if any(
+            a.client.session is not None and a.client.session.uid == session.uid
+            for a in self.accounts.values()
+        ):
+            # A repeat of a session we already hold: our tokens are the newer.
+            return {"saved": True, "displaced": [], "cleanupFailures": []}
+        replaced = [
+            a.client.session
+            for email, a in self.accounts.items()
+            if a.client.session is not None
+            and (email == session.email or (session.user_id and a.client.session.user_id == session.user_id))
+        ]
         try:
-            result = sessions.adopt(self.store, session, end)
-        except Exception as exc:
+            result = sessions.adopt(self.store, session, end, also=replaced)
+        except SaveIndeterminate as exc:
+            log_error("saving a new sign-in", exc)
+            return {"saved": False, "indeterminate": True, "error": str(exc)}
+        except Exception as exc:  # raised before anything was written
             log_error("saving a new sign-in", exc)
             detail = str(exc) if isinstance(exc, StoreUnavailable) else exc.__class__.__name__
-            return {"saved": False, "error": detail}
-        self._sync_accounts()  # switch to the new session before polling again
+            return {"saved": False, "unchanged": True, "error": detail}
+        # Switch to the new session now, from what we were given: a keyring
+        # read that fails right after the save must not leave us polling the
+        # session we just ended.
+        for email, account in list(self.accounts.items()):
+            if (
+                account.client.session is not None
+                and account.client.session.uid != session.uid
+                and (
+                    email == session.email
+                    or (session.user_id and account.client.session.user_id == session.user_id)
+                )
+            ):
+                self.accounts.pop(email).client.close()
+                self.unsaved.pop(email, None)
+                if email != session.email:
+                    with contextlib.suppress(OSError):
+                        self.watermarks.forget(email)
+        current = self.accounts.get(session.email)
+        if current is None or current.client.session is None or current.client.session.uid != session.uid:
+            if current is not None:
+                current.client.close()
+            self.accounts[session.email] = self._make_account(session.email, session)
+        self._sync_accounts()  # the rest of the index, if the keyring answers
         self.emit(force=True)
         return result
 
@@ -805,6 +844,13 @@ class Daemon:
             notes = [f"{a['email']}: {a['error'] or a['status']}" for a in problems]
             if self.store_error:
                 notes.append(self.store_error)
+            if self.unsaved and self.unsaved_failures:
+                # Working, but only in memory: say so until the keyring takes it.
+                notes.extend(
+                    f"{email}: renewed sign-in not yet saved to the keyring (is it locked?); retrying."
+                    " Until then, restarting Promarchy would sign you out."
+                    for email in self.unsaved
+                )
             # Some accounts work and some do not: say so, so partial totals
             # are never mistaken for the whole picture.
             return ("partial" if notes else "ok"), "; ".join(notes)

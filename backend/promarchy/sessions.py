@@ -9,7 +9,7 @@ tokens could not be saved.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from .api import ProtonClient, RateLimited, Session
 from .auth import REJECTED, REVOKED, UNCONFIRMED, end_session
@@ -78,14 +78,26 @@ def sign_out_stored(
     return result
 
 
-def adopt(store: SessionStore, session: Session, end: Callable[[Session], str]) -> dict:
+def adopt(
+    store: SessionStore,
+    session: Session,
+    end: Callable[[Session], str],
+    also: Iterable[Session] = (),
+) -> dict:
     """Save a fresh sign-in and end every session it replaces.
 
     `end` ends one displaced session with the owner's current tokens for it
-    (the saved copy may be older than what the owner holds). Raises if the
-    new session cannot be saved; nothing is replaced then.
+    (the saved copy may be older than what the owner holds). `also`: sessions
+    the owner holds that this sign-in replaces, in case their saved copies
+    could not be read. Raises StoreUnavailable if nothing changed, and
+    SaveIndeterminate if the new session may or may not have been saved.
     """
-    displaced = store.replace(session)
+    displaced = [old for old in store.replace(session) if old.uid != session.uid]
+    known = {old.uid for old in displaced}
+    for held in also:
+        if held.uid != session.uid and held.uid not in known:
+            displaced.append(held)
+            known.add(held.uid)
     outcomes = []
     for old in displaced:
         try:
@@ -94,7 +106,12 @@ def adopt(store: SessionStore, session: Session, end: Callable[[Session], str]) 
             log_error("ending a replaced session", exc)
             outcome = UNCONFIRMED
         outcomes.append({"email": old.email, "outcome": outcome})
-    return {"saved": True, "displaced": outcomes, "cleanupFailures": list(store.cleanup_failures)}
+    return {
+        "saved": True,
+        "displaced": outcomes,
+        "cleanupFailures": list(store.cleanup_failures),
+        "indexFailed": store.index_failed,
+    }
 
 
 def end_displaced(client: ProtonClient) -> str:

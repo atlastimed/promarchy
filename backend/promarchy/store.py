@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .api import Session
+from .log import log_error
 from .paths import open_private, state_dir, write_private
 
 KEYRING_SERVICE = "promarchy"
@@ -28,6 +29,11 @@ KEYRING_SERVICE = "promarchy"
 
 class StoreUnavailable(RuntimeError):
     pass
+
+
+class SaveIndeterminate(StoreUnavailable):
+    """A write was attempted and may or may not have landed (the helper
+    timed out or crashed). Never treat this as "nothing changed"."""
 
 
 class SecretBackend(Protocol):
@@ -86,23 +92,29 @@ class SecretToolBackend:
 
     def set(self, key: str, value: str) -> None:
         label = f"Promarchy: Proton Mail session ({key.removeprefix('session:')})"
-        result = self._run(
-            "store",
-            "--label",
-            label,
-            "service",
-            KEYRING_SERVICE,
-            "username",
-            key,
-            "application",
-            "promarchy",
-            secret=value,
-        )
-        if result.returncode != 0:
+        try:
+            result = self._run(
+                "store",
+                "--label",
+                label,
+                "service",
+                KEYRING_SERVICE,
+                "username",
+                key,
+                "application",
+                "promarchy",
+                secret=value,
+            )
+        except StoreUnavailable as exc:  # timed out or crashed mid-write
+            raise SaveIndeterminate(str(exc)) from exc
+        if result.returncode != 0:  # the helper refused: nothing was stored
             raise self._failure("Could not save to the keyring", result)
-        self._run(
-            "clear", "service", KEYRING_SERVICE, "username", key, "application", self.LEGACY_APPLICATION
-        )
+        try:  # tidying up after older versions must not turn a save into a failure
+            self._run(
+                "clear", "service", KEYRING_SERVICE, "username", key, "application", self.LEGACY_APPLICATION
+            )
+        except StoreUnavailable as exc:
+            log_error("clearing a legacy keyring item", exc)
 
     def delete(self, key: str) -> None:
         result = self._run("clear", "service", KEYRING_SERVICE, "username", key)
@@ -119,6 +131,7 @@ class SessionStore:
         self._stamp = self.root / "accounts.stamp"
         self._held = threading.local()
         self.cleanup_failures: list[str] = []  # keyring items replace() could not delete
+        self.index_failed = False  # replace() saved the session but not the account list
 
     @property
     def secrets(self) -> SecretBackend:
@@ -168,12 +181,23 @@ class SessionStore:
         old entry instead of adding the same mailbox twice. Read and write
         happen under one lock, so racing sign-ins each get back exactly what
         they displaced, and the caller revokes it on Proton's side.
+
+        Outcomes: StoreUnavailable means nothing changed; SaveIndeterminate
+        means the new session may or may not be stored; a return means it is
+        stored, with any leftovers in `cleanup_failures` / `index_failed`.
         """
+        # One spelling per address: the keyring key is case-insensitive, so
+        # "Me@x" and "me@x" must never be treated as two accounts.
+        session.email = session.email.strip().lower()
         if not session.email:
             raise ValueError("session has no account email")
         displaced: list[Session] = []
+        self.cleanup_failures = []
+        self.index_failed = False
         with self._locked():
-            accounts = self.accounts()
+            accounts = list(
+                dict.fromkeys(session.email if a.lower() == session.email else a for a in self.accounts())
+            )
             aliases = []
             if session.user_id:
                 for other in [a for a in accounts if a != session.email]:
@@ -183,28 +207,40 @@ class SessionStore:
             previous = self.load(session.email)
             # Save the new session before removing anything: if this fails,
             # every existing entry is still intact.
-            self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
+            try:
+                self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
+            except StoreUnavailable:
+                raise
+            except Exception as exc:
+                raise SaveIndeterminate("the keyring may or may not hold the new session") from exc
+            # From here on the new session is saved: finish what we can and
+            # report the rest, never raise as if nothing had happened.
             if previous is not None and previous.uid != session.uid:
                 displaced.append(previous)
-            if session.email not in accounts:
-                accounts.append(session.email)
-                announce = True
-            self.cleanup_failures = []
-            for other, stored in aliases:
-                # The new sign-in is authoritative: the old address leaves the
-                # index and its session is returned for revocation even if its
-                # keyring item cannot be deleted (reported, not hidden).
-                try:
-                    self.secrets.delete(_key(other))
-                except StoreUnavailable:
-                    self.cleanup_failures.append(other)
-                accounts.remove(other)
-                displaced.append(stored)
-                announce = True
-            if accounts != self.accounts():
-                self._write_index(accounts)
-            if announce:
-                self._bump()
+            for _, stored in aliases:
+                if stored.uid != session.uid:  # the same session merely re-keyed: keep it alive
+                    displaced.append(stored)
+            try:
+                if session.email not in accounts:
+                    accounts.append(session.email)
+                    announce = True
+                for other, _ in aliases:
+                    # The new sign-in is authoritative: the old address leaves
+                    # the index even if its keyring item cannot be deleted
+                    # (reported, not hidden).
+                    try:
+                        self.secrets.delete(_key(other))
+                    except StoreUnavailable:
+                        self.cleanup_failures.append(other)
+                    accounts.remove(other)
+                    announce = True
+                if accounts != self.accounts():
+                    self._write_index(accounts)
+                if announce:
+                    self._bump()
+            except Exception as exc:
+                log_error("updating the account list", exc)
+                self.index_failed = True
         return displaced
 
     def update_tokens(self, session: Session) -> bool:
@@ -218,7 +254,12 @@ class SessionStore:
             if session.email not in self.accounts():
                 return False
             stored = self.load(session.email)
-            if stored is not None and stored.uid != session.uid:
+            if stored is None:
+                # Unreadable (a locked keyring answers like a missing item):
+                # never write blind over what may be a newer sign-in. The
+                # caller keeps the tokens and tries again.
+                raise StoreUnavailable("Could not read the saved session to update it")
+            if stored.uid != session.uid:
                 return False
             self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
             return True
