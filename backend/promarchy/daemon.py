@@ -320,7 +320,12 @@ class Daemon:
                 failed.append(email)
                 continue
             uid = account.client.session.uid
-            outcome = end_session(account.client, lambda email=email: self.store.load(email))
+            try:
+                outcome = end_session(account.client, lambda email=email: self.store.load_locked(email))
+            except RateLimited as exc:
+                self._record_failure(account, exc)  # keep Proton's Retry-After
+                failed.append(email)
+                continue
             if outcome == UNCONFIRMED:
                 failed.append(email)
                 continue
@@ -437,7 +442,9 @@ class Daemon:
             self.unsaved[email] = updated
             self._persist_unsaved(force=True)
 
-        client = self.client_factory(session, on_refresh=persist)
+        client = self.client_factory(
+            session, on_refresh=persist, refresh_guard=lambda: self.store.refresh_guard(email)
+        )
         mailbox = Mailbox(
             client,
             email,

@@ -27,3 +27,7 @@ Hardening from the pre-release reviews:
 - Conversation rows use the Inbox's own context when a thread spans folders.
 - A Proton account is identified by its UserID, so signing in through another of its addresses replaces the old entry instead of counting the mailbox twice.
 - Proton's Retry-After also holds off settings changes, mark-as-read and sign-out; unexpected keyring-helper exits are reported as errors.
+- Renewing a session and saving the new tokens happen under one cross-process lock; a process that waited adopts the tokens another one just saved instead of spending its own, and sign-out reads the session under that lock, so it never mistakes a renewal in progress for a dead session.
+- Signing in through another address saves the new session before removing the old entry, so a failed save loses nothing.
+- A rate-limited sign-out keeps Proton's Retry-After.
+- `scripts/proton_probe.py` checks parsers and counts against the live API without exposing the session; its `--roundtrip` only touches single-message conversations and always restores what it sent.

@@ -395,3 +395,128 @@ def test_daemon_still_reports_a_genuinely_expired_session(daemon_env):  # noqa: 
     clock.advance(600)
     d.tick()
     assert len(api.calls) == calls  # no hammering while expired
+
+
+# ------------------------------------------------- N01/N02/N05 (review of 3a6ca09)
+
+
+def test_a_waiting_process_adopts_tokens_instead_of_spending_its_own(store):
+    server = AuthServer()
+    held = stored_session(server)
+    store.save(held)
+    server.rotate()  # another process renewed and saved, under the lock
+    store.update_tokens(stored_session(server))
+    calls = []
+    real = server.request
+
+    def spy(method, url, **kw):
+        calls.append(url.rsplit("/", 2)[-2:])
+        return real(method, url, **kw)
+
+    server.request = spy
+    client = ProtonClient(
+        Session(**held.to_dict()), http=server, refresh_guard=lambda: store.refresh_guard("me@proton.me")
+    )
+    client.refresh()
+    assert client.session.refresh_token == server.refresh
+    assert not any(c[-1] == "refresh" for c in calls)  # no single-use token was spent
+
+
+def test_renewal_and_save_are_atomic_across_processes(tmp_path):
+    import threading
+    import time
+
+    root = tmp_path / "shared"
+    root.mkdir()
+    secrets = MemorySecrets()
+    daemon_store = SessionStore(secrets=secrets, root=root)  # two processes,
+    cli_store = SessionStore(secrets=secrets, root=root)  # one keyring
+    server = AuthServer()
+    daemon_store.save(stored_session(server))
+    real = server.request
+
+    def slow_refresh(method, url, **kw):
+        if url.endswith("/auth/v4/refresh"):
+            time.sleep(0.3)  # Proton has rotated; the save has not happened yet
+        return real(method, url, **kw)
+
+    server.request = slow_refresh
+    client = ProtonClient(
+        stored_session(server),
+        http=server,
+        on_refresh=daemon_store.update_tokens,
+        refresh_guard=lambda: daemon_store.refresh_guard("me@proton.me"),
+    )
+    renewing = threading.Thread(target=client.refresh)
+    renewing.start()
+    time.sleep(0.1)  # the CLI re-reads mid-renewal
+    seen = cli_store.load_locked("me@proton.me")
+    renewing.join()
+    assert seen.refresh_token == server.refresh  # it waited for the save
+
+
+def test_cli_logout_reports_unsaved_fresh_tokens(cli_env, monkeypatch, capsys):
+    store, server = cli_env
+    store.save(stored_session(server))
+    server.access = "expired-on-server"
+    real = server.request
+
+    renewed = []
+
+    def offline_after_refresh(method, url, **kw):
+        if method == "DELETE" and renewed:
+            raise ConnectionRefusedError("offline")  # the network drops right after renewing
+        response = real(method, url, **kw)
+        if url.endswith("/auth/v4/refresh") and response.status_code == 200:
+            renewed.append(True)
+        return response
+
+    server.request = offline_after_refresh
+
+    def broken(session):
+        raise StoreUnavailable("keyring busy")
+
+    monkeypatch.setattr(store, "update_tokens", broken)
+    assert cli.cmd_logout(args()) == 1
+    err = capsys.readouterr().err
+    assert "still signed in" in err and "sign in again" in err
+    assert store.accounts() == ["me@proton.me"]
+
+
+def test_failed_save_during_alias_replacement_keeps_the_old_entry(store):
+    store.save(
+        Session(uid="u1", access_token="a", refresh_token="r", email="old@example.com", user_id="USER")
+    )
+
+    def refuse(key, value):
+        raise StoreUnavailable("keyring locked")
+
+    store.secrets.set = refuse
+    with pytest.raises(StoreUnavailable):
+        store.replace(
+            Session(uid="u2", access_token="a", refresh_token="r", email="new@proton.me", user_id="USER")
+        )
+    assert store.accounts() == ["old@example.com"]
+    assert store.load("old@example.com").uid == "u1"
+
+
+def test_rate_limited_sign_out_keeps_the_deadline(daemon_env, monkeypatch):  # noqa: F811
+    from promarchy import daemon as daemon_module
+
+    d, api, store, clock, states = daemon_env
+    store.save(Session(uid="u", access_token="a", refresh_token="r", email="me@proton.me"))
+    d.tick()
+
+    def throttled(client, reload):
+        raise RateLimited("slow down", 300)
+
+    monkeypatch.setattr(daemon_module, "end_session", throttled)
+    d.handle({"cmd": "logout"})
+    calls = len(api.calls)
+    clock.advance(31)
+    d.tick()
+    assert len(api.calls) == calls
+    assert store.accounts() == ["me@proton.me"]
+    clock.advance(300)
+    d.tick()
+    assert len(api.calls) > calls

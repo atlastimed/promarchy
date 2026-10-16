@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .api import AuthExpired, ProtonClient, ProtonError, Session, WrongCredentials
+from .api import AuthExpired, ProtonClient, ProtonError, RateLimited, Session, WrongCredentials
 from .paths import cache_dir
 
 TWO_FACTOR_TOTP = 1
@@ -190,6 +190,9 @@ def end_session(client: ProtonClient, reload: Callable[[], Session | None]) -> s
     daemon may have rotated it a moment ago. So before believing that, we
     re-read the stored session; if someone else rotated the tokens, we retry
     with the live ones. Only an unchanged, rejected session counts as GONE.
+    `reload` must read under the store lock that renewals hold (see
+    SessionStore.load_locked), so it never sees a renewal half saved.
+    RateLimited propagates, so callers can honour Proton's Retry-After.
     """
     for _ in range(3):
         if client.session is None:
@@ -208,6 +211,8 @@ def end_session(client: ProtonClient, reload: Callable[[], Session | None]) -> s
             if stored.refresh_token in (tried, client.session.refresh_token):
                 return GONE
             client.session = stored  # rotated by another process: try again
+        except RateLimited:
+            raise
         except ProtonError:
             return UNCONFIRMED
     return UNCONFIRMED

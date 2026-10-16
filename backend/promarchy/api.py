@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -133,12 +134,17 @@ class ProtonClient:
         session: Session | None = None,
         *,
         on_refresh: Callable[[Session], None] | None = None,
+        refresh_guard: Callable[[], AbstractContextManager[Session | None]] | None = None,
         base: str = API_BASE,
         http: HttpTransport | None = None,
     ) -> None:
         self.session = session
         self.base = base.rstrip("/")
         self._on_refresh = on_refresh
+        # Held across "renew, then save": other processes using the same
+        # stored session wait instead of consuming the single-use token too.
+        # It yields the currently stored session (or None).
+        self._refresh_guard = refresh_guard
         self._http = http or HttpTransport(timeout=TIMEOUT)
         self._http.headers.update(
             {
@@ -189,6 +195,20 @@ class ProtonClient:
         session = self.session
         if session is None:
             raise AuthExpired("Not signed in")
+        with self._refresh_guard() if self._refresh_guard else nullcontext() as stored:
+            if (
+                stored is not None
+                and stored.uid == session.uid
+                and stored.refresh_token != session.refresh_token
+            ):
+                # Another process renewed this session while we waited for
+                # the lock: use its tokens instead of spending ours.
+                session.access_token = stored.access_token
+                session.refresh_token = stored.refresh_token
+                return
+            self._renew(session)
+
+    def _renew(self, session: Session) -> None:
         body = {
             "UID": session.uid,
             "RefreshToken": session.refresh_token,

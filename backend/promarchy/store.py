@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Protocol
@@ -116,6 +117,7 @@ class SessionStore:
         self._index = self.root / "accounts.json"
         self._lock = self.root / "accounts.lock"
         self._stamp = self.root / "accounts.stamp"
+        self._held = threading.local()
 
     @property
     def secrets(self) -> SecretBackend:
@@ -171,20 +173,28 @@ class SessionStore:
         displaced: list[Session] = []
         with self._locked():
             accounts = self.accounts()
+            aliases = []
             if session.user_id:
                 for other in [a for a in accounts if a != session.email]:
                     stored = self.load(other)
                     if stored is not None and stored.user_id == session.user_id:
-                        self.secrets.delete(_key(other))
-                        accounts.remove(other)
-                        displaced.append(stored)
-                        announce = True
+                        aliases.append((other, stored))
             previous = self.load(session.email)
+            # Save the new session before removing anything: if this fails,
+            # every existing entry is still intact.
+            self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
             if previous is not None and previous.uid != session.uid:
                 displaced.append(previous)
-            self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
             if session.email not in accounts:
                 accounts.append(session.email)
+                announce = True
+            for other, stored in aliases:
+                try:
+                    self.secrets.delete(_key(other))
+                except StoreUnavailable:
+                    continue  # left in place; the daemon skips duplicates anyway
+                accounts.remove(other)
+                displaced.append(stored)
                 announce = True
             if accounts != self.accounts():
                 self._write_index(accounts)
@@ -229,12 +239,42 @@ class SessionStore:
     # ------------------------------------------------------------ internals
 
     @contextlib.contextmanager
+    def refresh_guard(self, email: str) -> Iterator[Session | None]:
+        """Hold the store lock across a token renewal and its save, and yield
+        the session as currently stored, so every process sees renewals as
+        all-or-nothing and nobody spends a token someone else already used."""
+        with self._locked():
+            try:
+                current = self.load(email)
+            except Exception:
+                current = None
+            yield current
+
+    def load_locked(self, email: str) -> Session | None:
+        """Read under the lock: never observes a renewal that is half done."""
+        with self._locked():
+            return self.load(email)
+
+    @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
+        # Re-entrant for the thread holding it (saving the renewed tokens
+        # happens while the renewal still holds the lock); exclusive across
+        # threads and processes through flock on a fresh descriptor.
+        depth = getattr(self._held, "depth", 0)
+        if depth:
+            self._held.depth = depth + 1
+            try:
+                yield
+            finally:
+                self._held.depth = depth
+            return
         fd = open_private(self._lock)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
+            self._held.depth = 1
             yield
         finally:
+            self._held.depth = 0
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 

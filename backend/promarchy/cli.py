@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from . import __version__
-from .api import HumanVerificationRequired, ProtonClient, ProtonError, Session, WrongCredentials
+from .api import HumanVerificationRequired, ProtonClient, ProtonError, RateLimited, Session, WrongCredentials
 from .auth import (
     UNCONFIRMED,
     HumanVerification,
@@ -295,7 +295,16 @@ def _logout_one(store: SessionStore, email: str, local: bool) -> int:
         except Exception:
             unsaved.append(updated)
 
-    outcome = end_session(ProtonClient(session, on_refresh=persist), lambda: store.load(email))
+    client = ProtonClient(session, on_refresh=persist, refresh_guard=lambda: store.refresh_guard(email))
+    try:
+        outcome = end_session(client, lambda: store.load_locked(email))
+    except RateLimited as exc:
+        outcome = UNCONFIRMED
+        print(f"Proton asked to wait {exc.retry_after} s before more requests.", file=sys.stderr)
+    if unsaved:  # one more attempt before reporting
+        with contextlib.suppress(Exception):
+            store.update_tokens(unsaved[-1])
+            unsaved.clear()
     if outcome == UNCONFIRMED and not local:
         print(
             f"✗ {email}: could not confirm with Proton that the session ended, so it is still signed in.\n"
@@ -305,7 +314,9 @@ def _logout_one(store: SessionStore, email: str, local: bool) -> int:
         )
         if unsaved:
             print(
-                "  Proton also issued fresh credentials that could not be saved to your keyring.",
+                "  Proton also issued fresh credentials that could not be saved to your keyring, so this\n"
+                "  session can no longer be renewed here: sign in again, and end the old session under\n"
+                "  Proton's Settings → Security → Session management.",
                 file=sys.stderr,
             )
         return 1

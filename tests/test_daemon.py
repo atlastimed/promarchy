@@ -32,7 +32,7 @@ def env(tmp_path):
     out = io.StringIO()
     notifier = RecordingNotifier()
 
-    def factory(session, on_refresh=None):
+    def factory(session, on_refresh=None, **kw):
         api.session = session
         api.on_refresh = on_refresh
         return api
@@ -264,7 +264,7 @@ class FlakyStore(SessionStore):
 
 
 def make_daemon(env, store):
-    def factory(session, on_refresh=None):
+    def factory(session, on_refresh=None, **kw):
         env.api.session = session
         env.api.on_refresh = on_refresh
         return env.api

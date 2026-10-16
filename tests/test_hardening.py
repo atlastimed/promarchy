@@ -44,7 +44,7 @@ def daemon_env(tmp_path):
     store = make_store(tmp_path)
     out = io.StringIO()
 
-    def factory(s, on_refresh=None):
+    def factory(s, on_refresh=None, **kw):
         api.session = s
         return api
 

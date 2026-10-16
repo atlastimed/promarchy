@@ -243,40 +243,53 @@ def wait_for(predicate, timeout: float = 75.0) -> float | None:
     return None
 
 
+def is_single_unread(conversation: dict) -> bool:
+    """Exactly one message in the whole conversation, unread, in the Inbox.
+
+    Marking a conversation read touches all its messages, while marking it
+    unread again only restores one (Proton's own behaviour), so anything else
+    could not be restored exactly.
+    """
+    ctx = inbox_context(conversation)
+    return (
+        conversation.get("NumMessages") == 1
+        and conversation.get("NumUnread") == 1
+        and ctx.get("ContextNumMessages") == 1
+        and ctx.get("ContextNumUnread") == 1
+    )
+
+
 def roundtrip(probe: Probe, alias: Aliases) -> dict:
     page = label_params(()) + [("Page", "0"), ("PageSize", "50"), ("Sort", "Time"), ("Desc", "1")]
     conversations = probe.get("/mail/v4/conversations", params=page).get("Conversations") or []
-    target = next(
-        (
-            c
-            for c in conversations
-            if inbox_context(c).get("ContextNumMessages") == 1
-            and inbox_context(c).get("ContextNumUnread") == 1
-        ),
-        None,
-    )
+    target = next((c for c in conversations if is_single_unread(c)), None)
     if target is None:
-        return {"skipped": "no unread single-message inbox conversation among the newest 50"}
+        return {"skipped": "no unread single-message conversation in the newest 50"}
     cid = str(target["ID"])
+    # Re-check just before writing: the list may be seconds old.
+    if not is_single_unread(probe.get(f"/mail/v4/conversations/{cid}").get("Conversation") or {}):
+        return {"skipped": "the chosen conversation changed before the test; nothing was modified"}
     before = (snapshot().get("counts") or {}).get("all")
     result: dict = {"conversation": alias(cid, "c"), "barAllBefore": before}
-    marked = False
+    dispatched = False
     try:
+        dispatched = True  # a sent write may have landed even if its reply is lost
         probe.put("/mail/v4/conversations/read", {"IDs": [cid]})
-        marked = True
         result["barReflectedReadAfterSeconds"] = wait_for(
             lambda: (snapshot().get("counts") or {}).get("all") == (before or 0) - 1
         )
     finally:
-        if marked:
-            probe.put("/mail/v4/conversations/unread", {"IDs": [cid], "LabelID": INBOX})
+        if dispatched:
+            try:
+                probe.put("/mail/v4/conversations/unread", {"IDs": [cid], "LabelID": INBOX})
+            except ProtonError as exc:
+                result["restoreError"] = f"{type(exc).__name__} (HTTP {exc.status}); restore it by hand"
     result["barRestoredAfterSeconds"] = wait_for(
         lambda: (snapshot().get("counts") or {}).get("all") == before
     )
-    check = probe.get(f"/mail/v4/conversations/{cid}")
-    restored = inbox_context(check.get("Conversation") or {}).get("ContextNumUnread")
-    result["inboxUnreadAfterRestore"] = restored
-    result["restored"] = restored == 1
+    after = probe.get(f"/mail/v4/conversations/{cid}").get("Conversation") or {}
+    result["unreadAfterRestore"] = after.get("NumUnread")
+    result["restored"] = is_single_unread(after)
     return result
 
 
