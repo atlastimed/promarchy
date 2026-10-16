@@ -696,3 +696,83 @@ def test_tokens_kept_only_in_memory_are_shown(tmp_path):
     state = daemon.snapshot()
     assert state["status"] == "partial"
     assert "not yet saved to the keyring" in state["message"]
+
+
+# ------------------------------------------- final release review (P1, P2s)
+
+
+def tool_backend(monkeypatch, run):
+    backend = SecretToolBackend.__new__(SecretToolBackend)
+    backend.tool = "/usr/bin/secret-tool"
+    monkeypatch.setattr(backend, "_run", run)
+    return backend
+
+
+def completed(returncode, stdout="", stderr=""):
+    import subprocess
+
+    return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
+
+
+def test_a_helper_killed_after_writing_is_indeterminate_not_a_refusal(monkeypatch):
+    """P1-1: status -9 proves nothing about whether the item was stored."""
+    for result in (completed(-9), completed(2)):
+        backend = tool_backend(monkeypatch, lambda *a, secret=None, r=result: r)
+        with pytest.raises(SaveIndeterminate):
+            backend.set("session:x", "{}")
+    refused = tool_backend(monkeypatch, lambda *a, secret=None: completed(1, stderr="Cannot create an item"))
+    with pytest.raises(StoreUnavailable) as failure:
+        refused.set("session:x", "{}")
+    assert not isinstance(failure.value, SaveIndeterminate)
+
+
+def test_a_leftover_from_an_older_version_never_shadows_the_current_item(monkeypatch):
+    """P2-2: lookups prefer Promarchy's own item."""
+
+    def run(*args, secret=None):
+        if args[0] == "lookup" and "application" in args:
+            return completed(0, stdout="current\n")
+        if args[0] == "lookup":
+            return completed(0, stdout="legacy\n")
+        if args[0] == "clear":
+            return completed(1, stderr="Locked")  # the legacy item survives
+        return completed(0)
+
+    backend = tool_backend(monkeypatch, run)
+    backend.set("session:x", "current")  # a failed legacy clear is logged, not raised
+    assert backend.get("session:x") == "current"
+
+
+def test_older_items_are_still_read_when_there_is_no_current_one(monkeypatch):
+    def run(*args, secret=None):
+        if "application" in args:
+            return completed(1)  # no match
+        return completed(0, stdout="legacy\n")
+
+    assert tool_backend(monkeypatch, run).get("session:x") == "legacy"
+
+
+def test_the_unsaved_warning_survives_going_offline(tmp_path):
+    """P2-1"""
+    from promarchy.api import NetworkError
+
+    store = make_store(tmp_path)
+    store.save(Session(uid="u1", access_token="a", refresh_token="r", email="me@proton.me"))
+    api = FakeProton()
+    daemon = make_daemon(store, tmp_path, shared_api_factory(api))
+    daemon.tick()
+
+    def refuse(key, value):
+        raise StoreUnavailable("keyring locked")
+
+    store.secrets.set = refuse
+    daemon.unsaved["me@proton.me"] = Session(
+        uid="u1", access_token="a2", refresh_token="r2", email="me@proton.me"
+    )
+    daemon._persist_unsaved(force=True)
+    api.fail_with = NetworkError("offline")
+    daemon.accounts["me@proton.me"].next_poll = 0
+    daemon.tick()
+    state = daemon.snapshot()
+    assert state["status"] == "offline"
+    assert "not yet saved to the keyring" in state["message"]

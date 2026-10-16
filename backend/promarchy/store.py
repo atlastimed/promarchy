@@ -50,6 +50,7 @@ class SecretToolBackend:
     of a D-Bus and crypto stack it would otherwise carry around.
     """
 
+    APPLICATION = "promarchy"
     LEGACY_APPLICATION = "Python keyring library"  # items written by 0.1.0 pre-releases
 
     def __init__(self) -> None:
@@ -83,7 +84,15 @@ class SecretToolBackend:
         return StoreUnavailable(f"{action}: {detail}")
 
     def get(self, key: str) -> str | None:
-        result = self._run("lookup", "service", KEYRING_SERVICE, "username", key)
+        # Our own item first: one an older version left behind (and could
+        # not clear) must never shadow the current session.
+        current = self._lookup("service", KEYRING_SERVICE, "username", key, "application", self.APPLICATION)
+        if current is not None:
+            return current
+        return self._lookup("service", KEYRING_SERVICE, "username", key)
+
+    def _lookup(self, *attributes: str) -> str | None:
+        result = self._run("lookup", *attributes)
         if result.returncode == 0:
             return result.stdout.rstrip("\n") or None
         if self._no_match(result):
@@ -102,17 +111,23 @@ class SecretToolBackend:
                 "username",
                 key,
                 "application",
-                "promarchy",
+                self.APPLICATION,
                 secret=value,
             )
         except StoreUnavailable as exc:  # timed out or crashed mid-write
             raise SaveIndeterminate(str(exc)) from exc
-        if result.returncode != 0:  # the helper refused: nothing was stored
+        if result.returncode > 0 and result.stderr.strip():  # the helper refused: nothing was stored
             raise self._failure("Could not save to the keyring", result)
-        try:  # tidying up after older versions must not turn a save into a failure
-            self._run(
+        if result.returncode != 0:  # killed by a signal, or failed without saying why
+            raise SaveIndeterminate(f"secret-tool ended with status {result.returncode}")
+        # Tidying up after older versions must not turn a save into a failure;
+        # a leftover cannot shadow the new item (see get()).
+        try:
+            cleared = self._run(
                 "clear", "service", KEYRING_SERVICE, "username", key, "application", self.LEGACY_APPLICATION
             )
+            if cleared.returncode != 0 and not self._no_match(cleared):
+                raise self._failure("Could not clear an older keyring item", cleared)
         except StoreUnavailable as exc:
             log_error("clearing a legacy keyring item", exc)
 

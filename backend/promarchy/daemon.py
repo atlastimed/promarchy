@@ -818,6 +818,16 @@ class Daemon:
         rows.sort(key=lambda r: r["time"], reverse=True)
         rows = rows[: self.config.recent_limit]
         status, message = self._overall_status(accounts, synced_any)
+        if self.unsaved and self.unsaved_failures:
+            # Working, but only in memory: say so whatever else is going on,
+            # until the keyring takes it.
+            warning = " ".join(
+                f"{email}: renewed sign-in not yet saved to the keyring (is it locked?); retrying."
+                " Until then, restarting Promarchy would sign you out."
+                for email in self.unsaved
+            )
+            status = "partial" if status == "ok" else status
+            message = f"{message}; {warning}" if message else warning
         if self.notice and self.mono() < self.notice_until:
             message = f"{self.notice} {message}".strip()
         return {
@@ -844,13 +854,6 @@ class Daemon:
             notes = [f"{a['email']}: {a['error'] or a['status']}" for a in problems]
             if self.store_error:
                 notes.append(self.store_error)
-            if self.unsaved and self.unsaved_failures:
-                # Working, but only in memory: say so until the keyring takes it.
-                notes.extend(
-                    f"{email}: renewed sign-in not yet saved to the keyring (is it locked?); retrying."
-                    " Until then, restarting Promarchy would sign you out."
-                    for email in self.unsaved
-                )
             # Some accounts work and some do not: say so, so partial totals
             # are never mistaken for the whole picture.
             return ("partial" if notes else "ok"), "; ".join(notes)
