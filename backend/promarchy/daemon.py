@@ -42,6 +42,7 @@ STAMP_CHECK_SECONDS = 5
 LOCK_WAIT_SECONDS = 15
 MAX_BACKOFF = 300
 STORE_RETRY_MAX = 120
+AUTH_RECHECK_SECONDS = 120
 SHUTDOWN_GRACE = 10  # seconds a SIGTERM waits for the current step
 DEMO_INTERVAL = 30.0
 NOTICE_SECONDS = 120
@@ -204,6 +205,11 @@ class Daemon:
         self._sync_accounts()
         now = self.mono()
         for account in list(self.accounts.values()):
+            check_at = account.extra.get("auth_check_at")
+            if account.status == "auth-expired" and check_at is not None and now >= check_at:
+                account.extra["auth_check_at"] = now + AUTH_RECHECK_SECONDS
+                if self._adopt_stored_tokens(account):
+                    account.next_poll = now
             # One gate for every scheduled request: Proton's Retry-After wins
             # over whatever set next_poll (a command, a settings change).
             if account.next_poll <= now and now >= account.rate_limited_until:
@@ -491,8 +497,13 @@ class Daemon:
         now = self.mono()
         account.error = str(exc)
         if isinstance(exc, AuthExpired):
+            if self._adopt_stored_tokens(account):
+                account.error = ""
+                account.next_poll = now  # retry at once with the live tokens
+                return
             account.status = "auth-expired"
-            account.next_poll = float("inf")  # until a new sign-in bumps the stamp
+            account.next_poll = float("inf")  # until a sign-in, or tokens appear (see tick)
+            account.extra["auth_check_at"] = now + AUTH_RECHECK_SECONDS
             return
         account.failures += 1
         if isinstance(exc, RateLimited):
@@ -503,6 +514,28 @@ class Daemon:
         account.status = "offline" if isinstance(exc, NetworkError) else "error"
         account.backoff_until = now + min(MAX_BACKOFF, 5 * 2 ** min(account.failures, 6))
         account.next_poll = account.backoff_until
+
+    def _adopt_stored_tokens(self, account: Account) -> bool:
+        """Recover when another process renewed this session.
+
+        Refresh tokens are single-use: if the CLI (or anything else using the
+        stored session) renewed it, ours was consumed and Proton rejects it,
+        although the keyring holds a working pair for the very same session.
+        Take that pair instead of declaring the session expired.
+        """
+        current = account.client.session
+        try:
+            stored = self.store.load(account.email)
+        except Exception as exc:
+            log_error("re-reading a session", exc)
+            return False
+        if stored is None or current is None or stored.uid != current.uid:
+            return False
+        if stored.refresh_token == current.refresh_token:
+            return False
+        account.client.session = stored
+        self.unsaved.pop(account.email, None)
+        return True
 
     def _after_sync(self, account: Account) -> None:
         mailbox = account.mailbox

@@ -359,3 +359,39 @@ def test_quiet_status_one_means_no_match(monkeypatch):
     backend = backend_returning(monkeypatch, 1)
     backend.delete("session:x")  # nothing to delete: fine
     assert backend.get("session:x") is None
+
+
+# -------------------------------------------- tokens renewed by another process
+
+
+def test_daemon_adopts_tokens_another_process_renewed(daemon_env):  # noqa: F811
+    from promarchy.api import AuthExpired
+
+    d, api, store, clock, states = daemon_env
+    store.save(Session(uid="u", access_token="a1", refresh_token="r1", email="me@proton.me"))
+    d.tick()
+    # The CLI renews the same session; the daemon's r1 is now consumed.
+    store.update_tokens(Session(uid="u", access_token="a2", refresh_token="r2", email="me@proton.me"))
+    api.queue_event(**{"raise": AuthExpired("refresh token rejected")})
+    clock.advance(31)
+    d.tick()  # fails, re-reads the keyring, adopts r2
+    clock.advance(1)
+    d.tick()
+    assert states()[-1]["status"] == "ok"
+    assert d.accounts["me@proton.me"].client.session.refresh_token == "r2"
+
+
+def test_daemon_still_reports_a_genuinely_expired_session(daemon_env):  # noqa: F811
+    from promarchy.api import AuthExpired
+
+    d, api, store, clock, states = daemon_env
+    store.save(Session(uid="u", access_token="a1", refresh_token="r1", email="me@proton.me"))
+    d.tick()
+    api.fail_with = AuthExpired("refresh token rejected")
+    clock.advance(31)
+    d.tick()
+    assert states()[-1]["status"] == "auth-expired"
+    calls = len(api.calls)
+    clock.advance(600)
+    d.tick()
+    assert len(api.calls) == calls  # no hammering while expired
