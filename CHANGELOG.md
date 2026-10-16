@@ -22,3 +22,8 @@ Hardening from the pre-release reviews:
 - Partial failures across accounts are shown instead of hidden; the dropdown lists conversations with exact counts.
 - Private files are written via exclusive temp files; state directories are verified and tightened.
 - Demo mode no longer busy-wakes; daemon restart backoff resets only after stable uptime; the QML lint gate fails closed.
+- Sign-out re-checks the stored session before trusting a rejected refresh token (another process may have rotated it), keeps going if fresh tokens cannot be saved, and changes nothing when the saved session cannot be read.
+- Sender logos are raster-only (requested as PNG, checked by file signature); SVG is never stored or shown.
+- Conversation rows use the Inbox's own context when a thread spans folders.
+- A Proton account is identified by its UserID, so signing in through another of its addresses replaces the old entry instead of counting the mailbox twice.
+- Proton's Retry-After also holds off settings changes, mark-as-read and sign-out; unexpected keyring-helper exits are reported as errors.

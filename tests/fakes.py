@@ -110,7 +110,7 @@ class FakeProton:
         self.calls.append(("GET", path, params, None))
         if self.logo_error is not None:
             raise self.logo_error
-        return self.logo_status, "image/png", b"\x89PNG fake"
+        return self.logo_status, "image/png", b"\x89PNG\r\n\x1a\n fake"
 
     def close(self) -> None:
         pass
@@ -153,19 +153,35 @@ class FakeProton:
         return found, single
 
     def _conversations(self, params) -> dict:
-        """Conversations with Context* counts for the requested folder, newest first."""
+        """Shaped like Proton's response (verified against the live API):
+        per-label context in `Labels`, `CategoryID`, top-level Context* for
+        the queried folder, and whole-conversation Num* totals."""
         found, single = self._matching(params)
-        groups: dict[str, list[dict]] = {}
-        for m in found:
-            groups.setdefault(m["ConversationID"], []).append(m)
+        pairs = list(params.items()) if isinstance(params, dict) else list(params)
+        location = [str(v) for k, v in pairs if k in ("LabelID", "LabelID[]")][0]
         items = []
-        for cid, msgs in groups.items():
-            newest = max(msgs, key=lambda m: m["Time"])
+        for cid in dict.fromkeys(m["ConversationID"] for m in found):
+            msgs = [m for m in self.messages if m["ConversationID"] == cid]
             labels = sorted({label for m in msgs for label in m["LabelIDs"]})
+
+            def ctx(label, msgs=msgs):
+                inside = [m for m in msgs if label in m["LabelIDs"]]
+                return {
+                    "ID": label,
+                    "ContextNumMessages": len(inside),
+                    "ContextNumUnread": sum(1 for m in inside if m["Unread"]),
+                    "ContextTime": max((m["Time"] for m in inside), default=0),
+                    "ContextNumAttachments": sum(m["NumAttachments"] for m in inside),
+                }
+
+            here = ctx(location)
+            category = next(
+                (label for label in labels if label in ("20", "21", "22", "23", "24", "25", "26")), ""
+            )
             items.append(
                 {
                     "ID": cid,
-                    "Subject": newest["Subject"],
+                    "Subject": max(msgs, key=lambda m: m["Time"])["Subject"],
                     "Senders": [
                         {
                             "Name": m["SenderName"],
@@ -174,11 +190,15 @@ class FakeProton:
                         }
                         for m in sorted(msgs, key=lambda m: m["Time"])
                     ],
-                    "ContextTime": newest["Time"],
-                    "ContextNumMessages": len(msgs),
-                    "ContextNumUnread": sum(1 for m in msgs if m["Unread"]),
-                    "ContextNumAttachments": sum(m["NumAttachments"] for m in msgs),
-                    "LabelIDs": labels,
+                    "Labels": [ctx(label) for label in labels],
+                    "CategoryID": category,
+                    "ContextNumMessages": here["ContextNumMessages"],
+                    "ContextNumUnread": here["ContextNumUnread"],
+                    "ContextTime": here["ContextTime"],
+                    "ContextNumAttachments": here["ContextNumAttachments"],
+                    "NumMessages": len(msgs),
+                    "NumUnread": sum(1 for m in msgs if m["Unread"]),
+                    "Time": max(m["Time"] for m in msgs),
                 }
             )
         items.sort(key=lambda c: c["ContextTime"], reverse=True)

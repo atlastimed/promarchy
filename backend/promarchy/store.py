@@ -64,13 +64,24 @@ class SecretToolBackend:
         except (OSError, subprocess.SubprocessError) as exc:
             raise StoreUnavailable(f"Could not talk to the keyring: {exc.__class__.__name__}") from exc
 
+    @staticmethod
+    def _no_match(result: subprocess.CompletedProcess) -> bool:
+        # secret-tool's only quiet failure: exit status 1, nothing on stderr.
+        # Anything else (a signal, another status, a message) is a real error.
+        return result.returncode == 1 and not result.stderr.strip()
+
+    @staticmethod
+    def _failure(action: str, result: subprocess.CompletedProcess) -> StoreUnavailable:
+        detail = result.stderr.strip()[:200] or f"secret-tool exited with status {result.returncode}"
+        return StoreUnavailable(f"{action}: {detail}")
+
     def get(self, key: str) -> str | None:
         result = self._run("lookup", "service", KEYRING_SERVICE, "username", key)
-        if result.returncode != 0:
-            if result.stderr.strip():
-                raise StoreUnavailable(f"Keyring lookup failed: {result.stderr.strip()[:200]}")
-            return None  # no such item
-        return result.stdout.rstrip("\n") or None
+        if result.returncode == 0:
+            return result.stdout.rstrip("\n") or None
+        if self._no_match(result):
+            return None
+        raise self._failure("Keyring lookup failed", result)
 
     def set(self, key: str, value: str) -> None:
         label = f"Promarchy: Proton Mail session ({key.removeprefix('session:')})"
@@ -87,17 +98,15 @@ class SecretToolBackend:
             secret=value,
         )
         if result.returncode != 0:
-            raise StoreUnavailable(f"Could not save to the keyring: {result.stderr.strip()[:200]}")
+            raise self._failure("Could not save to the keyring", result)
         self._run(
             "clear", "service", KEYRING_SERVICE, "username", key, "application", self.LEGACY_APPLICATION
         )
 
     def delete(self, key: str) -> None:
         result = self._run("clear", "service", KEYRING_SERVICE, "username", key)
-        # Exit status 1 with no message means nothing matched: already gone.
-        if result.returncode != 0 and result.stderr.strip():
-            detail = result.stderr.strip()[:200]
-            raise StoreUnavailable(f"Could not remove the session from the keyring: {detail}")
+        if result.returncode != 0 and not self._no_match(result):  # no match: already gone
+            raise self._failure("Could not remove the session from the keyring", result)
 
 
 class SessionStore:
@@ -148,26 +157,40 @@ class SessionStore:
         made that change itself and must not treat it as a new sign-in."""
         self.replace(session, announce=announce)
 
-    def replace(self, session: Session, *, announce: bool = True) -> Session | None:
-        """Store a (new) session and return the different one it replaced.
+    def replace(self, session: Session, *, announce: bool = True) -> list[Session]:
+        """Store a (new) session and return every session it displaced.
 
-        Read and write happen under one lock, so two sign-ins racing for the
-        same account each get back exactly the session they displaced, and
-        the caller can revoke it instead of leaving it valid on Proton's side.
+        A Proton account is identified by its UserID, not by the address you
+        typed: signing in again through another of its addresses replaces the
+        old entry instead of adding the same mailbox twice. Read and write
+        happen under one lock, so racing sign-ins each get back exactly what
+        they displaced, and the caller revokes it on Proton's side.
         """
         if not session.email:
             raise ValueError("session has no account email")
+        displaced: list[Session] = []
         with self._locked():
-            previous = self.load(session.email)
-            self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
             accounts = self.accounts()
+            if session.user_id:
+                for other in [a for a in accounts if a != session.email]:
+                    stored = self.load(other)
+                    if stored is not None and stored.user_id == session.user_id:
+                        self.secrets.delete(_key(other))
+                        accounts.remove(other)
+                        displaced.append(stored)
+                        announce = True
+            previous = self.load(session.email)
+            if previous is not None and previous.uid != session.uid:
+                displaced.append(previous)
+            self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
             if session.email not in accounts:
                 accounts.append(session.email)
-                self._write_index(accounts)
                 announce = True
+            if accounts != self.accounts():
+                self._write_index(accounts)
             if announce:
                 self._bump()
-        return previous if previous is not None and previous.uid != session.uid else None
+        return displaced
 
     def update_tokens(self, session: Session) -> bool:
         """Persist rotated tokens, but only onto the same live session.
@@ -185,15 +208,18 @@ class SessionStore:
             self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
             return True
 
-    def remove(self, email: str, expected_uid: str | None = None) -> bool:
-        """Forget an account. With `expected_uid`, only if that exact session
-        is still the stored one (a newer sign-in must not be thrown away).
-        The keyring entry goes first: if that fails, the index is untouched
-        and the error propagates, so nothing is half-removed."""
+    def remove(self, email: str, expected_uid: str | None = None, *, require_absent: bool = False) -> bool:
+        """Forget an account, only if it is still in the state the caller saw.
+
+        `expected_uid`: that exact session must still be the stored one (a
+        newer sign-in is never thrown away). `require_absent`: there must
+        still be no stored session (the caller found none). The keyring entry
+        goes first: if that fails, the index is untouched and the error
+        propagates, so nothing is half-removed."""
         with self._locked():
-            if expected_uid is not None:
+            if expected_uid is not None or require_absent:
                 stored = self.load(email)
-                if stored is not None and stored.uid != expected_uid:
+                if stored is not None and (require_absent or stored.uid != expected_uid):
                     return False
             self.secrets.delete(_key(email))
             self._write_index([a for a in self.accounts() if a != email])

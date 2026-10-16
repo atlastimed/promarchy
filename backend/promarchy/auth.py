@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .api import AuthExpired, ProtonClient, ProtonError, Session, WrongCredentials
@@ -177,14 +178,45 @@ def primary_address(client: ProtonClient, username: str) -> str:
     return username.lower()
 
 
-def logout(client: ProtonClient) -> bool:
-    """Revoke the session on Proton's side.
+REVOKED = "revoked"  # Proton confirmed the session is ended
+GONE = "gone"  # the session was already invalid on Proton's side
+UNCONFIRMED = "unconfirmed"  # could not confirm; the session may still be live
 
-    True when Proton confirmed it, or when the session is already dead (its
-    refresh token was rejected). False when Proton could not be reached or
-    refused for another reason, in which case the session may still be live.
-    An expired access token is refreshed first so the revocation can go through.
+
+def end_session(client: ProtonClient, reload: Callable[[], Session | None]) -> str:
+    """End the client's session on Proton's side and say what is known.
+
+    A rejected refresh token alone does not prove the session is dead: the
+    daemon may have rotated it a moment ago. So before believing that, we
+    re-read the stored session; if someone else rotated the tokens, we retry
+    with the live ones. Only an unchanged, rejected session counts as GONE.
     """
+    for _ in range(3):
+        if client.session is None:
+            return GONE
+        tried = client.session.refresh_token
+        try:
+            client.call("DELETE", "/auth/v4")
+            return REVOKED
+        except AuthExpired:
+            try:
+                stored = reload()
+            except Exception:
+                return UNCONFIRMED
+            if stored is None or stored.uid != client.session.uid:
+                return GONE  # signed out or replaced elsewhere; ours is dead
+            if stored.refresh_token in (tried, client.session.refresh_token):
+                return GONE
+            client.session = stored  # rotated by another process: try again
+        except ProtonError:
+            return UNCONFIRMED
+    return UNCONFIRMED
+
+
+def logout(client: ProtonClient) -> bool:
+    """Best-effort revoke of a session no one else holds (a sign-in that is
+    being abandoned, or one just displaced). True when Proton confirmed it or
+    the session is already dead; for stored sessions use end_session()."""
     try:
         client.call("DELETE", "/auth/v4")
         return True

@@ -15,11 +15,13 @@ from pathlib import Path
 from urllib.parse import quote
 
 from . import __version__
-from .api import HumanVerificationRequired, ProtonClient, ProtonError, WrongCredentials
+from .api import HumanVerificationRequired, ProtonClient, ProtonError, Session, WrongCredentials
 from .auth import (
+    UNCONFIRMED,
     HumanVerification,
     MissingDependency,
     begin_login,
+    end_session,
     logout,
     primary_address,
     request_verification_code,
@@ -126,7 +128,7 @@ def _login(username: str | None) -> str:
         email = primary_address(client, username)
         pending.session.email = email
         try:
-            previous = store.replace(pending.session)
+            displaced = store.replace(pending.session)
         except Exception as exc:
             raise LoginFailed(f"Signed in, but could not save the session to your keyring: {exc}") from exc
         committed = True
@@ -139,12 +141,15 @@ def _login(username: str | None) -> str:
         # Ctrl+C) must not leave a live session behind on Proton's side.
         if not committed:
             logout(client)
-    if previous is not None and not logout(ProtonClient(previous)):
-        print(
-            "Note: the session this sign-in replaced could not be revoked (Proton unreachable).\n"
-            "You can end it under Proton's Settings → Security → Session management.",
-            file=sys.stderr,
-        )
+    for old_session in displaced:
+        if old_session.email != email:
+            print(f"{old_session.email} is the same Proton account; it now appears as {email}.")
+        if not logout(ProtonClient(old_session)):
+            print(
+                "Note: a session this sign-in replaced could not be revoked (Proton unreachable).\n"
+                "You can end it under Proton's Settings → Security → Session management.",
+                file=sys.stderr,
+            )
     return email
 
 
@@ -233,10 +238,12 @@ def record_login(ok: bool, detail: str) -> None:
 
 
 def cmd_logout(args: argparse.Namespace) -> int:
-    """Revoke and forget sessions, reporting each step truthfully.
+    """End sessions on Proton's side and forget them here, truthfully.
 
-    A session is only forgotten locally once Proton confirmed the revocation
-    (or it was already dead), unless --local says to forget it regardless.
+    A session is forgotten only once Proton confirmed it is over (or it was
+    already dead), unless --local says to forget it regardless. Every local
+    removal is conditional on the state we saw, so a sign-in racing with
+    this never loses its fresh session.
     """
     store = SessionStore()
     accounts = store.accounts()
@@ -251,37 +258,64 @@ def cmd_logout(args: argparse.Namespace) -> int:
             status = 1
             continue
         try:
-            session = store.load(email)
+            status |= _logout_one(store, email, args.local)
         except StoreUnavailable as exc:
             print(f"✗ {email}: {exc}", file=sys.stderr)
             status = 1
-            continue
-        revoked = True
-        if session is not None:
-            client = ProtonClient(session, on_refresh=store.update_tokens)
-            revoked = logout(client)
-            if not revoked and not args.local:
-                print(
-                    f"✗ {email}: Proton could not be reached to end the session, so it is still signed in.\n"
-                    "  Try again when online, or add --local to forget it here anyway (then end it under\n"
-                    "  Proton's Settings → Security → Session management).",
-                    file=sys.stderr,
-                )
-                status = 1
-                continue
-        try:
-            removed = store.remove(email, expected_uid=session.uid if session else None)
-        except StoreUnavailable as exc:
-            print(f"✗ {email}: {exc}", file=sys.stderr)
-            status = 1
-            continue
-        if not removed:
-            print(f"{email} was signed in again meanwhile; kept the newer session.")
-        elif revoked:
-            print(f"Signed out {email}.")
-        else:
-            print(f"Forgot {email} on this machine. Its session could not be ended on Proton's side.")
     return status
+
+
+def _logout_one(store: SessionStore, email: str, local: bool) -> int:
+    session = store.load(email)
+    if session is None:
+        # Nothing to revoke, but an empty answer can also mean a locked
+        # keyring: only forget the account when asked to, and only if a
+        # session still has not appeared meanwhile.
+        if not local:
+            print(
+                f"✗ {email}: its saved session could not be read (is your keyring locked?).\n"
+                "  Nothing was changed. Unlock the keyring and try again,\n"
+                "  or add --local to remove it anyway.",
+                file=sys.stderr,
+            )
+            return 1
+        if store.remove(email, require_absent=True):
+            print(f"Removed {email} (it had no saved session).")
+        else:
+            print(f"{email} was signed in again meanwhile; kept the new session.")
+        return 0
+
+    unsaved: list[Session] = []
+
+    def persist(updated: Session) -> None:
+        # Never let a keyring hiccup abort the sign-out halfway: keep the
+        # fresh tokens in memory, finish the revocation, then report.
+        try:
+            store.update_tokens(updated)
+        except Exception:
+            unsaved.append(updated)
+
+    outcome = end_session(ProtonClient(session, on_refresh=persist), lambda: store.load(email))
+    if outcome == UNCONFIRMED and not local:
+        print(
+            f"✗ {email}: could not confirm with Proton that the session ended, so it is still signed in.\n"
+            "  Try again when online, or add --local to forget it here anyway (then end it under\n"
+            "  Proton's Settings → Security → Session management).",
+            file=sys.stderr,
+        )
+        if unsaved:
+            print(
+                "  Proton also issued fresh credentials that could not be saved to your keyring.",
+                file=sys.stderr,
+            )
+        return 1
+    if not store.remove(email, expected_uid=session.uid):
+        print(f"{email} was signed in again meanwhile; kept the newer session.")
+    elif outcome == UNCONFIRMED:
+        print(f"Forgot {email} on this machine. Its session could not be ended on Proton's side.")
+    else:
+        print(f"Signed out {email}.")
+    return 0
 
 
 def cmd_accounts(_: argparse.Namespace) -> int:

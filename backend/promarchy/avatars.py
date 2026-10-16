@@ -6,12 +6,16 @@ address is looked up). Only senders Proton flags with ``DisplaySenderImage``
 are fetched, a handful per sync at most, and hits and misses are both cached
 so steady state costs no requests. A rate limit ends the pass and pauses
 logo lookups until Proton's retry time.
+
+Only raster images are accepted. SVG can reference other files, and no
+byte-level filter is a sound boundary for it (an encoding change defeats
+pattern matching), so we ask Proton to rasterise (``Format=png``), check the
+file signature of whatever comes back, and never store or display SVG.
 """
 
 from __future__ import annotations
 
 import hashlib
-import re
 import time
 from pathlib import Path
 
@@ -22,11 +26,18 @@ HIT_TTL = 14 * 86400
 MISS_TTL = 2 * 86400
 FETCH_BUDGET = 6
 MAX_BYTES = 512 * 1024
-EXTENSIONS = {"image/png": ".png", "image/svg+xml": ".svg", "image/jpeg": ".jpg", "image/webp": ".webp"}
+EXTENSIONS = (".png", ".jpg", ".webp")
 
-# Brand logos are plain vector paths. Anything that could make the renderer
-# reach for other files or run code is refused rather than sanitised.
-_SVG_REJECT = re.compile(rb"<script|<image|<foreignobject|<!entity|<!doctype|href|url\s*\(", re.I)
+
+def raster_extension(body: bytes) -> str | None:
+    """Identify PNG, JPEG or WebP by signature; anything else is refused."""
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if body.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return ".webp"
+    return None
 
 
 class Avatars:
@@ -62,11 +73,17 @@ class Avatars:
         return changed
 
     def prune(self) -> int:
-        """Delete expired hits and misses so the cache cannot grow forever."""
+        """Delete expired hits and misses, and anything that is not a raster
+        logo or miss marker (such as SVGs cached by earlier versions)."""
         now = self.clock()
         removed = 0
         for path in self.root.iterdir():
             try:
+                if path.suffix not in (*EXTENSIONS, ".miss"):
+                    if path.is_file() or path.is_symlink():
+                        path.unlink()
+                        removed += 1
+                    continue
                 ttl = MISS_TTL if path.suffix == ".miss" else HIT_TTL
                 if path.is_file() and not path.is_symlink() and now - path.stat().st_mtime >= ttl:
                     path.unlink()
@@ -83,7 +100,7 @@ class Avatars:
         """Path for a hit, False for a remembered miss, None when unknown."""
         stem = self._stem(address)
         now = self.clock()
-        for ext in EXTENSIONS.values():
+        for ext in EXTENSIONS:
             path = self.root / f"{stem}{ext}"
             try:
                 if now - path.stat().st_mtime < HIT_TTL:
@@ -103,15 +120,15 @@ class Avatars:
         try:
             status, ctype, body = client.fetch_bytes(
                 "/core/v4/images/logo",
-                params={"Address": address, "Size": 64, "Mode": self.mode},
+                params={"Address": address, "Size": 64, "Mode": self.mode, "Format": "png"},
                 max_bytes=MAX_BYTES,
             )
         except RateLimited:
             raise
         except ProtonError:
             return False  # transient: try again on a later sync
-        ext = EXTENSIONS.get(ctype)
-        if status != 200 or not ext or not body or (ext == ".svg" and _SVG_REJECT.search(body)):
+        ext = raster_extension(body) if status == 200 and ctype.startswith("image/") else None
+        if ext is None:
             write_private(self.root / f"{stem}.miss", b"")
             return False
         path = self.root / f"{stem}{ext}"

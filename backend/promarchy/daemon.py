@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .api import AuthExpired, NetworkError, ProtonClient, ProtonError, RateLimited, Session
-from .auth import logout as revoke_session
+from .auth import UNCONFIRMED, end_session
 from .avatars import Avatars
 from .demo import demo_state
 from .log import log_error
@@ -204,7 +204,9 @@ class Daemon:
         self._sync_accounts()
         now = self.mono()
         for account in list(self.accounts.values()):
-            if account.next_poll <= now:
+            # One gate for every scheduled request: Proton's Retry-After wins
+            # over whatever set next_poll (a command, a settings change).
+            if account.next_poll <= now and now >= account.rate_limited_until:
                 try:
                     self._poll(account)
                 except Exception as exc:  # a bug must not kill the bar's data source
@@ -294,7 +296,9 @@ class Daemon:
                 account.next_poll = account.rate_limited_until
                 account.extra["force"] = True
             elif config.poll_seconds < old.poll_seconds:
-                account.next_poll = min(account.next_poll, self.mono() + config.poll_seconds)
+                account.next_poll = max(
+                    account.rate_limited_until, min(account.next_poll, self.mono() + config.poll_seconds)
+                )
 
     def _logout(self, target: Any) -> None:
         """Revoke and forget accounts (all, or one by email). An account is
@@ -306,8 +310,12 @@ class Daemon:
             account = self.accounts.get(email)
             if account is None or account.client.session is None:
                 continue
+            if self.mono() < account.rate_limited_until:
+                failed.append(email)
+                continue
             uid = account.client.session.uid
-            if not revoke_session(account.client):
+            outcome = end_session(account.client, lambda email=email: self.store.load(email))
+            if outcome == UNCONFIRMED:
                 failed.append(email)
                 continue
             try:
@@ -330,6 +338,13 @@ class Daemon:
     def _mark_read(self, email: str, ids: list[Any], kind: str = "message") -> None:
         account = self.accounts.get(email)
         if account is None:
+            return
+        wait = account.rate_limited_until - self.mono()
+        if wait > 0:
+            self._set_notice(
+                f"Proton asked Promarchy to wait; try marking as read again in {int(wait) + 1} s."
+            )
+            self.emit()
             return
         try:
             account.mailbox.mark_read([str(i) for i in ids if isinstance(i, str)], kind)
@@ -373,6 +388,14 @@ class Daemon:
                     missing.add(email)
                 continue
             if current and current.client.session and current.client.session.uid == session.uid:
+                continue
+            if session.user_id and any(
+                other != email and acc.client.session and acc.client.session.user_id == session.user_id
+                for other, acc in self.accounts.items()
+            ):
+                # The same Proton account under another address (an old entry
+                # a newer sign-in has not displaced yet): never count it twice.
+                log_error("skipping a duplicate entry for an account already loaded", RuntimeError())
                 continue
             if current:
                 current.client.close()

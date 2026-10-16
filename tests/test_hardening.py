@@ -196,9 +196,9 @@ def test_keyring_delete_failure_leaves_the_index_alone(tmp_path):
 
 def test_replace_returns_exactly_the_displaced_session(tmp_path):
     store = make_store(tmp_path)
-    assert store.replace(session(uid="a")) is None
-    assert store.replace(session(uid="b")).uid == "a"
-    assert store.replace(session(uid="b")) is None  # same session: nothing displaced
+    assert store.replace(session(uid="a")) == []
+    assert [s.uid for s in store.replace(session(uid="b"))] == ["a"]
+    assert store.replace(session(uid="b")) == []  # same session: nothing displaced
 
 
 def test_ctrl_c_during_two_factor_revokes_the_pending_session(cli_store, monkeypatch):
@@ -225,11 +225,11 @@ def test_daemon_sign_out_only_forgets_after_revocation(daemon_env, monkeypatch):
     d, api, store, clock, states = daemon_env
     store.save(session(uid="uid1"))
     d.tick()
-    monkeypatch.setattr(daemon_module, "revoke_session", lambda client: False)
+    monkeypatch.setattr(daemon_module, "end_session", lambda client, reload: "unconfirmed")
     d.handle({"cmd": "logout"})
     assert store.accounts() == ["me@proton.me"]
     assert "Could not sign out" in states()[-1]["message"]
-    monkeypatch.setattr(daemon_module, "revoke_session", lambda client: True)
+    monkeypatch.setattr(daemon_module, "end_session", lambda client, reload: "revoked")
     d.handle({"cmd": "logout"})
     assert store.accounts() == []
     assert states()[-1]["status"] == "signed-out"

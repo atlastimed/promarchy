@@ -102,16 +102,34 @@ def summarize(message: dict, account: str) -> dict:
 
 
 def summarize_conversation(conversation: dict, account: str) -> dict:
-    """One dropdown row per conversation, with Proton's exact counts for the
-    requested folder (the Context* fields), not an estimate from a sample."""
+    """One dropdown row per conversation, with the Inbox's own numbers.
+
+    A conversation can span Inbox, Sent and Archive. Proton reports per-folder
+    context in `Labels` (and, for the folder you queried, at the top level),
+    so we take the Inbox entry first, then the top-level context, and only
+    then whole-conversation totals.
+    """
     cid = str(conversation.get("ID") or "")
-    labels = [str(label) for label in conversation.get("LabelIDs") or []]
-    category = next((LABEL_CATEGORY[label] for label in labels if label in LABEL_CATEGORY), "")
+    contexts = {
+        str(entry.get("ID")): entry for entry in conversation.get("Labels") or [] if isinstance(entry, dict)
+    }
+    inbox = contexts.get(INBOX, {})
+
+    def context(field: str, whole: str) -> int:
+        for source, key in ((inbox, field), (conversation, field), (conversation, whole)):
+            value = source.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+        return 0
+
+    labels = set(contexts) | {str(label) for label in conversation.get("LabelIDs") or []}
+    category = LABEL_CATEGORY.get(str(conversation.get("CategoryID") or ""), "")
+    if not category:
+        category = next((LABEL_CATEGORY[label] for label in labels if label in LABEL_CATEGORY), "")
     senders = [s for s in conversation.get("Senders") or [] if isinstance(s, dict)]
     names = [clean_text(s.get("Name") or s.get("Address"), 120) for s in senders]
     first = senders[0] if senders else {}
-    unread = int(conversation.get("ContextNumUnread", conversation.get("NumUnread")) or 0)
-    count = int(conversation.get("ContextNumMessages", conversation.get("NumMessages")) or 1)
+    unread = context("ContextNumUnread", "NumUnread")
     return {
         "id": cid,
         "conversationId": cid,
@@ -119,15 +137,13 @@ def summarize_conversation(conversation: dict, account: str) -> dict:
         "senderName": clean_text(", ".join(dict.fromkeys(n for n in names if n)), 200),
         "senderAddress": clean_text(first.get("Address"), 200),
         "subject": clean_text(conversation.get("Subject"), 300),
-        "time": int(conversation.get("ContextTime") or conversation.get("Time") or 0),
+        "time": context("ContextTime", "Time"),
         "unread": unread > 0,
         "starred": STARRED in labels,
-        "attachments": int(
-            conversation.get("ContextNumAttachments", conversation.get("NumAttachments")) or 0
-        ),
+        "attachments": context("ContextNumAttachments", "NumAttachments"),
         "category": category,
         "senderImage": bool(first.get("DisplaySenderImage", conversation.get("DisplaySenderImage"))),
-        "threadCount": max(1, count),
+        "threadCount": max(1, context("ContextNumMessages", "NumMessages")),
         "kind": "conversation",
         "unreadIds": [cid] if unread else [],
     }
