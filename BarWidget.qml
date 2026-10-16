@@ -33,7 +33,8 @@ Panel {
     categories: String(setting("categories", "all")),
     groupThreads: flag("groupThreads", true),
     notify: notifyEnabled,
-    senderImages: flag("senderImages", true)
+    senderImages: flag("senderImages", true),
+    demo: flag("demo", false)
   })
 
   // ---- state -----------------------------------------------------------------

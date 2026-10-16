@@ -29,6 +29,7 @@ from typing import Any, TextIO
 
 from .api import AuthExpired, NetworkError, ProtonClient, ProtonError, RateLimited, Session
 from .avatars import Avatars
+from .demo import demo_state
 from .mailbox import WEB_BASE, Mailbox, parse_categories
 from .notify import Notifier, Watermarks, select_new
 from .paths import runtime_dir
@@ -64,6 +65,7 @@ class Config:
     threads: bool = True
     notify: bool = True
     sender_images: bool = True
+    demo: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> Config:
@@ -75,6 +77,7 @@ class Config:
             threads=_flag(data.get("groupThreads"), base.threads),
             notify=_flag(data.get("notify"), base.notify),
             sender_images=_flag(data.get("senderImages"), base.sender_images),
+            demo=_flag(data.get("demo"), False),
         )
 
 
@@ -150,6 +153,10 @@ class Daemon:
         return 0
 
     def tick(self) -> None:
+        if self.config.demo:
+            self.emit(force=self._force_emit)
+            self._force_emit = False
+            return
         self._sync_accounts()
         now = self.clock()
         for account in list(self.accounts.values()):
@@ -357,6 +364,8 @@ class Daemon:
 
     def snapshot(self) -> dict:
         now = int(self.clock())
+        if self.config.demo:
+            return demo_state(now, self.config.recent_limit)
         totals = {"1h": 0, "24h": 0, "7d": 0, "all": 0}
         rows: list[dict] = []
         accounts = []

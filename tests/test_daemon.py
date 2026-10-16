@@ -234,3 +234,12 @@ def test_sender_logos_attached(env):
     env.daemon.handle({"cmd": "refresh"})
     env.daemon.tick()
     assert env.api.endpoint_calls("/core/v4/images/logo") == calls  # cached
+
+
+def test_demo_mode_needs_no_account_or_network(env):
+    env.daemon.handle({"cmd": "configure", "settings": {"demo": True, "recentLimit": 5}})
+    env.daemon.tick()
+    state = env.states()[-1]
+    assert state["status"] == "ok"
+    assert len(state["messages"]) == 5
+    assert env.api.calls == []
