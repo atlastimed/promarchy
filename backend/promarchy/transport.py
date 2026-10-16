@@ -8,7 +8,6 @@ are gzip-compressed on the wire, and every socket operation has a timeout.
 
 from __future__ import annotations
 
-import gzip
 import http.client
 import json as jsonlib
 import os
@@ -62,6 +61,7 @@ class HttpTransport:
         json: Any = None,
         headers: dict[str, str] | None = None,
         timeout: Any = None,
+        max_bytes: int = MAX_BODY,
     ) -> Response:
         parts = urlsplit(url)
         if parts.scheme != "https" or not parts.hostname:
@@ -80,21 +80,25 @@ class HttpTransport:
         for attempt in range(attempts):
             conn = self._connection(origin)
             try:
-                conn.request(method, path, body=body, headers=merged)
+                try:
+                    conn.request(method, path, body=body, headers=merged)
+                except ValueError:
+                    # http.client quotes the offending header (maybe a token).
+                    raise TransportError("invalid request header") from None
                 resp = conn.getresponse()
-                content = resp.read(MAX_BODY + 1)
-                if len(content) > MAX_BODY:
+                content = resp.read(max_bytes + 1)
+                if len(content) > max_bytes:
                     raise TransportError("response too large")
                 if resp.getheader("Content-Encoding", "").lower() == "gzip":
-                    try:
-                        content = gzip.decompress(content)
-                    except (OSError, EOFError, zlib.error) as exc:
-                        raise TransportError("Proton sent a corrupt response") from exc
+                    content = gunzip_bounded(content, max_bytes)
                 header_map = {k.lower(): v for k, v in resp.getheaders()}
                 if resp.will_close:
                     self.close()
                 self._last_used = time.monotonic()
                 return Response(resp.status, header_map, content)
+            except TransportError:
+                self.close()  # our own verdict on the response: not worth a retry
+                raise
             except (http.client.HTTPException, OSError) as exc:
                 self.close()
                 # A reused connection may have been dropped by the server
@@ -102,8 +106,6 @@ class HttpTransport:
                 if reused and attempt + 1 < attempts:
                     reused = False
                     continue
-                if isinstance(exc, TransportError):
-                    raise
                 raise TransportError(_describe(exc)) from exc
         raise TransportError("request failed")  # pragma: no cover - loop always returns or raises
 
@@ -124,6 +126,26 @@ class HttpTransport:
             self._conn = conn
             self._origin = origin
         return self._conn
+
+
+def gunzip_bounded(data: bytes, limit: int) -> bytes:
+    """Decompress gzip (including concatenated members) without ever holding
+    more than `limit` expanded bytes, so a tiny compressed body cannot
+    balloon into hundreds of megabytes."""
+    out = bytearray()
+    remaining = data
+    try:
+        while remaining:
+            inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            out += inflater.decompress(remaining, limit + 1 - len(out))
+            if len(out) > limit or inflater.unconsumed_tail:
+                raise TransportError("response too large")
+            if not inflater.eof:
+                raise TransportError("Proton sent a truncated response")
+            remaining = inflater.unused_data
+    except zlib.error as exc:
+        raise TransportError("Proton sent a corrupt response") from exc
+    return bytes(out)
 
 
 def _proxy_for(host: str) -> tuple[str, int] | None:

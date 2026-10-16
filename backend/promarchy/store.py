@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .api import Session
-from .paths import state_dir
+from .paths import open_private, state_dir, write_private
 
 KEYRING_SERVICE = "promarchy"
 
@@ -93,7 +93,11 @@ class SecretToolBackend:
         )
 
     def delete(self, key: str) -> None:
-        self._run("clear", "service", KEYRING_SERVICE, "username", key)
+        result = self._run("clear", "service", KEYRING_SERVICE, "username", key)
+        # Exit status 1 with no message means nothing matched: already gone.
+        if result.returncode != 0 and result.stderr.strip():
+            detail = result.stderr.strip()[:200]
+            raise StoreUnavailable(f"Could not remove the session from the keyring: {detail}")
 
 
 class SessionStore:
@@ -142,9 +146,19 @@ class SessionStore:
     def save(self, session: Session, *, announce: bool = True) -> None:
         """Persist a session. Token rotations pass announce=False: the daemon
         made that change itself and must not treat it as a new sign-in."""
+        self.replace(session, announce=announce)
+
+    def replace(self, session: Session, *, announce: bool = True) -> Session | None:
+        """Store a (new) session and return the different one it replaced.
+
+        Read and write happen under one lock, so two sign-ins racing for the
+        same account each get back exactly the session they displaced, and
+        the caller can revoke it instead of leaving it valid on Proton's side.
+        """
         if not session.email:
             raise ValueError("session has no account email")
         with self._locked():
+            previous = self.load(session.email)
             self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
             accounts = self.accounts()
             if session.email not in accounts:
@@ -153,6 +167,7 @@ class SessionStore:
                 announce = True
             if announce:
                 self._bump()
+        return previous if previous is not None and previous.uid != session.uid else None
 
     def update_tokens(self, session: Session) -> bool:
         """Persist rotated tokens, but only onto the same live session.
@@ -170,17 +185,26 @@ class SessionStore:
             self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
             return True
 
-    def remove(self, email: str) -> None:
+    def remove(self, email: str, expected_uid: str | None = None) -> bool:
+        """Forget an account. With `expected_uid`, only if that exact session
+        is still the stored one (a newer sign-in must not be thrown away).
+        The keyring entry goes first: if that fails, the index is untouched
+        and the error propagates, so nothing is half-removed."""
         with self._locked():
+            if expected_uid is not None:
+                stored = self.load(email)
+                if stored is not None and stored.uid != expected_uid:
+                    return False
             self.secrets.delete(_key(email))
             self._write_index([a for a in self.accounts() if a != email])
             self._bump()
+        return True
 
     # ------------------------------------------------------------ internals
 
     @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
-        fd = os.open(self._lock, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = open_private(self._lock)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             yield
@@ -189,17 +213,14 @@ class SessionStore:
             os.close(fd)
 
     def _write_index(self, accounts: list[str]) -> None:
-        tmp = self._index.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump({"accounts": accounts}, fh)
-        os.replace(tmp, self._index)
+        write_private(self._index, json.dumps({"accounts": accounts}))
 
     def _bump(self) -> None:
-        self._stamp.touch(mode=0o600)
-        # touch() keeps the old mtime when the file already exists on some
-        # filesystems with coarse timestamps; force a fresh one.
-        os.utime(self._stamp)
+        fd = open_private(self._stamp)
+        try:
+            os.utime(fd)
+        finally:
+            os.close(fd)
 
 
 def _key(email: str) -> str:

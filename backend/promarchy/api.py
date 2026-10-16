@@ -7,6 +7,7 @@ ever downloaded or decrypted.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -94,14 +95,29 @@ class Session:
     @classmethod
     def from_dict(cls, data: dict) -> Session:
         return cls(
-            uid=str(data["uid"]),
-            access_token=str(data["access_token"]),
-            refresh_token=str(data["refresh_token"]),
+            uid=checked_token(data["uid"]),
+            access_token=checked_token(data["access_token"]),
+            refresh_token=checked_token(data["refresh_token"]),
             email=str(data.get("email") or ""),
             user_id=str(data.get("user_id") or ""),
             scopes=[str(s) for s in data.get("scopes") or []],
             created_at=float(data.get("created_at") or 0.0),
         )
+
+
+_TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]{1,1024}")
+
+
+def checked_token(value: Any) -> str:
+    """Accept a UID or token only in its expected shape.
+
+    A corrupted value would otherwise reach an HTTP header, and the library
+    exception for a bad header quotes the value back, token and all.
+    """
+    text = str(value)
+    if not _TOKEN.fullmatch(text):
+        raise ValueError("malformed session value")  # never echo the value itself
+    return text
 
 
 class ProtonClient:
@@ -156,12 +172,14 @@ class ProtonClient:
             )
         return self._parse(resp)
 
-    def fetch_bytes(self, path: str, *, params: Any = None) -> tuple[int, str, bytes]:
-        """GET a binary resource (sender logos). Returns (status, type, body)."""
-        resp = self._send("GET", path, params=params, body=None, auth=True, headers=None)
+    def fetch_bytes(self, path: str, *, params: Any = None, max_bytes: int) -> tuple[int, str, bytes]:
+        """GET a small binary resource (sender logos). Returns (status, type, body)."""
+        resp = self._send("GET", path, params=params, body=None, auth=True, headers=None, max_bytes=max_bytes)
         if resp.status_code == 401 and self.session:
             self.refresh()
-            resp = self._send("GET", path, params=params, body=None, auth=True, headers=None)
+            resp = self._send(
+                "GET", path, params=params, body=None, auth=True, headers=None, max_bytes=max_bytes
+            )
         if resp.status_code in (429, 503):
             raise RateLimited("Proton asked us to slow down", _retry_after(resp))
         ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
@@ -198,15 +216,19 @@ class ProtonClient:
                 if exc.status in (400, 401, 403, 422):
                     raise AuthExpired("Your Proton session expired. Sign in again.") from exc
                 raise
-        session.access_token = str(payload["AccessToken"])
-        session.refresh_token = str(payload["RefreshToken"])
+        try:
+            access, refresh = checked_token(payload["AccessToken"]), checked_token(payload["RefreshToken"])
+        except (KeyError, ValueError) as exc:
+            raise AuthExpired("Proton returned an unusable session. Sign in again.") from exc
+        session.access_token = access
+        session.refresh_token = refresh
         session.scopes = [str(s) for s in payload.get("Scopes") or session.scopes]
         if self._on_refresh:
             self._on_refresh(session)
 
     # --------------------------------------------------------------- helpers
 
-    def _send(self, method, path, *, params, body, auth, headers) -> Response:
+    def _send(self, method, path, *, params, body, auth, headers, max_bytes=None) -> Response:
         request_headers: dict[str, str] = {}
         if auth and self.session:
             request_headers["x-pm-uid"] = self.session.uid
@@ -214,6 +236,7 @@ class ProtonClient:
         if headers:
             request_headers.update(headers)
         try:
+            extra = {"max_bytes": max_bytes} if max_bytes else {}
             return self._http.request(
                 method,
                 self.base + path,
@@ -221,6 +244,7 @@ class ProtonClient:
                 json=body,
                 headers=request_headers,
                 timeout=TIMEOUT,
+                **extra,
             )
         except (TransportError, OSError) as exc:
             raise NetworkError(str(exc) or "Cannot reach Proton") from exc

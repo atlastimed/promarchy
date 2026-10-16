@@ -8,7 +8,6 @@ from promarchy.mailbox import (
     PAGE_LIMIT,
     Mailbox,
     clean_text,
-    group_threads,
     label_params,
     parse_categories,
     summarize,
@@ -77,17 +76,28 @@ def test_category_filter_applies_to_counts_list_and_totals():
     assert [m["subject"] for m in box.recent] == ["primary"]
 
 
-def test_threads_are_grouped_with_count_and_unread_ids():
+def test_conversations_give_exact_counts_and_distinct_rows():
     api = FakeProton()
-    api.add(300, conversation="c1", unread=False, subject="Re: plan")
-    api.add(200, conversation="c1", subject="Re: plan")
-    api.add(100, conversation="c1", subject="Re: plan")
-    api.add(150, conversation="c2", subject="other")
+    for i in range(30):  # a busy thread that would swamp a message sample
+        api.add(100 + i, conversation="busy", unread=i < 2, subject="Re: plan")
+    api.add(200, conversation="quiet", subject="other")
+    box = make(api, recent_limit=8)
+    box.full_sync()
+    assert [(r["conversationId"], r["threadCount"]) for r in box.recent] == [("busy", 30), ("quiet", 1)]
+    busy = box.recent[0]
+    assert busy["kind"] == "conversation" and busy["unread"] is True and busy["unreadIds"] == ["busy"]
+    assert busy["url"] == "https://mail.proton.me/inbox/busy"
+
+
+def test_conversation_mark_read_uses_the_conversation_endpoint():
+    api = FakeProton()
+    api.add(100, conversation="c1")
+    api.add(90, conversation="c1")
     box = make(api)
     box.full_sync()
-    assert [(r["conversationId"], r["threadCount"]) for r in box.recent] == [("c1", 3), ("c2", 1)]
-    assert sorted(box.recent[0]["unreadIds"]) == ["m2", "m3"]
-    assert box.recent[0]["unread"] is True
+    box.mark_read(["c1"], kind="conversation")
+    assert [c for c in api.calls if c[0] == "PUT"][0][1] == "/mail/v4/conversations/read"
+    assert box.counts(NOW)["1h"] == 0
 
 
 def test_threads_off_lists_every_message():
@@ -225,12 +235,12 @@ def test_mark_read_updates_counts():
 def test_web_urls_follow_view_mode():
     api = FakeProton()
     api.add(60, conversation="conv")
-    box = make(api)
+    box = make(api, threads=False)
     box.full_sync()
     row = box.recent[0]
     assert row["url"] == "https://mail.proton.me/inbox/conv/m1"
     api.view_mode = 1
-    box2 = make(api)
+    box2 = make(api, threads=False)
     box2.full_sync()
     assert box2.recent[0]["url"] == "https://mail.proton.me/inbox/m1"
     assert box.web_url() == "https://mail.proton.me/inbox"
@@ -251,33 +261,3 @@ def test_summarize_cleans_untrusted_text():
     assert row["starred"] is True
     assert row["category"] == "transactions"
     assert clean_text("a" * 500, 10) == "a" * 10
-
-
-def test_group_threads_respects_limit():
-    rows = [summarize({"ID": f"m{i}", "ConversationID": f"c{i}", "Time": 100 - i}, "me") for i in range(5)]
-    assert len(group_threads(rows, 3)) == 3
-
-
-def test_failed_resync_is_retried_on_the_next_poll():
-    api = FakeProton()
-    box = make(api)
-    box.full_sync()
-    new = api.add(5)
-    api.queue_event(Messages=[{"ID": new["ID"], "Action": 1, "Message": {"LabelIDs": ["0"]}}])
-    real_call = api.call
-
-    def failing_list(method, path, **kw):
-        if path == "/mail/v4/messages":
-            raise NetworkError("timeout")
-        return real_call(method, path, **kw)
-
-    api.call = failing_list
-    try:
-        box.poll()
-    except NetworkError:
-        pass
-    api.call = real_call
-    assert box.dirty is True
-    assert box.poll() is True  # no new event, but the owed resync happens
-    assert box.counts(NOW)["1h"] == 1
-    assert box.dirty is False

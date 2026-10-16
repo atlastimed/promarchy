@@ -47,7 +47,14 @@ Panel {
   readonly property bool signedIn: mail ? mail.signedIn : false
   readonly property int badgeCount: Model.countFor(counts, countWindow)
   readonly property int headerCount: Model.countFor(counts, headerWindow)
-  readonly property bool healthy: status === "ok"
+  // "partial": some accounts work and some do not; counts are still shown.
+  readonly property bool healthy: status === "ok" || status === "partial"
+  readonly property bool needsSignIn: {
+    if (status === "signed-out" || status === "auth-expired") return true
+    var list = mail ? mail.accounts : []
+    for (var i = 0; i < list.length; i++) if (list[i].status === "auth-expired") return true
+    return false
+  }
   readonly property bool anyUnreadShown: {
     for (var i = 0; i < messages.length; i++) if (messages[i].unread) return true
     return false
@@ -151,18 +158,21 @@ Panel {
   }
 
   function markRead(message) {
-    if (mail && message && message.unreadIds && message.unreadIds.length) mail.markRead(message.account, message.unreadIds)
+    if (mail && message && message.unreadIds && message.unreadIds.length)
+      mail.markRead(message.account, message.unreadIds, message.kind)
   }
 
   function markAllRead() {
     if (!mail) return
-    var byAccount = {}
+    var groups = {}
     for (var i = 0; i < messages.length; i++) {
       var m = messages[i]
       if (!m.unread) continue
-      byAccount[m.account] = (byAccount[m.account] || []).concat(m.unreadIds || [])
+      var key = m.account + "\n" + (m.kind || "message")
+      if (!groups[key]) groups[key] = { account: m.account, kind: m.kind || "message", ids: [] }
+      groups[key].ids = groups[key].ids.concat(m.unreadIds || [])
     }
-    for (var account in byAccount) mail.markRead(account, byAccount[account])
+    for (var k in groups) mail.markRead(groups[k].account, groups[k].ids, groups[k].kind)
   }
 
   function selectedMessage() {
@@ -379,8 +389,9 @@ Panel {
           // Sign-in, expired session, offline and error states.
           CursorSurface {
             id: notice
-            readonly property bool needsSignIn: root.status === "signed-out" || root.status === "auth-expired"
-            visible: !root.healthy && root.status !== "starting"
+            readonly property bool needsSignIn: root.needsSignIn
+            visible: (!root.healthy && root.status !== "starting") || root.status === "partial"
+              || (root.mail ? root.mail.message !== "" && root.healthy : false)
             width: parent.width
             implicitHeight: noticeColumn.implicitHeight + Style.spacing.rowPaddingX * 2
             foreground: root.foreground
@@ -398,7 +409,7 @@ Panel {
                 textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.WordWrap
-                color: root.status === "error" ? root.highlight : root.foreground
+                color: root.status === "error" || root.status === "partial" ? root.highlight : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
                 text: {
@@ -406,6 +417,7 @@ Panel {
                     return "Sign in to see new mail here. Your password is only used on this machine for Proton's SRP handshake; the session is kept in your keyring."
                   if (root.status === "auth-expired") return "Your Proton session ended. Sign in again to keep mail flowing."
                   if (root.status === "offline") return "Offline. Showing the last mail Promarchy saw; it will catch up on its own."
+                  if (root.status === "partial") return "Not every account is working, so totals are incomplete. " + (root.mail ? root.mail.message : "")
                   return root.mail ? root.mail.message : ""
                 }
               }

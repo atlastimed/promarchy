@@ -11,34 +11,68 @@ swapped for a look-alike hyphen so it can never become an option.
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-from .paths import state_dir
+from .paths import state_dir, write_private
 
 MAX_INDIVIDUAL = 3
 GLYPH = "󰇮"
 
 
+GRACE = 600  # seconds of already-announced IDs remembered behind the watermark
+
+
+@dataclass(frozen=True)
+class Mark:
+    """How far announcements have got for one account.
+
+    `time` alone is not enough: two messages can share a timestamp second, and
+    Proton can deliver one slightly out of order. So we also remember the IDs
+    already handled in the last few minutes and only skip those.
+    """
+
+    time: int
+    seen: dict[str, int] = field(default_factory=dict)
+
+    def to_json(self) -> dict:
+        return {"time": self.time, "seen": self.seen}
+
+    @classmethod
+    def from_json(cls, value: Any) -> Mark | None:
+        if isinstance(value, (int, float)):  # 0.1.0 format: a bare timestamp
+            return cls(int(value), {})
+        if isinstance(value, dict) and isinstance(value.get("time"), (int, float)):
+            seen = value.get("seen") if isinstance(value.get("seen"), dict) else {}
+            return cls(int(value["time"]), {str(k): int(v) for k, v in seen.items()})
+        return None
+
+
 class Watermarks:
-    """Per-account "newest mail already announced" times, kept across restarts."""
+    """Per-account announcement marks, kept across restarts."""
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or state_dir() / "notified.json"
         try:
             data = json.loads(self.path.read_text())
-            self._marks = {str(k): int(v) for k, v in data.items()} if isinstance(data, dict) else {}
         except (OSError, ValueError):
-            self._marks = {}
+            data = {}
+        self._marks: dict[str, Mark] = {}
+        if isinstance(data, dict):
+            for account, value in data.items():
+                mark = Mark.from_json(value)
+                if mark is not None:
+                    self._marks[str(account)] = mark
 
-    def get(self, account: str) -> int | None:
+    def get(self, account: str) -> Mark | None:
         return self._marks.get(account)
 
-    def set(self, account: str, value: int) -> None:
-        if self._marks.get(account) != value:
-            self._marks[account] = value
+    def set(self, account: str, mark: Mark) -> None:
+        if self._marks.get(account) != mark:
+            self._marks[account] = mark
             self._write()
 
     def forget(self, account: str) -> None:
@@ -46,30 +80,31 @@ class Watermarks:
             self._write()
 
     def _write(self) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump(self._marks, fh)
-        os.replace(tmp, self.path)
+        write_private(self.path, json.dumps({k: v.to_json() for k, v in self._marks.items()}))
 
 
 def select_new(
-    fresh: list[dict], watermark: int | None, now: int, catch_up: int = 3600
-) -> tuple[list[dict], int]:
-    """Pick messages to announce and return the advanced watermark.
+    unread: dict[str, int], fresh: list[dict], mark: Mark | None, now: int, catch_up: int = 3600
+) -> tuple[list[dict], int, Mark]:
+    """Decide what to announce.
 
-    The first run for an account announces nothing (old mail is not news).
-    After a restart we only catch up on the last hour, so a laptop that was
-    asleep overnight does not unload a backlog of toasts.
+    `unread` is every unread message ID in the index (with its time), so the
+    count stays right even when more mail arrived than we hold details for;
+    `fresh` carries sender and subject for the newest of them.
+
+    Returns (displayable new messages newest first, how many are new, new mark).
+    The first run for an account announces nothing (old mail is not news),
+    and after a long sleep only the last hour is caught up on.
     """
-    if watermark is None:
-        newest = max((m["time"] for m in fresh), default=now)
-        return [], max(newest, now)
-    floor = max(watermark, now - catch_up)
-    new = [m for m in fresh if m["time"] > floor and m["unread"]]
-    new.sort(key=lambda m: m["time"], reverse=True)
-    advanced = max([watermark] + [m["time"] for m in new])
-    return new, advanced
+    if mark is None:
+        start = max([now, *unread.values()])
+        return [], 0, Mark(start, {i: t for i, t in unread.items() if t >= start - GRACE})
+    floor = max(mark.time - GRACE, now - catch_up)
+    new = {i: t for i, t in unread.items() if t >= floor and i not in mark.seen}
+    advanced = max([mark.time, *new.values()])
+    seen = {i: t for i, t in {**mark.seen, **new}.items() if t >= advanced - GRACE}
+    shown = sorted((m for m in fresh if m["id"] in new), key=lambda m: m["time"], reverse=True)
+    return shown, len(new), Mark(advanced, seen)
 
 
 class Notifier:
@@ -79,20 +114,20 @@ class Notifier:
         self._send = shutil.which("omarchy-notification-send")
         self._fallback = shutil.which("notify-send")
 
-    def announce(self, messages: list[dict], urls: dict[str, str], inbox_url: str) -> None:
-        if not messages:
+    def announce(
+        self, messages: list[dict], urls: dict[str, str], inbox_url: str, total: int | None = None
+    ) -> None:
+        total = len(messages) if total is None else total
+        if total <= 0:
             return
-        if len(messages) > MAX_INDIVIDUAL:
+        if total > MAX_INDIVIDUAL or len(messages) < total:
             senders = []
             for m in messages:
                 if m["senderName"] not in senders:
                     senders.append(m["senderName"])
-            more = f" and {len(senders) - 3} more" if len(senders) > 3 else ""
-            self._toast(
-                f"{len(messages)} new messages",
-                ", ".join(senders[:3]) + more,
-                inbox_url,
-            )
+            shown = ", ".join(senders[:3])
+            more = " and others" if len(senders) > 3 or len(messages) < total else ""
+            self._toast(f"{total} new messages", (shown + more) or "Proton Mail", inbox_url)
             return
         for m in reversed(messages):  # oldest first, so the newest ends on top
             self._toast(

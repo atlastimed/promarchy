@@ -58,9 +58,9 @@ Item {
     send({ cmd: "poll" })
   }
 
-  function markRead(account, ids) {
+  function markRead(account, ids, kind) {
     if (!account || !ids || ids.length === 0) return
-    send({ cmd: "markRead", account: account, ids: ids })
+    send({ cmd: "markRead", account: account, ids: ids, kind: kind === "conversation" ? "conversation" : "message" })
   }
 
   function send(command) {
@@ -96,8 +96,10 @@ Item {
     ])
   }
 
+  // The daemon holds the freshest tokens, so it ends the sessions itself and
+  // reports in the dropdown if Proton could not be reached.
   function signOut() {
-    Quickshell.execDetached([python, "-I", backend, "logout", "--all"])
+    send({ cmd: "logout" })
   }
 
   function ingest(line) {
@@ -108,7 +110,8 @@ Item {
       return
     }
     if (!state || state.type !== "state") return
-    _restarts = 0
+    // Only a daemon that keeps running for a while earns a reset backoff.
+    if (!stableTimer.running && _restarts > 0) stableTimer.restart()
     status = String(state.status || "error")
     message = String(state.message || "")
     accounts = Array.isArray(state.accounts) ? state.accounts : []
@@ -131,7 +134,8 @@ Item {
       onRead: function(line) { console.warn("[promarchy] " + line) }
     }
     onStarted: if (root._settings) root.send({ cmd: "configure", settings: root._settings })
-    onExited: function(exitCode) {
+    onExited: function(exitCode, exitStatus) {
+      stableTimer.stop()
       if (root._stopping) return
       root.status = "error"
       root.message = "Mail backend stopped (exit " + exitCode + "); restarting…"
@@ -147,6 +151,12 @@ Item {
       root._restarts++
       daemon.running = true
     }
+  }
+
+  Timer {
+    id: stableTimer
+    interval: 60000
+    onTriggered: root._restarts = 0
   }
 
   // The daemon answers a refresh within a second or two; never spin forever.

@@ -96,29 +96,41 @@ def summarize(message: dict, account: str) -> dict:
         "category": category,
         "senderImage": bool(message.get("DisplaySenderImage")),
         "threadCount": 1,
+        "kind": "message",
         "unreadIds": [str(message.get("ID"))] if message.get("Unread") else [],
     }
 
 
-def group_threads(messages: list[dict], limit: int) -> list[dict]:
-    """Collapse a busy conversation into its newest message plus a count."""
-    rows: list[dict] = []
-    by_conversation: dict[str, dict] = {}
-    for message in messages:
-        key = message["conversationId"] or message["id"]
-        row = by_conversation.get(key)
-        if row is None:
-            if len(rows) >= limit:
-                continue
-            row = dict(message, unreadIds=list(message["unreadIds"]))
-            by_conversation[key] = row
-            rows.append(row)
-            continue
-        row["threadCount"] += 1
-        row["unreadIds"].extend(message["unreadIds"])
-        row["unread"] = row["unread"] or message["unread"]
-        row["starred"] = row["starred"] or message["starred"]
-    return rows
+def summarize_conversation(conversation: dict, account: str) -> dict:
+    """One dropdown row per conversation, with Proton's exact counts for the
+    requested folder (the Context* fields), not an estimate from a sample."""
+    cid = str(conversation.get("ID") or "")
+    labels = [str(label) for label in conversation.get("LabelIDs") or []]
+    category = next((LABEL_CATEGORY[label] for label in labels if label in LABEL_CATEGORY), "")
+    senders = [s for s in conversation.get("Senders") or [] if isinstance(s, dict)]
+    names = [clean_text(s.get("Name") or s.get("Address"), 120) for s in senders]
+    first = senders[0] if senders else {}
+    unread = int(conversation.get("ContextNumUnread", conversation.get("NumUnread")) or 0)
+    count = int(conversation.get("ContextNumMessages", conversation.get("NumMessages")) or 1)
+    return {
+        "id": cid,
+        "conversationId": cid,
+        "account": account,
+        "senderName": clean_text(", ".join(dict.fromkeys(n for n in names if n)), 200),
+        "senderAddress": clean_text(first.get("Address"), 200),
+        "subject": clean_text(conversation.get("Subject"), 300),
+        "time": int(conversation.get("ContextTime") or conversation.get("Time") or 0),
+        "unread": unread > 0,
+        "starred": STARRED in labels,
+        "attachments": int(
+            conversation.get("ContextNumAttachments", conversation.get("NumAttachments")) or 0
+        ),
+        "category": category,
+        "senderImage": bool(first.get("DisplaySenderImage", conversation.get("DisplaySenderImage"))),
+        "threadCount": max(1, count),
+        "kind": "conversation",
+        "unreadIds": [cid] if unread else [],
+    }
 
 
 class Mailbox:
@@ -207,6 +219,9 @@ class Mailbox:
     def event_is_relevant(self, event: dict) -> bool:
         known = set(self.unread_times)
         known.update(row["id"] for row in self.recent)
+        for item in event.get("Conversations") or []:
+            if isinstance(item, dict) and str(item.get("ID") or "") in known:
+                return True
         for item in event.get("Messages") or []:
             if not isinstance(item, dict):
                 continue
@@ -222,10 +237,11 @@ class Mailbox:
                 return True
         return False
 
-    def mark_read(self, ids: list[str]) -> None:
+    def mark_read(self, ids: list[str], kind: str = "message") -> None:
         ids = [i for i in dict.fromkeys(ids) if i]
+        endpoint = "/mail/v4/conversations/read" if kind == "conversation" else "/mail/v4/messages/read"
         for start in range(0, len(ids), 100):
-            self.client.call("PUT", "/mail/v4/messages/read", body={"IDs": ids[start : start + 100]})
+            self.client.call("PUT", endpoint, body={"IDs": ids[start : start + 100]})
         if ids:
             self.resync()
 
@@ -263,6 +279,8 @@ class Mailbox:
     def web_url(self, row: dict | None = None) -> str:
         if not row:
             return f"{WEB_BASE}/inbox"
+        if row.get("kind") == "conversation":
+            return f"{WEB_BASE}/inbox/{row['id']}"
         if self.view_mode == VIEW_MODE_MESSAGES or not row.get("conversationId"):
             return f"{WEB_BASE}/inbox/{row['id']}"
         return f"{WEB_BASE}/inbox/{row['conversationId']}/{row['id']}"
@@ -316,26 +334,25 @@ class Mailbox:
         if self.recent_limit <= 0:
             self.recent = []
             return
-        fetch = min(100, self.recent_limit * (3 if self.threads else 1))
         # PageSize is exact; Limit is floored at 50 by the API.
         params = label_params(self.categories) + [
             ("Page", "0"),
-            ("PageSize", str(fetch)),
+            ("PageSize", str(self.recent_limit)),
             ("Sort", "Time"),
             ("Desc", "1"),
         ]
-        resp = self.client.call("GET", "/mail/v4/messages", params=params)
+        if self.threads:
+            resp = self.client.call("GET", "/mail/v4/conversations", params=params)
+            items, build = resp.get("Conversations"), summarize_conversation
+        else:
+            resp = self.client.call("GET", "/mail/v4/messages", params=params)
+            items, build = resp.get("Messages"), summarize
         rows = [
-            summarize(m, self.account)
-            for m in resp.get("Messages") or []
-            if isinstance(m, dict) and m.get("ID")
+            build(item, self.account) for item in items or [] if isinstance(item, dict) and item.get("ID")
         ]
         for row in rows:
             row["url"] = self.web_url(row)
-        if self.threads:
-            self.recent = group_threads(rows, self.recent_limit)
-        else:
-            self.recent = rows[: self.recent_limit]
+        self.recent = rows[: self.recent_limit]
 
     def _sync_totals(self) -> None:
         resp = self.client.call("GET", "/mail/v4/messages/count", params={"OnlyInInboxForCategories": 1})

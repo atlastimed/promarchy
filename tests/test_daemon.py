@@ -16,9 +16,11 @@ from promarchy.store import SessionStore, StoreUnavailable
 class RecordingNotifier:
     def __init__(self):
         self.batches = []
+        self.totals = []
 
-    def announce(self, messages, urls, inbox_url):
+    def announce(self, messages, urls, inbox_url, total=None):
         self.batches.append([m["id"] for m in messages])
+        self.totals.append(len(messages) if total is None else total)
 
 
 @pytest.fixture
@@ -62,7 +64,7 @@ def env(tmp_path):
     )
     e.states = lambda: [json.loads(line) for line in out.getvalue().splitlines()]
     e.sign_in = lambda email="me@proton.me": store.save(
-        Session(uid=f"uid-{email}", access_token="a", refresh_token="r", email=email)
+        Session(uid="uid-" + email.split("@")[0], access_token="a", refresh_token="r", email=email)
     )
     return e
 
@@ -307,7 +309,9 @@ def test_empty_keyring_answer_keeps_a_running_account(env):
     store.save(Session(uid="u", access_token="a", refresh_token="r", email="other@proton.me"))
     daemon.tick()
     assert "me@proton.me" in daemon.accounts
-    assert env.states()[-1]["status"] == "ok"
+    state = env.states()[-1]
+    assert state["status"] == "partial"  # me works; other's session could not be read
+    assert "other@proton.me" in state["message"]
 
 
 def test_missing_session_asks_to_sign_in_again(env):
@@ -325,7 +329,7 @@ def test_missing_session_asks_to_sign_in_again(env):
 def test_rotated_tokens_are_saved_and_retried(env, monkeypatch):
     env.sign_in()
     env.daemon.tick()
-    rotated = Session(uid="uid-me@proton.me", access_token="a2", refresh_token="r2", email="me@proton.me")
+    rotated = Session(uid="uid-me", access_token="a2", refresh_token="r2", email="me@proton.me")
     calls = {"n": 0}
     real = env.store.update_tokens
 
@@ -349,7 +353,7 @@ def test_rotation_does_not_resurrect_a_signed_out_account(env):
     env.sign_in()
     env.daemon.tick()
     env.store.remove("me@proton.me")
-    stale = Session(uid="uid-me@proton.me", access_token="a2", refresh_token="r2", email="me@proton.me")
+    stale = Session(uid="uid-me", access_token="a2", refresh_token="r2", email="me@proton.me")
     assert env.store.update_tokens(stale) is False
     assert env.store.accounts() == []
 
@@ -357,7 +361,7 @@ def test_rotation_does_not_resurrect_a_signed_out_account(env):
 def test_rotation_does_not_clobber_a_newer_sign_in(env):
     env.sign_in()
     env.store.save(Session(uid="newer", access_token="n", refresh_token="nr", email="me@proton.me"))
-    stale = Session(uid="uid-me@proton.me", access_token="a2", refresh_token="r2", email="me@proton.me")
+    stale = Session(uid="uid-me", access_token="a2", refresh_token="r2", email="me@proton.me")
     assert env.store.update_tokens(stale) is False
     assert env.store.load("me@proton.me").uid == "newer"
 

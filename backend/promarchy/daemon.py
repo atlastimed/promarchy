@@ -23,17 +23,19 @@ import signal
 import sys
 import threading
 import time
-import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, TextIO
 
 from .api import AuthExpired, NetworkError, ProtonClient, ProtonError, RateLimited, Session
+from .auth import logout as revoke_session
 from .avatars import Avatars
 from .demo import demo_state
+from .log import log_error
 from .mailbox import WEB_BASE, Mailbox, parse_categories
 from .notify import Notifier, Watermarks, select_new
-from .paths import runtime_dir
+from .paths import open_private, runtime_dir, write_private
 from .store import SessionStore, StoreUnavailable
 
 STAMP_CHECK_SECONDS = 5
@@ -41,6 +43,8 @@ LOCK_WAIT_SECONDS = 15
 MAX_BACKOFF = 300
 STORE_RETRY_MAX = 120
 SHUTDOWN_GRACE = 10  # seconds a SIGTERM waits for the current step
+DEMO_INTERVAL = 30.0
+NOTICE_SECONDS = 120
 
 
 def _clamp(value: Any, low: int, high: int, default: int) -> int:
@@ -93,6 +97,10 @@ class Account:
     error: str = ""
     failures: int = 0
     next_poll: float = 0.0  # on the monotonic clock
+    # Proton's Retry-After is a hard deadline (even a manual refresh waits);
+    # error backoff only holds off automatic polls such as opening the menu.
+    rate_limited_until: float = 0.0
+    backoff_until: float = 0.0
     extra: dict = field(default_factory=dict)
 
 
@@ -135,6 +143,9 @@ class Daemon:
         self.unsaved_retry_at = 0.0
         self.configured = False
         self.stopping = False
+        self.notice = ""
+        self.notice_until = 0.0
+        self.demo_anchor: int | None = None
         self._last_payload = ""
         self._force_emit = False
 
@@ -155,6 +166,10 @@ class Daemon:
         try:
             self._sync_accounts()
             self.emit(force=True)
+            try:
+                self.avatars.prune()
+            except OSError:
+                log_error("pruning the logo cache")
             # Give the shell a moment to send its settings before the first
             # sync, so we do not fetch with defaults and then again.
             self._drain(timeout=1.5)
@@ -180,6 +195,8 @@ class Daemon:
 
     def tick(self) -> None:
         if self.config.demo:
+            if self.demo_anchor is None:
+                self.demo_anchor = int(self.clock())
             self.emit(force=self._force_emit)
             self._force_emit = False
             return
@@ -191,7 +208,7 @@ class Daemon:
                 try:
                     self._poll(account)
                 except Exception as exc:  # a bug must not kill the bar's data source
-                    traceback.print_exc(file=sys.stderr)
+                    log_error("polling", exc)
                     self._record_failure(account, ProtonError(f"Internal error: {exc.__class__.__name__}"))
         # An explicit refresh always answers, even when nothing changed, so
         # the widget can stop its spinner.
@@ -199,6 +216,8 @@ class Daemon:
         self._force_emit = False
 
     def _sleep_for(self) -> float:
+        if self.config.demo:
+            return DEMO_INTERVAL
         mono, wall = self.mono(), self.clock()
         delay = float(STAMP_CHECK_SECONDS)
         for account in self.accounts.values():
@@ -233,8 +252,8 @@ class Daemon:
         while True:
             try:
                 self.handle(command)
-            except Exception:  # a bad command or a bug must not end the session
-                traceback.print_exc(file=sys.stderr)
+            except Exception as exc:  # a bad command or a bug must not end the session
+                log_error(f"handling {str(command.get('cmd'))[:20]!r}", exc)
             try:
                 command = self.commands.get_nowait()
             except queue.Empty:
@@ -247,16 +266,21 @@ class Daemon:
         elif name == "configure":
             self._configure(Config.from_dict(command.get("settings") or {}))
         elif name == "refresh":
+            # An explicit refresh may cut an error backoff short, never
+            # Proton's own Retry-After.
             self._force_emit = True
             for account in self.accounts.values():
-                account.next_poll = 0
+                account.next_poll = account.rate_limited_until
                 account.extra["force"] = True
         elif name == "poll":
             for account in self.accounts.values():
                 if account.status != "auth-expired":
-                    account.next_poll = 0
+                    account.next_poll = max(account.rate_limited_until, account.backoff_until)
+        elif name == "logout":
+            self._logout(command.get("account"))
         elif name == "markRead":
-            self._mark_read(str(command.get("account") or ""), command.get("ids") or [])
+            kind = "conversation" if command.get("kind") == "conversation" else "message"
+            self._mark_read(str(command.get("account") or ""), command.get("ids") or [], kind)
 
     def _configure(self, config: Config) -> None:
         old = self.config
@@ -267,22 +291,53 @@ class Daemon:
                 categories=config.categories, recent_limit=config.recent_limit, threads=config.threads
             )
             if needs_sync or (config.sender_images and not old.sender_images):
-                account.next_poll = 0
+                account.next_poll = account.rate_limited_until
                 account.extra["force"] = True
             elif config.poll_seconds < old.poll_seconds:
                 account.next_poll = min(account.next_poll, self.mono() + config.poll_seconds)
 
-    def _mark_read(self, email: str, ids: list[Any]) -> None:
+    def _logout(self, target: Any) -> None:
+        """Revoke and forget accounts (all, or one by email). An account is
+        only removed once Proton confirmed the revocation, so a sign-out
+        while offline is reported instead of silently leaving a live session."""
+        emails = [str(target)] if isinstance(target, str) and target else list(self.accounts)
+        failed = []
+        for email in emails:
+            account = self.accounts.get(email)
+            if account is None or account.client.session is None:
+                continue
+            uid = account.client.session.uid
+            if not revoke_session(account.client):
+                failed.append(email)
+                continue
+            try:
+                self.store.remove(email, expected_uid=uid)
+            except Exception as exc:
+                log_error("removing an account", exc)
+                failed.append(email)
+        if failed:
+            self._set_notice(
+                f"Could not sign out {', '.join(failed)}: Proton could not be reached or the keyring "
+                "refused. Still signed in; try again."
+            )
+        self._sync_accounts()
+        self.emit(force=True)
+
+    def _set_notice(self, text: str) -> None:
+        self.notice = text
+        self.notice_until = self.mono() + NOTICE_SECONDS
+
+    def _mark_read(self, email: str, ids: list[Any], kind: str = "message") -> None:
         account = self.accounts.get(email)
         if account is None:
             return
         try:
-            account.mailbox.mark_read([str(i) for i in ids if isinstance(i, str)])
+            account.mailbox.mark_read([str(i) for i in ids if isinstance(i, str)], kind)
             self._after_sync(account)
         except ProtonError as exc:
             self._record_failure(account, exc)
         except Exception as exc:
-            traceback.print_exc(file=sys.stderr)
+            log_error("marking read", exc)
             self._record_failure(account, ProtonError(f"Internal error: {exc.__class__.__name__}"))
         self.emit()
 
@@ -301,8 +356,8 @@ class Daemon:
                 self.unsaved.pop(email, None)
                 try:
                     self.watermarks.forget(email)
-                except OSError:
-                    traceback.print_exc(file=sys.stderr)
+                except OSError as exc:
+                    log_error("forgetting a watermark", exc)
         missing: set[str] = set()
         for email in emails:
             try:
@@ -372,7 +427,7 @@ class Daemon:
             try:
                 self.store.update_tokens(session)
             except Exception as exc:
-                print(f"promarchy: could not save rotated tokens: {exc.__class__.__name__}", file=sys.stderr)
+                log_error("saving rotated tokens", exc)
                 failed = True
                 continue
             # Saved, or deliberately skipped because the account was signed
@@ -398,12 +453,13 @@ class Daemon:
             self._record_failure(account, exc)
             return
         except Exception as exc:  # a bug must not kill the bar's data source
-            traceback.print_exc(file=sys.stderr)
+            log_error("syncing", exc)
             self._record_failure(account, ProtonError(f"Internal error: {exc.__class__.__name__}"))
             return
         account.status = "ok"
         account.error = ""
         account.failures = 0
+        account.backoff_until = 0.0
         account.next_poll = self.mono() + self.config.poll_seconds
         if changed:
             self._after_sync(account)
@@ -417,38 +473,42 @@ class Daemon:
             return
         account.failures += 1
         if isinstance(exc, RateLimited):
-            account.next_poll = now + exc.retry_after
+            account.rate_limited_until = now + exc.retry_after
+            account.next_poll = account.rate_limited_until
             account.status = "ok" if account.mailbox.synced else "error"
             return
         account.status = "offline" if isinstance(exc, NetworkError) else "error"
-        account.next_poll = now + min(MAX_BACKOFF, 5 * 2 ** min(account.failures, 6))
+        account.backoff_until = now + min(MAX_BACKOFF, 5 * 2 ** min(account.failures, 6))
+        account.next_poll = account.backoff_until
 
     def _after_sync(self, account: Account) -> None:
         mailbox = account.mailbox
         now = int(self.clock())
-        new, mark = select_new(mailbox.fresh, self.watermarks.get(account.email), now)
-        if self.config.notify and new:
-            urls = {m["id"]: mailbox.web_url(m) for m in new}
-            self.notifier.announce(new, urls, mailbox.web_url())
+        shown, total, mark = select_new(
+            mailbox.unread_times, mailbox.fresh, self.watermarks.get(account.email), now
+        )
+        if self.config.notify and total:
+            urls = {m["id"]: mailbox.web_url(m) for m in shown}
+            self.notifier.announce(shown, urls, mailbox.web_url(), total=total)
         try:
             self.watermarks.set(account.email, mark)
-        except OSError:
-            traceback.print_exc(file=sys.stderr)
+        except OSError as exc:
+            log_error("saving the notification watermark", exc)
         if self.config.sender_images and mailbox.recent:
             self.emit()  # show the list now; logos follow
             try:
                 self.avatars.attach(mailbox.recent, account.client)
             except ProtonError:
                 pass
-            except Exception:  # logos are decoration; never let them stop mail
-                traceback.print_exc(file=sys.stderr)
+            except Exception as exc:  # logos are decoration; never let them stop mail
+                log_error("fetching sender logos", exc)
 
     # ----------------------------------------------------------------- state
 
     def snapshot(self) -> dict:
         now = int(self.clock())
         if self.config.demo:
-            return demo_state(now, self.config.recent_limit)
+            return demo_state(self.demo_anchor or now, self.config.recent_limit)
         totals = {"1h": 0, "24h": 0, "7d": 0, "all": 0}
         rows: list[dict] = []
         accounts = []
@@ -472,9 +532,21 @@ class Daemon:
                     "inboxUrl": mailbox.web_url(),
                 }
             )
+        for email in sorted(self.missing):
+            accounts.append(
+                {
+                    "email": email,
+                    "status": "auth-expired",
+                    "error": "No saved session (keyring locked?). Sign in again if this persists.",
+                    "counts": {k: 0 for k in totals},
+                    "inboxUrl": f"{WEB_BASE}/inbox",
+                }
+            )
         rows.sort(key=lambda r: r["time"], reverse=True)
         rows = rows[: self.config.recent_limit]
         status, message = self._overall_status(accounts, synced_any)
+        if self.notice and self.mono() < self.notice_until:
+            message = f"{self.notice} {message}".strip()
         return {
             "type": "state",
             "status": status,
@@ -488,21 +560,28 @@ class Daemon:
         }
 
     def _overall_status(self, accounts: list[dict], synced_any: bool) -> tuple[str, str]:
-        if self.store_error and not accounts:
+        loaded = [a for a in accounts if a["email"] not in self.missing]
+        if self.store_error and not loaded:
             return "error", self.store_error
-        if not accounts and self.missing:
-            return "auth-expired", (
-                f"Could not find the saved session for {sorted(self.missing)[0]}. "
-                "If your keyring is locked, unlock it; otherwise sign in again."
-            )
         if not accounts:
             return "signed-out", self._last_login_failure() or "Sign in to see your mail"
+        problems = [a for a in accounts if a["status"] not in ("ok", "starting")]
         statuses = {a["status"] for a in accounts}
-        if statuses == {"auth-expired"}:
-            return "auth-expired", "Your Proton session expired. Sign in again."
         if "ok" in statuses and synced_any:
-            problems = [a for a in accounts if a["status"] != "ok"]
-            return "ok", (f"{problems[0]['email']}: {problems[0]['error']}" if problems else "")
+            notes = [f"{a['email']}: {a['error'] or a['status']}" for a in problems]
+            if self.store_error:
+                notes.append(self.store_error)
+            # Some accounts work and some do not: say so, so partial totals
+            # are never mistaken for the whole picture.
+            return ("partial" if notes else "ok"), "; ".join(notes)
+        if statuses == {"auth-expired"}:
+            first = accounts[0]
+            if first["email"] in self.missing:
+                return "auth-expired", (
+                    f"Could not find the saved session for {first['email']}. "
+                    "If your keyring is locked, unlock it; otherwise sign in again."
+                )
+            return "auth-expired", "Your Proton session expired. Sign in again."
         if "offline" in statuses:
             return "offline", next(a["error"] for a in accounts if a["status"] == "offline")
         if "error" in statuses:
@@ -536,18 +615,14 @@ class Daemon:
         self._mirror(payload)
 
     def _mirror(self, payload: str) -> None:
-        path = self.state_path or str(runtime_dir() / "state.json")
+        path = Path(self.state_path) if self.state_path else runtime_dir() / "state.json"
         with contextlib.suppress(OSError):
-            tmp = path + ".tmp"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as fh:
-                fh.write(payload + "\n")
-            os.replace(tmp, path)
+            write_private(path, payload + "\n")
 
     # ------------------------------------------------------------------ lock
 
     def _acquire_lock(self) -> int | None:
-        fd = os.open(runtime_dir() / "daemon.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fd = open_private(runtime_dir() / "daemon.lock")
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
         while True:
             try:

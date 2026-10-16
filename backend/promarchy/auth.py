@@ -155,8 +155,17 @@ def request_verification_code(client: ProtonClient, method: str, destination: st
     client.call("POST", "/core/v4/users/code", body=body, auth=False)
 
 
-def primary_address(client: ProtonClient) -> str:
-    """The account's main sending address, used as its display name."""
+def primary_address(client: ProtonClient, username: str) -> str:
+    """The account's main address, used to name it.
+
+    Signing in with a full address needs no lookup. For a bare username we
+    read the address list; Proton includes the account's private keys
+    (encrypted with your password) in that response, and Promarchy reads only
+    the address fields and keeps nothing else.
+    """
+    username = username.strip()
+    if "@" in username:
+        return username.lower()
     try:
         addresses = client.call("GET", "/core/v4/addresses").get("Addresses") or []
     except ProtonError:
@@ -164,14 +173,22 @@ def primary_address(client: ProtonClient) -> str:
     enabled = [a for a in addresses if isinstance(a, dict) and a.get("Status") == 1]
     enabled.sort(key=lambda a: a.get("Order", 1 << 30))
     if enabled and enabled[0].get("Email"):
-        return str(enabled[0]["Email"])
-    user = client.call("GET", "/core/v4/users").get("User") or {}
-    return str(user.get("Email") or user.get("Name") or "")
+        return str(enabled[0]["Email"]).lower()
+    return username.lower()
 
 
-def logout(client: ProtonClient) -> None:
-    """Revoke the session server-side (best effort)."""
+def logout(client: ProtonClient) -> bool:
+    """Revoke the session on Proton's side.
+
+    True when Proton confirmed it, or when the session is already dead (its
+    refresh token was rejected). False when Proton could not be reached or
+    refused for another reason, in which case the session may still be live.
+    An expired access token is refreshed first so the revocation can go through.
+    """
     try:
-        client.call("DELETE", "/auth/v4", _retry_auth=False)
+        client.call("DELETE", "/auth/v4")
+        return True
+    except AuthExpired:
+        return True
     except ProtonError:
-        pass
+        return False

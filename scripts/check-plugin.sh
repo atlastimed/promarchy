@@ -47,12 +47,25 @@ grep -q "^version = \"$version\"" pyproject.toml || fail "pyproject version diff
 grep -q "moduleName: \"$id\"" BarWidget.qml || fail "BarWidget moduleName must be $id"
 grep -q "pluginId: \"$id\"" BarWidget.qml || fail "BarWidget pluginId must be $id"
 
+# qmllint must run and report on every file. Unresolved qs.* modules only
+# exist inside the running shell, so their warnings are expected; a syntax
+# error (exit 255, "syntax" diagnostics) or a tool that never ran fails.
 qmllint=${QMLLINT:-$(command -v qmllint6 || command -v qmllint || echo /usr/lib/qt6/bin/qmllint)}
-output=$("$qmllint" ./*.qml 2>&1 || true)
-if grep -q '\[syntax\]' <<<"$output"; then
-  grep -A2 '\[syntax\]' <<<"$output" >&2
+[[ -x $qmllint ]] || fail "qmllint not found (install qt6-declarative or set QMLLINT)"
+report=$(mktemp)
+trap 'rm -f "$report"' EXIT
+qml_files=(./*.qml)
+lint_status=0
+"$qmllint" --json "$report" "${qml_files[@]}" >/dev/null 2>&1 || lint_status=$?
+jq -e --argjson n "${#qml_files[@]}" '(.files | length) == $n' "$report" >/dev/null 2>&1 \
+  || fail "qmllint did not report on all ${#qml_files[@]} QML files (exit $lint_status)"
+syntax=$(jq -r '.files[] | .filename as $f | .warnings[] | select(.id == "syntax")
+  | "\($f):\(.line):\(.column): \(.message)"' "$report")
+if [[ -n $syntax ]]; then
+  echo "$syntax" >&2
   fail "QML syntax errors"
 fi
+(( lint_status == 0 )) || fail "qmllint exited with status $lint_status"
 
 python3 -I backend/promarchyctl --version >/dev/null || fail "backend does not start"
 echo "check-plugin: $id $version ok"

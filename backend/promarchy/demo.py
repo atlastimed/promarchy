@@ -12,7 +12,7 @@ SAMPLES = [
     (
         18,
         "GitHub",
-        "notifications@github.com",
+        "notifications@github.example",
         "[omarchy/omarchy] New release: 4.1.0",
         True,
         3,
@@ -20,7 +20,17 @@ SAMPLES = [
         False,
         "updates",
     ),
-    (52, "Linear", "notifications@linear.app", "PRO-142 Ship the bar widget", True, 1, 0, False, "updates"),
+    (
+        52,
+        "Linear",
+        "notifications@linear.example",
+        "PRO-142 Ship the bar widget",
+        True,
+        1,
+        0,
+        False,
+        "updates",
+    ),
     (
         190,
         "Grace Hopper",
@@ -32,11 +42,21 @@ SAMPLES = [
         False,
         "primary",
     ),
-    (420, "Proton", "no-reply@proton.me", "Your monthly security summary", False, 1, 0, False, "primary"),
+    (
+        420,
+        "Proton",
+        "no-reply@proton.example",
+        "Your monthly security summary",
+        False,
+        1,
+        0,
+        False,
+        "primary",
+    ),
     (
         1500,
         "Stripe",
-        "receipts@stripe.com",
+        "receipts@stripe.example",
         "Your receipt from Hetzner #2741",
         False,
         1,
@@ -47,9 +67,9 @@ SAMPLES = [
     (2900, "Alan Turing", "alan@example.com", "Weekend hike photos", False, 1, 6, False, "primary"),
     (
         7000,
-        "Hacker Newsletter",
-        "kale@hackernewsletter.com",
-        "Hacker Newsletter #712",
+        "Weekly Digest",
+        "digest@newsletter.example",
+        "The weekly digest #712",
         False,
         1,
         0,
@@ -62,6 +82,8 @@ COUNTS = {"1h": 3, "24h": 4, "7d": 27, "all": 112}
 
 
 def demo_state(now: int, limit: int) -> dict:
+    """Sample mail relative to `now`, the moment demo mode was switched on, so
+    the snapshot stays identical between ticks."""
     messages = []
     for index, (minutes, name, address, subject, unread, thread, files, starred, category) in enumerate(
         SAMPLES
@@ -71,7 +93,7 @@ def demo_state(now: int, limit: int) -> dict:
             {
                 "id": mid,
                 "conversationId": f"demo-conv{index}",
-                "account": "you@proton.me",
+                "account": "you@example.com",
                 "senderName": name,
                 "senderAddress": address,
                 "subject": subject,
@@ -82,6 +104,7 @@ def demo_state(now: int, limit: int) -> dict:
                 "category": category,
                 "senderImage": False,
                 "threadCount": thread,
+                "kind": "conversation",
                 "unreadIds": [mid] if unread else [],
                 "url": "https://mail.proton.me/inbox",
             }
@@ -90,7 +113,7 @@ def demo_state(now: int, limit: int) -> dict:
         "type": "state",
         "status": "ok",
         "message": "",
-        "accounts": [{"email": "you@proton.me", "status": "ok", "error": "", "counts": COUNTS}],
+        "accounts": [{"email": "you@example.com", "status": "ok", "error": "", "counts": COUNTS}],
         "counts": dict(COUNTS),
         "capped": False,
         "messages": messages[:limit],

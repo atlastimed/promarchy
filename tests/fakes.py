@@ -87,6 +87,13 @@ class FakeProton:
             return {"Code": 1000, "MailSettings": {"ViewMode": self.view_mode}}
         if path == "/mail/v4/messages" and method == "GET":
             return self._list(params)
+        if path == "/mail/v4/conversations" and method == "GET":
+            return self._conversations(params)
+        if path == "/mail/v4/conversations/read" and method == "PUT":
+            for message in self.messages:
+                if message["ConversationID"] in body["IDs"]:
+                    message["Unread"] = 0
+            return {"Code": 1000}
         if path == "/mail/v4/messages/count":
             return self._counts()
         if path == "/mail/v4/messages/read" and method == "PUT":
@@ -96,9 +103,14 @@ class FakeProton:
             return {"Code": 1000}
         raise AssertionError(f"unexpected call {method} {path}")
 
-    def fetch_bytes(self, path, *, params=None):
+    logo_status = 200
+    logo_error: Exception | None = None
+
+    def fetch_bytes(self, path, *, params=None, max_bytes):
         self.calls.append(("GET", path, params, None))
-        return 200, "image/png", b"\x89PNG fake"
+        if self.logo_error is not None:
+            raise self.logo_error
+        return self.logo_status, "image/png", b"\x89PNG fake"
 
     def close(self) -> None:
         pass
@@ -127,6 +139,51 @@ class FakeProton:
             matches = matches[ids.index(single["AnchorID"]) + 1 :]
         limit = int(single.get("PageSize") or max(50, int(single.get("Limit", 50))))
         return {"Code": 1000, "Total": total, "Messages": [dict(m) for m in matches[:limit]]}
+
+    def _matching(self, params) -> tuple[list[dict], dict]:
+        pairs = list(params.items()) if isinstance(params, dict) else list(params)
+        single = dict(pairs)
+        labels = [str(v) for k, v in pairs if k in ("LabelID", "LabelID[]")]
+        location, categories = labels[0], set(labels[1:])
+        found = [
+            m
+            for m in self.messages
+            if location in m["LabelIDs"] and (not categories or categories & set(m["LabelIDs"]))
+        ]
+        return found, single
+
+    def _conversations(self, params) -> dict:
+        """Conversations with Context* counts for the requested folder, newest first."""
+        found, single = self._matching(params)
+        groups: dict[str, list[dict]] = {}
+        for m in found:
+            groups.setdefault(m["ConversationID"], []).append(m)
+        items = []
+        for cid, msgs in groups.items():
+            newest = max(msgs, key=lambda m: m["Time"])
+            labels = sorted({label for m in msgs for label in m["LabelIDs"]})
+            items.append(
+                {
+                    "ID": cid,
+                    "Subject": newest["Subject"],
+                    "Senders": [
+                        {
+                            "Name": m["SenderName"],
+                            "Address": m["SenderAddress"],
+                            "DisplaySenderImage": m["DisplaySenderImage"],
+                        }
+                        for m in sorted(msgs, key=lambda m: m["Time"])
+                    ],
+                    "ContextTime": newest["Time"],
+                    "ContextNumMessages": len(msgs),
+                    "ContextNumUnread": sum(1 for m in msgs if m["Unread"]),
+                    "ContextNumAttachments": sum(m["NumAttachments"] for m in msgs),
+                    "LabelIDs": labels,
+                }
+            )
+        items.sort(key=lambda c: c["ContextTime"], reverse=True)
+        size = int(single.get("PageSize") or 50)
+        return {"Code": 1000, "Total": len(items), "Conversations": items[:size]}
 
     def _counts(self) -> dict:
         counts: dict[str, int] = {}

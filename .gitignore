@@ -4,3 +4,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 node_modules/
+# never commit local secrets or runtime state
+.env
+.env.*
+*.bundle
+state.json
+accounts.json
+notified.json
+last-login.json

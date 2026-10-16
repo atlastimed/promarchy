@@ -6,7 +6,6 @@ import argparse
 import contextlib
 import getpass
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -26,7 +25,7 @@ from .auth import (
     request_verification_code,
     submit_totp,
 )
-from .paths import runtime_dir, state_dir
+from .paths import runtime_dir, state_dir, write_private
 from .store import SessionStore, StoreUnavailable
 
 BOLD = "\033[1m"
@@ -55,7 +54,11 @@ class LoginFailed(Exception):
 
 def cmd_login(args: argparse.Namespace) -> int:
     print(_style("Promarchy · sign in to Proton Mail", BOLD))
-    print(_style("Your password is used locally for Proton's SRP handshake and is never stored.\n", DIM))
+    print(
+        _style(
+            "Your password is only used on this machine for Proton's SRP handshake and is not stored.\n", DIM
+        )
+    )
     try:
         email = _login(args.username)
     except LoginFailed as exc:
@@ -110,36 +113,38 @@ def _login(username: str | None) -> str:
         password = ""  # noqa: F841 - drop our reference as early as possible
 
     client.session = pending.session
+    committed = False
     try:
         if pending.needs_fido2_only:
-            logout(client)
             raise LoginFailed(
                 "This account only accepts a security key as its second factor.\n"
                 "  Promarchy supports authenticator-app codes (TOTP). Add one in\n"
                 "  Proton's account settings, then sign in again."
             )
         if pending.needs_totp and not _two_factor(client):
-            logout(client)
             raise LoginFailed("Two-factor authentication was not completed.")
-        email = (primary_address(client) or username).strip().lower()
+        email = primary_address(client, username)
+        pending.session.email = email
+        try:
+            previous = store.replace(pending.session)
+        except Exception as exc:
+            raise LoginFailed(f"Signed in, but could not save the session to your keyring: {exc}") from exc
+        committed = True
     except WrongCredentials as exc:
         raise LoginFailed(str(exc)) from exc
     except ProtonError as exc:
-        logout(client)
         raise LoginFailed(f"Sign-in failed: {exc}") from exc
-
-    pending.session.email = email
-    try:
-        previous = store.load(email)
-    except Exception:
-        previous = None
-    try:
-        store.save(pending.session)
-    except Exception as exc:
-        logout(client)  # do not leave an unreachable session behind on Proton's side
-        raise LoginFailed(f"Signed in, but could not save the session to your keyring: {exc}") from exc
-    if previous and previous.uid != pending.session.uid:
-        logout(ProtonClient(previous))  # revoke the session we just replaced
+    finally:
+        # Anything short of a saved session (an error, a wrong 2FA code,
+        # Ctrl+C) must not leave a live session behind on Proton's side.
+        if not committed:
+            logout(client)
+    if previous is not None and not logout(ProtonClient(previous)):
+        print(
+            "Note: the session this sign-in replaced could not be revoked (Proton unreachable).\n"
+            "You can end it under Proton's Settings → Security → Session management.",
+            file=sys.stderr,
+        )
     return email
 
 
@@ -170,8 +175,9 @@ def _human_verification(client: ProtonClient, exc: HumanVerificationRequired) ->
         url = str(exc.details.get("WebUrl") or "")
         if not url.startswith(VERIFY_PREFIX):
             url = f"{VERIFY_PREFIX}?methods=captcha&token={quote(token)}"
-        print("Opening the CAPTCHA in your browser. Solve it there, then come back here.")
-        print(_style(f"  {url}", DIM))
+        # The link carries a short-lived verification token: it goes straight
+        # to the browser and is never printed or logged.
+        print("Opening the CAPTCHA on verify.proton.me in your browser. Solve it there, then come back.")
         open_in_browser(url)
         answer = _ask("Press Enter once it says you're verified (q to cancel): ")
         if answer.lower().startswith("q"):
@@ -220,37 +226,62 @@ def record_login(ok: bool, detail: str) -> None:
     """Leave the outcome where the daemon can show it in the dropdown."""
     path = state_dir() / "last-login.json"
     with contextlib.suppress(OSError):
-        tmp = path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump({"time": int(time.time()), "ok": ok, "detail": detail[:300]}, fh)
-        os.replace(tmp, path)
+        write_private(path, json.dumps({"time": int(time.time()), "ok": ok, "detail": detail[:300]}))
 
 
 # -------------------------------------------------------------------- others
 
 
 def cmd_logout(args: argparse.Namespace) -> int:
+    """Revoke and forget sessions, reporting each step truthfully.
+
+    A session is only forgotten locally once Proton confirmed the revocation
+    (or it was already dead), unless --local says to forget it regardless.
+    """
     store = SessionStore()
     accounts = store.accounts()
     targets = accounts if args.all else [args.email.lower()] if args.email else accounts[:1]
     if not targets:
         print("Not signed in.")
         return 0
+    status = 0
     for email in targets:
         if email not in accounts:
             print(f"✗ {email} is not signed in.", file=sys.stderr)
-            return 1
+            status = 1
+            continue
         try:
             session = store.load(email)
         except StoreUnavailable as exc:
-            print(f"✗ {exc}", file=sys.stderr)
-            return 1
-        if session:
-            logout(ProtonClient(session))
-        store.remove(email)
-        print(f"Signed out {email}.")
-    return 0
+            print(f"✗ {email}: {exc}", file=sys.stderr)
+            status = 1
+            continue
+        revoked = True
+        if session is not None:
+            client = ProtonClient(session, on_refresh=store.update_tokens)
+            revoked = logout(client)
+            if not revoked and not args.local:
+                print(
+                    f"✗ {email}: Proton could not be reached to end the session, so it is still signed in.\n"
+                    "  Try again when online, or add --local to forget it here anyway (then end it under\n"
+                    "  Proton's Settings → Security → Session management).",
+                    file=sys.stderr,
+                )
+                status = 1
+                continue
+        try:
+            removed = store.remove(email, expected_uid=session.uid if session else None)
+        except StoreUnavailable as exc:
+            print(f"✗ {email}: {exc}", file=sys.stderr)
+            status = 1
+            continue
+        if not removed:
+            print(f"{email} was signed in again meanwhile; kept the newer session.")
+        elif revoked:
+            print(f"Signed out {email}.")
+        else:
+            print(f"Forgot {email} on this machine. Its session could not be ended on Proton's side.")
+    return status
 
 
 def cmd_accounts(_: argparse.Namespace) -> int:
@@ -317,9 +348,12 @@ def main(argv: list[str] | None = None) -> int:
     login.add_argument("--wait", action="store_true", help="wait for Enter before exiting (used by the bar)")
     login.set_defaults(func=cmd_login)
 
-    out = sub.add_parser("logout", help="sign out and revoke the session")
+    out = sub.add_parser("logout", help="end the session on Proton's side and forget it here")
     out.add_argument("email", nargs="?")
     out.add_argument("--all", action="store_true", help="sign out every account")
+    out.add_argument(
+        "--local", action="store_true", help="forget the session here even if Proton cannot be reached"
+    )
     out.set_defaults(func=cmd_logout)
 
     sub.add_parser("accounts", help="list signed-in accounts").set_defaults(func=cmd_accounts)

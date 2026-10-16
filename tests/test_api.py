@@ -38,7 +38,7 @@ class FakeHttp:
         self.sent = []
         self.headers = {}
 
-    def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+    def request(self, method, url, params=None, json=None, headers=None, timeout=None, max_bytes=None):
         assert timeout is not None, "every request needs a timeout"
         self.sent.append({"method": method, "url": url, "json": json, "headers": dict(headers or {})})
         item = self.responses.pop(0)
@@ -165,7 +165,7 @@ def test_fetch_bytes_through_real_client():
     png.content = b"\x89PNG"
     http = FakeHttp([png])
     status, ctype, body = ProtonClient(session(), http=http).fetch_bytes(
-        "/core/v4/images/logo", params={"Address": "a@b.c"}
+        "/core/v4/images/logo", params={"Address": "a@b.c"}, max_bytes=1024
     )
     assert (status, ctype, body) == (200, "image/png", b"\x89PNG")
     assert http.sent[0]["headers"]["Authorization"] == "Bearer old-access"
