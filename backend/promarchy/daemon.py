@@ -156,7 +156,11 @@ class Daemon:
         now = self.clock()
         for account in list(self.accounts.values()):
             if account.next_poll <= now:
-                self._poll(account)
+                try:
+                    self._poll(account)
+                except Exception as exc:  # a bug must not kill the bar's data source
+                    traceback.print_exc(file=sys.stderr)
+                    self._record_failure(account, ProtonError(f"Internal error: {exc.__class__.__name__}"))
         # An explicit refresh always answers, even when nothing changed, so
         # the widget can stop its spinner.
         self.emit(force=self._force_emit)
@@ -349,6 +353,8 @@ class Daemon:
                 self.avatars.attach(mailbox.recent, account.client)
             except ProtonError:
                 pass
+            except Exception:  # logos are decoration; never let them stop mail
+                traceback.print_exc(file=sys.stderr)
 
     # ----------------------------------------------------------------- state
 

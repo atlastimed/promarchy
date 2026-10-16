@@ -159,10 +159,10 @@ class ProtonClient:
 
     def fetch_bytes(self, path: str, *, params: Any = None) -> tuple[int, str, bytes]:
         """GET a binary resource (sender logos). Returns (status, type, body)."""
-        resp = self._send("GET", path, params=params, auth=True, headers=None)
+        resp = self._send("GET", path, params=params, body=None, auth=True, headers=None)
         if resp.status_code == 401 and self.session:
             self.refresh()
-            resp = self._send("GET", path, params=params, auth=True, headers=None)
+            resp = self._send("GET", path, params=params, body=None, auth=True, headers=None)
         if resp.status_code in (429, 503):
             raise RateLimited("Proton asked us to slow down", _retry_after(resp))
         ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()

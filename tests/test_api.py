@@ -159,3 +159,14 @@ def test_non_json_error():
 def test_session_roundtrip():
     s = session()
     assert Session.from_dict(json.loads(json.dumps(s.to_dict()))) == s
+
+
+def test_fetch_bytes_through_real_client():
+    png = Response(200, None, {"content-type": "image/png; charset=binary"})
+    png.content = b"\x89PNG"
+    http = FakeHttp([png])
+    status, ctype, body = ProtonClient(session(), http=http).fetch_bytes(
+        "/core/v4/images/logo", params={"Address": "a@b.c"}
+    )
+    assert (status, ctype, body) == (200, "image/png", b"\x89PNG")
+    assert http.sent[0]["headers"]["Authorization"] == "Bearer old-access"
