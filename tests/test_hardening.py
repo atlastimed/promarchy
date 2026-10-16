@@ -161,16 +161,17 @@ def test_logout_offline_keeps_the_session_and_fails(cli_store, capsys):
 def test_logout_local_forgets_even_when_offline(cli_store, capsys):
     cli_store.save(session())
     FakeClient.outcome = "offline"
-    assert cli.cmd_logout(logout_args(local=True)) == 0
+    assert cli.cmd_logout(logout_args(local=True)) == 1  # forgotten here, not confirmed ended
     assert cli_store.accounts() == []
     assert "could not be ended" in capsys.readouterr().out
 
 
-def test_logout_of_an_already_dead_session_succeeds(cli_store):
+def test_logout_of_a_rejected_session_removes_it_but_does_not_claim_success(cli_store, capsys):
     cli_store.save(session())
     FakeClient.outcome = "dead"
-    assert cli.cmd_logout(logout_args()) == 0
+    assert cli.cmd_logout(logout_args()) == 1
     assert cli_store.accounts() == []
+    assert "cannot confirm" in capsys.readouterr().err
 
 
 def test_logout_does_not_throw_away_a_newer_sign_in(cli_store):
@@ -225,11 +226,11 @@ def test_daemon_sign_out_only_forgets_after_revocation(daemon_env, monkeypatch):
     d, api, store, clock, states = daemon_env
     store.save(session(uid="uid1"))
     d.tick()
-    monkeypatch.setattr(daemon_module, "end_session", lambda client, reload: "unconfirmed")
+    monkeypatch.setattr(daemon_module, "end_session", lambda client: "unconfirmed")
     d.handle({"cmd": "logout"})
     assert store.accounts() == ["me@proton.me"]
     assert "Could not sign out" in states()[-1]["message"]
-    monkeypatch.setattr(daemon_module, "end_session", lambda client, reload: "revoked")
+    monkeypatch.setattr(daemon_module, "end_session", lambda client: "revoked")
     d.handle({"cmd": "logout"})
     assert store.accounts() == []
     assert states()[-1]["status"] == "signed-out"

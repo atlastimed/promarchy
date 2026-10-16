@@ -270,26 +270,35 @@ def roundtrip(probe: Probe, alias: Aliases) -> dict:
     if not is_single_unread(probe.get(f"/mail/v4/conversations/{cid}").get("Conversation") or {}):
         return {"skipped": "the chosen conversation changed before the test; nothing was modified"}
     before = (snapshot().get("counts") or {}).get("all")
-    result: dict = {"conversation": alias(cid, "c"), "barAllBefore": before}
-    dispatched = False
+    result: dict = {"conversation": alias(cid, "c"), "barAllBefore": before, "restored": False}
+    # Once the read request is sent it may have landed even if its reply is
+    # lost, so from here on the restore always runs and is always reported.
     try:
-        dispatched = True  # a sent write may have landed even if its reply is lost
         probe.put("/mail/v4/conversations/read", {"IDs": [cid]})
         result["barReflectedReadAfterSeconds"] = wait_for(
             lambda: (snapshot().get("counts") or {}).get("all") == (before or 0) - 1
         )
-    finally:
-        if dispatched:
-            try:
-                probe.put("/mail/v4/conversations/unread", {"IDs": [cid], "LabelID": INBOX})
-            except ProtonError as exc:
-                result["restoreError"] = f"{type(exc).__name__} (HTTP {exc.status}); restore it by hand"
-    result["barRestoredAfterSeconds"] = wait_for(
-        lambda: (snapshot().get("counts") or {}).get("all") == before
-    )
-    after = probe.get(f"/mail/v4/conversations/{cid}").get("Conversation") or {}
-    result["unreadAfterRestore"] = after.get("NumUnread")
-    result["restored"] = is_single_unread(after)
+    except ProtonError as exc:
+        result["readError"] = f"{type(exc).__name__} (HTTP {exc.status})"
+    try:
+        probe.put("/mail/v4/conversations/unread", {"IDs": [cid], "LabelID": INBOX})
+    except ProtonError as exc:
+        result["restoreError"] = f"{type(exc).__name__} (HTTP {exc.status})"
+    try:
+        after = probe.get(f"/mail/v4/conversations/{cid}").get("Conversation") or {}
+        result["unreadAfterRestore"] = after.get("NumUnread")
+        result["restored"] = is_single_unread(after)
+    except ProtonError as exc:
+        result["verifyError"] = f"{type(exc).__name__} (HTTP {exc.status})"
+    if result["restored"]:
+        result["barRestoredAfterSeconds"] = wait_for(
+            lambda: (snapshot().get("counts") or {}).get("all") == before
+        )
+    else:
+        result["action"] = (
+            "Restore not confirmed: in Proton Mail, find your newest unread conversation from before this run"
+            f" ({result['conversation']} here) and mark it unread again if it is now read."
+        )
     return result
 
 
@@ -308,10 +317,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     probe = Probe(NoRenewClient(session))
     alias = Aliases()
+    status = 0
     try:
         out = report(probe, alias)
         if args.roundtrip:
             out["roundtrip"] = roundtrip(probe, alias)
+            if "skipped" not in out["roundtrip"] and not out["roundtrip"]["restored"]:
+                status = 3
     except AuthExpired:
         print(
             "The access token has expired. This probe never renews the session (that would consume\n"
@@ -328,7 +340,9 @@ def main(argv: list[str] | None = None) -> int:
     out["requests"] = probe.requests
     json.dump(out, sys.stdout, indent=2, ensure_ascii=False)
     print()
-    return 0
+    if status:
+        print("Round trip: the restore could not be confirmed; see roundtrip.action.", file=sys.stderr)
+    return status
 
 
 if __name__ == "__main__":

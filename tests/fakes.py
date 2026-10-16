@@ -83,6 +83,9 @@ class FakeProton:
                 raise event["raise"]
             self.event_id = f"ev{next(self._event)}"
             return {"Code": 1000, "EventID": self.event_id, "More": 0, "Refresh": 0, **event}
+        if path == "/auth/v4" and method == "DELETE":
+            self.revoked = True
+            return {"Code": 1000}
         if path == "/mail/v4/settings":
             return {"Code": 1000, "MailSettings": {"ViewMode": self.view_mode}}
         if path == "/mail/v4/messages" and method == "GET":

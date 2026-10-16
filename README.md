@@ -112,7 +112,7 @@ What Promarchy does, stated precisely:
 
   Omarchy's notification history also keeps the sender and subject of announced mail.
 - **Sender logos** are fetched from Proton's logo proxy, so Proton (not a third party) sees which sender address is looked up. Logos are requested as raster images and accepted only as PNG, JPEG or WebP (checked by file signature); SVG is never stored or shown.
-- **Signing out** ends the session on Proton's side first and only then forgets it here. If Proton cannot be reached, you are told and stay signed in (`promarchyctl logout --local` forgets it anyway; end it later under Proton's *Settings → Security → Session management*). Removing the plugin does not sign you out: run `promarchyctl logout --all` first.
+- **Signing out** ends the session on Proton's side first and only then forgets it here. While the bar runs, its background process owns the session and does this for the dropdown and for `promarchyctl logout` alike (over a private socket only your user can reach). If Proton cannot be reached, you are told and stay signed in (`--local` forgets it anyway). If Proton no longer accepts the saved credentials, Promarchy removes them and tells you it could not confirm the session ended. Either way you can check under Proton's *Settings → Security → Session management*. Removing the plugin does not sign you out: run `promarchyctl logout --all` first.
 - **Writes to your mailbox:** only *mark as read*, and only when you ask.
 - Proton does not publish a third-party API. Promarchy uses the same endpoints as the Proton web app, identifies itself honestly (`x-pm-appversion: Other`, `User-Agent: Promarchy/…`), and keeps its traffic small.
 

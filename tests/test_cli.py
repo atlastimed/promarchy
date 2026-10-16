@@ -55,3 +55,11 @@ def test_status_window(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "runtime_dir", lambda: tmp_path)
     assert cli.main(["status", "--window", "24h"]) == 0
     assert capsys.readouterr().out.strip() == "4"
+
+
+def test_tests_never_see_the_real_runtime_dir():
+    import conftest
+
+    from promarchy.paths import runtime_dir
+
+    assert not conftest.REAL_RUNTIME or not str(runtime_dir()).startswith(conftest.REAL_RUNTIME)

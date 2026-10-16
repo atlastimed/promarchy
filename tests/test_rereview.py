@@ -13,7 +13,7 @@ from test_hardening import daemon_env  # noqa: F401  (fixture)
 
 from promarchy import cli
 from promarchy.api import ProtonClient, RateLimited, Session
-from promarchy.auth import GONE, REVOKED, UNCONFIRMED, end_session
+from promarchy.auth import REJECTED, REVOKED, UNCONFIRMED, end_session
 from promarchy.avatars import Avatars
 from promarchy.mailbox import Mailbox, summarize_conversation
 from promarchy.store import SecretToolBackend, SessionStore, StoreUnavailable
@@ -76,23 +76,13 @@ def store(tmp_path):
     return SessionStore(secrets=MemorySecrets(), root=root)
 
 
-def test_stale_tokens_after_a_daemon_refresh_still_revoke(store):
+def test_end_session_reports_exactly_what_proton_said(store):
     server = AuthServer()
-    cli_copy = stored_session(server)  # the CLI loads these...
-    store.save(cli_copy)
-    server.rotate()  # ...then the daemon refreshes and saves the new pair
-    store.update_tokens(stored_session(server))
-    client = ProtonClient(Session(**cli_copy.to_dict()), http=server)
-    assert end_session(client, lambda: store.load("me@proton.me")) == REVOKED
+    assert end_session(ProtonClient(stored_session(server), http=server)) == REVOKED
     assert server.revoked is True
-
-
-def test_a_genuinely_dead_session_is_reported_gone(store):
-    server = AuthServer()
-    store.save(stored_session(server))
-    server.revoked = True
-    client = ProtonClient(stored_session(server), http=server)
-    assert end_session(client, lambda: store.load("me@proton.me")) == GONE
+    dead = AuthServer()
+    dead.revoked = True
+    assert end_session(ProtonClient(stored_session(dead), http=dead)) == REJECTED
 
 
 def test_unreachable_proton_is_unconfirmed(store):
@@ -101,9 +91,31 @@ def test_unreachable_proton_is_unconfirmed(store):
             raise ConnectionRefusedError("offline")
 
     server = Offline()
-    store.save(stored_session(server))
-    client = ProtonClient(stored_session(server), http=server)
-    assert end_session(client, lambda: store.load("me@proton.me")) == UNCONFIRMED
+    assert end_session(ProtonClient(stored_session(server), http=server)) == UNCONFIRMED
+
+
+def test_rate_limit_propagates_from_end_session():
+    class Throttled(AuthServer):
+        def request(self, method, url, **kw):
+            resp = Resp(429, {"Code": 2028, "Error": "slow"})
+            resp.headers["retry-after"] = "120"
+            return resp
+
+    with pytest.raises(RateLimited):
+        end_session(ProtonClient(stored_session(Throttled()), http=Throttled()))
+
+
+def test_a_client_never_adopts_stored_tokens(store):
+    """N06/N07: renewal uses only the client's own tokens; the store is never
+    consulted, so neither older nor newer stored pairs can replace them."""
+    server = AuthServer()
+    fresh = stored_session(server)  # the client's working pair (unsaved)
+    store.save(Session(uid=server.uid, access_token="old", refresh_token="consumed", email="me@proton.me"))
+    client = ProtonClient(Session(**fresh.to_dict()), http=server)
+    server.access = "expired"  # force a renewal
+    client.call("DELETE", "/auth/v4")
+    assert server.revoked is True
+    assert client.session.refresh_token not in ("consumed", fresh.refresh_token)
 
 
 @pytest.fixture
@@ -116,26 +128,6 @@ def cli_env(store, monkeypatch):
 
 def args(**kw):
     return argparse.Namespace(**{"email": None, "all": True, "local": False, **kw})
-
-
-def test_cli_logout_survives_a_concurrent_daemon_refresh(cli_env, monkeypatch):
-    store, server = cli_env
-    store.save(stored_session(server))
-    real_load = store.load
-    calls = {"n": 0}
-
-    def load_then_daemon_refreshes(email):
-        session = real_load(email)
-        calls["n"] += 1
-        if calls["n"] == 1:  # right after the CLI read its copy
-            server.rotate()
-            store.update_tokens(stored_session(server))
-        return session
-
-    monkeypatch.setattr(store, "load", load_then_daemon_refreshes)
-    assert cli.cmd_logout(args()) == 0
-    assert server.revoked is True
-    assert store.accounts() == []
 
 
 def test_unreadable_session_changes_nothing_without_local(cli_env, monkeypatch, capsys):
@@ -400,61 +392,6 @@ def test_daemon_still_reports_a_genuinely_expired_session(daemon_env):  # noqa: 
 # ------------------------------------------------- N01/N02/N05 (review of 3a6ca09)
 
 
-def test_a_waiting_process_adopts_tokens_instead_of_spending_its_own(store):
-    server = AuthServer()
-    held = stored_session(server)
-    store.save(held)
-    server.rotate()  # another process renewed and saved, under the lock
-    store.update_tokens(stored_session(server))
-    calls = []
-    real = server.request
-
-    def spy(method, url, **kw):
-        calls.append(url.rsplit("/", 2)[-2:])
-        return real(method, url, **kw)
-
-    server.request = spy
-    client = ProtonClient(
-        Session(**held.to_dict()), http=server, refresh_guard=lambda: store.refresh_guard("me@proton.me")
-    )
-    client.refresh()
-    assert client.session.refresh_token == server.refresh
-    assert not any(c[-1] == "refresh" for c in calls)  # no single-use token was spent
-
-
-def test_renewal_and_save_are_atomic_across_processes(tmp_path):
-    import threading
-    import time
-
-    root = tmp_path / "shared"
-    root.mkdir()
-    secrets = MemorySecrets()
-    daemon_store = SessionStore(secrets=secrets, root=root)  # two processes,
-    cli_store = SessionStore(secrets=secrets, root=root)  # one keyring
-    server = AuthServer()
-    daemon_store.save(stored_session(server))
-    real = server.request
-
-    def slow_refresh(method, url, **kw):
-        if url.endswith("/auth/v4/refresh"):
-            time.sleep(0.3)  # Proton has rotated; the save has not happened yet
-        return real(method, url, **kw)
-
-    server.request = slow_refresh
-    client = ProtonClient(
-        stored_session(server),
-        http=server,
-        on_refresh=daemon_store.update_tokens,
-        refresh_guard=lambda: daemon_store.refresh_guard("me@proton.me"),
-    )
-    renewing = threading.Thread(target=client.refresh)
-    renewing.start()
-    time.sleep(0.1)  # the CLI re-reads mid-renewal
-    seen = cli_store.load_locked("me@proton.me")
-    renewing.join()
-    assert seen.refresh_token == server.refresh  # it waited for the save
-
-
 def test_cli_logout_reports_unsaved_fresh_tokens(cli_env, monkeypatch, capsys):
     store, server = cli_env
     store.save(stored_session(server))
@@ -507,7 +444,7 @@ def test_rate_limited_sign_out_keeps_the_deadline(daemon_env, monkeypatch):  # n
     store.save(Session(uid="u", access_token="a", refresh_token="r", email="me@proton.me"))
     d.tick()
 
-    def throttled(client, reload):
+    def throttled(client):
         raise RateLimited("slow down", 300)
 
     monkeypatch.setattr(daemon_module, "end_session", throttled)

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import base64
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from .api import AuthExpired, ProtonClient, ProtonError, RateLimited, Session, WrongCredentials
@@ -178,44 +177,33 @@ def primary_address(client: ProtonClient, username: str) -> str:
     return username.lower()
 
 
-REVOKED = "revoked"  # Proton confirmed the session is ended
-GONE = "gone"  # the session was already invalid on Proton's side
-UNCONFIRMED = "unconfirmed"  # could not confirm; the session may still be live
+REVOKED = "revoked"  # Proton confirmed the session ended
+REJECTED = "rejected"  # Proton no longer accepts these credentials (see end_session)
+UNCONFIRMED = "unconfirmed"  # Proton unreachable or refused; the session may still be live
 
 
-def end_session(client: ProtonClient, reload: Callable[[], Session | None]) -> str:
-    """End the client's session on Proton's side and say what is known.
+def end_session(client: ProtonClient) -> str:
+    """End the client's session on Proton's side and say exactly what is known.
 
-    A rejected refresh token alone does not prove the session is dead: the
-    daemon may have rotated it a moment ago. So before believing that, we
-    re-read the stored session; if someone else rotated the tokens, we retry
-    with the live ones. Only an unchanged, rejected session counts as GONE.
-    `reload` must read under the store lock that renewals hold (see
-    SessionStore.load_locked), so it never sees a renewal half saved.
-    RateLimited propagates, so callers can honour Proton's Retry-After.
+    Only the session's owner may call this (the running daemon, or the CLI
+    while it holds the daemon lock), so no other process can renew these
+    tokens meanwhile. REJECTED means Proton refused both the access and the
+    refresh token: the session has ended, or these credentials were
+    superseded and lost (say a renewal whose save failed before a crash).
+    Promarchy cannot tell those apart, and says so rather than claiming a
+    sign-out. RateLimited propagates so the caller can honour Retry-After.
     """
-    for _ in range(3):
-        if client.session is None:
-            return GONE
-        tried = client.session.refresh_token
-        try:
-            client.call("DELETE", "/auth/v4")
-            return REVOKED
-        except AuthExpired:
-            try:
-                stored = reload()
-            except Exception:
-                return UNCONFIRMED
-            if stored is None or stored.uid != client.session.uid:
-                return GONE  # signed out or replaced elsewhere; ours is dead
-            if stored.refresh_token in (tried, client.session.refresh_token):
-                return GONE
-            client.session = stored  # rotated by another process: try again
-        except RateLimited:
-            raise
-        except ProtonError:
-            return UNCONFIRMED
-    return UNCONFIRMED
+    if client.session is None:
+        return REJECTED
+    try:
+        client.call("DELETE", "/auth/v4")
+        return REVOKED
+    except AuthExpired:
+        return REJECTED
+    except RateLimited:
+        raise
+    except ProtonError:
+        return UNCONFIRMED
 
 
 def logout(client: ProtonClient) -> bool:

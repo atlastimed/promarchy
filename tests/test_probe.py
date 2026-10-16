@@ -107,12 +107,25 @@ def test_roundtrip_refuses_conversations_it_could_not_restore(quick):
 
 def test_roundtrip_restores_even_when_the_read_reply_is_lost(quick):
     api = ProbeAPI([{"labels": {"0"}, "unread": True}], fail_read_after_commit=True)
-    from promarchy.api import NetworkError
-
-    with pytest.raises(NetworkError):
-        probe.roundtrip(api, probe.Aliases())
+    result = probe.roundtrip(api, probe.Aliases())
     assert api.puts == ["/mail/v4/conversations/read", "/mail/v4/conversations/unread"]
     assert api.messages[0]["unread"] is True
+    assert result["restored"] is True and "readError" in result
+
+
+def test_roundtrip_reports_a_failed_restore(quick):
+    from promarchy.api import NetworkError
+
+    class Broken(ProbeAPI):
+        def put(self, path, body):
+            if path.endswith("/unread"):
+                self.puts.append(path)
+                raise NetworkError("offline")
+            return super().put(path, body)
+
+    api = Broken([{"labels": {"0"}, "unread": True}], fail_read_after_commit=True)
+    result = probe.roundtrip(api, probe.Aliases())
+    assert result["restored"] is False and "restoreError" in result and "action" in result
 
 
 def test_roundtrip_reports_an_exact_restore(quick):

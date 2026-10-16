@@ -118,6 +118,7 @@ class SessionStore:
         self._lock = self.root / "accounts.lock"
         self._stamp = self.root / "accounts.stamp"
         self._held = threading.local()
+        self.cleanup_failures: list[str] = []  # keyring items replace() could not delete
 
     @property
     def secrets(self) -> SecretBackend:
@@ -188,11 +189,15 @@ class SessionStore:
             if session.email not in accounts:
                 accounts.append(session.email)
                 announce = True
+            self.cleanup_failures = []
             for other, stored in aliases:
+                # The new sign-in is authoritative: the old address leaves the
+                # index and its session is returned for revocation even if its
+                # keyring item cannot be deleted (reported, not hidden).
                 try:
                     self.secrets.delete(_key(other))
                 except StoreUnavailable:
-                    continue  # left in place; the daemon skips duplicates anyway
+                    self.cleanup_failures.append(other)
                 accounts.remove(other)
                 displaced.append(stored)
                 announce = True
@@ -239,27 +244,9 @@ class SessionStore:
     # ------------------------------------------------------------ internals
 
     @contextlib.contextmanager
-    def refresh_guard(self, email: str) -> Iterator[Session | None]:
-        """Hold the store lock across a token renewal and its save, and yield
-        the session as currently stored, so every process sees renewals as
-        all-or-nothing and nobody spends a token someone else already used."""
-        with self._locked():
-            try:
-                current = self.load(email)
-            except Exception:
-                current = None
-            yield current
-
-    def load_locked(self, email: str) -> Session | None:
-        """Read under the lock: never observes a renewal that is half done."""
-        with self._locked():
-            return self.load(email)
-
-    @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
-        # Re-entrant for the thread holding it (saving the renewed tokens
-        # happens while the renewal still holds the lock); exclusive across
-        # threads and processes through flock on a fresh descriptor.
+        # Re-entrant for the thread holding it; exclusive across threads and
+        # processes through flock on a fresh descriptor.
         depth = getattr(self._held, "depth", 0)
         if depth:
             self._held.depth = depth + 1
