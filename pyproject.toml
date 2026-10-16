@@ -1,0 +1,22 @@
+[project]
+name = "promarchy"
+version = "0.1.0"
+description = "Proton Mail in the Omarchy bar"
+requires-python = ">=3.11"
+license = "MIT"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+src = ["backend"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "S"]
+ignore = ["S603", "S607", "S101", "SIM105"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["backend"]

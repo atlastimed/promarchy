@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "id": "atlastimed.promarchy",
+  "name": "Promarchy",
+  "version": "0.1.0",
+  "author": "atlastimed",
+  "license": "MIT",
+  "description": "Proton Mail in the Omarchy bar: new-mail count, recent-mail dropdown and desktop notifications.",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Proton Mail",
+    "description": "Unread mail from the last hour, day or week as a badge, with a dropdown of recent messages.",
+    "category": "Communication",
+    "aliases": ["mail", "proton", "email", "promarchy"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "countWindow": "24h",
+      "recentCount": 8,
+      "pollSeconds": 30,
+      "notify": true,
+      "categories": "all",
+      "groupThreads": true,
+      "senderImages": true,
+      "openWith": "browser"
+    },
+    "schema": [
+      {
+        "key": "countWindow",
+        "type": "enum",
+        "label": "Badge counts unread mail from",
+        "options": ["1h", "24h", "7d", "all", "off"],
+        "defaultValue": "24h",
+        "description": "The number next to the icon: unread inbox mail received in the last hour, day or week, all unread mail, or no number."
+      },
+      {
+        "key": "recentCount",
+        "type": "integer",
+        "label": "Messages in dropdown",
+        "min": 0,
+        "max": 25,
+        "step": 1,
+        "defaultValue": 8
+      },
+      {
+        "key": "pollSeconds",
+        "type": "integer",
+        "label": "Check for mail every (seconds)",
+        "min": 10,
+        "max": 900,
+        "step": 5,
+        "defaultValue": 30,
+        "description": "Each check is one tiny request to Proton's event stream; mail is only re-read when something changed."
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Desktop notifications",
+        "defaultValue": true,
+        "description": "Show a notification when new mail arrives. Clicking it opens the message."
+      },
+      {
+        "key": "categories",
+        "type": "string",
+        "label": "Inbox categories",
+        "defaultValue": "all",
+        "description": "\"all\", or a comma list of: primary, social, promotions, updates, forums, newsletters, transactions. Applies to the badge, dropdown and notifications."
+      },
+      {
+        "key": "groupThreads",
+        "type": "boolean",
+        "label": "Group conversations",
+        "defaultValue": true,
+        "description": "Show a busy thread once, with a message count, instead of one row per reply."
+      },
+      {
+        "key": "senderImages",
+        "type": "boolean",
+        "label": "Sender logos",
+        "defaultValue": true,
+        "description": "Fetch sender logos through Proton's logo proxy, as the Proton web app does."
+      },
+      {
+        "key": "openWith",
+        "type": "enum",
+        "label": "Open mail in",
+        "options": ["browser", "webapp"],
+        "defaultValue": "browser",
+        "description": "Your default browser, or a standalone web-app window."
+      }
+    ]
+  }
+}
