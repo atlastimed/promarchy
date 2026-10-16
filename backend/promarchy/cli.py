@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import getpass
 import json
 import os
 import shutil
-import socket
+import signal
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from pathlib import Path
 from urllib.parse import quote
 
-from . import __version__
-from .api import HumanVerificationRequired, ProtonClient, ProtonError, RateLimited, Session, WrongCredentials
+from . import __version__, control, sessions
+from .api import HumanVerificationRequired, ProtonClient, ProtonError, Session, WrongCredentials
 from .auth import (
     REJECTED,
     REVOKED,
@@ -26,13 +26,12 @@ from .auth import (
     HumanVerification,
     MissingDependency,
     begin_login,
-    end_session,
     logout,
     primary_address,
     request_verification_code,
     submit_totp,
 )
-from .paths import open_private, runtime_dir, state_dir, write_private
+from .paths import runtime_dir, state_dir, write_private
 from .store import SessionStore, StoreUnavailable
 
 BOLD = "\033[1m"
@@ -132,10 +131,10 @@ def _login(username: str | None) -> str:
             raise LoginFailed("Two-factor authentication was not completed.")
         email = primary_address(client, username)
         pending.session.email = email
-        try:
-            displaced = store.replace(pending.session)
-        except Exception as exc:
-            raise LoginFailed(f"Signed in, but could not save the session to your keyring: {exc}") from exc
+        # Once the session is on its way to its owner, Ctrl+C must not revoke
+        # it behind the owner's back; this step is short.
+        with _uninterruptible():
+            handed = _hand_over(store, pending.session)
         committed = True
     except WrongCredentials as exc:
         raise LoginFailed(str(exc)) from exc
@@ -146,22 +145,86 @@ def _login(username: str | None) -> str:
         # Ctrl+C) must not leave a live session behind on Proton's side.
         if not committed:
             logout(client)
-    for leftover in store.cleanup_failures:
+    _report_replacement(handed, email)
+    return email
+
+
+BAR_NOT_ANSWERING = (
+    "Promarchy's background process is running but did not answer, so nothing was saved.\n"
+    "  Try again in a moment."
+)
+
+
+def _hand_over(store: SessionStore, session: Session) -> dict:
+    """Give a fresh sign-in to the sessions' owner (see control.py), which
+    saves it and ends the sessions it replaces with its own current tokens:
+    the saved copies may be older than what a running bar holds."""
+    reply = control.ask({"cmd": "adopt", "session": session.to_dict()})
+    if reply is None:  # no bar running: become the owner for this step
+        lock = control.take_lock()
+        if lock is None:
+            raise LoginFailed(BAR_NOT_ANSWERING)
+        try:
+            return sessions.adopt(store, session, lambda old: sessions.end_displaced(ProtonClient(old)))
+        except Exception as exc:
+            raise LoginFailed(f"Signed in, but could not save the session to your keyring: {exc}") from exc
+        finally:
+            os.close(lock)
+    if reply.get("saved") is True:
+        return reply
+    if reply.get("error") == "no answer":
+        # It may have run before the connection broke: the keyring tells.
+        with contextlib.suppress(Exception):
+            stored = store.load(session.email)
+            if stored is not None and stored.uid == session.uid:
+                return {"saved": True, "displaced": None, "cleanupFailures": []}
+        raise LoginFailed(BAR_NOT_ANSWERING)
+    if reply.get("error") == "busy":  # it never ran
+        raise LoginFailed(BAR_NOT_ANSWERING)
+    detail = reply.get("error") or "unknown error"
+    raise LoginFailed(f"Signed in, but could not save the session to your keyring: {detail}")
+
+
+@contextlib.contextmanager
+def _uninterruptible():
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def _report_replacement(handed: dict, email: str) -> None:
+    for leftover in handed.get("cleanupFailures") or []:
         print(
             f"Note: the keyring entry for {leftover} (the same Proton account) could not be deleted.\n"
             "Promarchy no longer uses it; you can remove it in your keyring manager (Passwords and Keys).",
             file=sys.stderr,
         )
-    for old_session in displaced:
-        if old_session.email != email:
-            print(f"{old_session.email} is the same Proton account; it now appears as {email}.")
-        if not logout(ProtonClient(old_session)):
+    displaced = handed.get("displaced")
+    if not isinstance(displaced, list):
+        print(
+            "Note: Promarchy could not confirm whether an older session of this account was ended.\n"
+            "If in doubt, check Proton's Settings → Security → Session management.",
+            file=sys.stderr,
+        )
+        return
+    for item in displaced:
+        if not isinstance(item, dict):
+            continue
+        if item.get("email") and item["email"] != email:
+            print(f"{item['email']} is the same Proton account; it now appears as {email}.")
+        # REJECTED: its owner's current credentials no longer work, so there
+        # is nothing left to end (typically a session that had expired).
+        if item.get("outcome") == UNCONFIRMED:
             print(
-                "Note: a session this sign-in replaced could not be revoked (Proton unreachable).\n"
+                "Note: a session this sign-in replaced could not be ended (Proton unreachable or busy).\n"
                 "You can end it under Proton's Settings → Security → Session management.",
                 file=sys.stderr,
             )
-    return email
 
 
 def _two_factor(client: ProtonClient) -> bool:
@@ -265,14 +328,28 @@ def cmd_logout(args: argparse.Namespace) -> int:
         print("Not signed in.")
         return 0
     target = None if args.all else targets[0]
-    reply = ask_daemon({"cmd": "logout", "account": target, "local": args.local})
+    reply = control.ask({"cmd": "logout", "account": target, "local": args.local})
     if reply is not None:
         results = reply.get("results")
-        if not isinstance(results, list):
-            print("✗ The bar's background process could not sign out.", file=sys.stderr)
-            return 1
-        return max((_report(r) for r in results), default=0)
-    lock = take_daemon_lock()
+        if isinstance(results, list):
+            return max((_report(r) for r in results if isinstance(r, dict)), default=0)
+        error = reply.get("error")
+        if error == "busy":
+            print(
+                "✗ The bar's background process was busy and did not start signing out. Nothing changed;\n"
+                "  try again in a moment.",
+                file=sys.stderr,
+            )
+        elif error == "no answer":
+            print(
+                "✗ The bar's background process did not answer; it may still finish signing out.\n"
+                "  Run `promarchyctl accounts` to check.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"✗ The bar's background process could not sign out ({error}).", file=sys.stderr)
+        return 1
+    lock = control.take_lock()
     if lock is None:
         print(
             "✗ The bar's background process is running but did not answer. Use Sign out in the\n"
@@ -281,92 +358,29 @@ def cmd_logout(args: argparse.Namespace) -> int:
         )
         return 1
     try:
-        status = 0
-        for email in targets:
-            try:
-                status = max(status, _report(_logout_locally(store, email, args.local)))
-            except StoreUnavailable as exc:
-                print(f"✗ {email}: {exc}", file=sys.stderr)
-                status = 1
-        return status
+        results = [sessions.sign_out_stored(store, email, args.local, ProtonClient) for email in targets]
+        return max(_report(r) for r in results)
     finally:
         os.close(lock)
-
-
-def ask_daemon(request: dict) -> dict | None:
-    """Send a request to the running bar; None when it is not running."""
-    path = runtime_dir() / "control.sock"
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-            conn.settimeout(5)
-            conn.connect(str(path))
-            conn.settimeout(180)
-            conn.sendall(json.dumps(request).encode() + b"\n")
-            data = b""
-            while b"\n" not in data:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
-    except (FileNotFoundError, ConnectionRefusedError):
-        return None
-    except OSError:
-        return {}
-    try:
-        reply = json.loads(data.split(b"\n", 1)[0])
-    except ValueError:
-        return {}
-    return reply if isinstance(reply, dict) else {}
-
-
-def take_daemon_lock() -> int | None:
-    """Become the sessions' owner while the bar is not running."""
-    fd = open_private(runtime_dir() / "daemon.lock")
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return fd
-    except BlockingIOError:
-        os.close(fd)
-        return None
-
-
-def _logout_locally(store: SessionStore, email: str, local: bool) -> dict:
-    session = store.load(email)
-    if session is None:
-        # An empty answer can also mean a locked keyring: only forget the
-        # account when asked to, and only if no session appeared meanwhile.
-        if not local:
-            return {"email": email, "outcome": "unreadable", "removed": False}
-        removed = store.remove(email, require_absent=True)
-        return {"email": email, "outcome": "no-session", "removed": removed}
-
-    unsaved: list[Session] = []
-
-    def persist(updated: Session) -> None:
-        # Keep going if the keyring refuses: finish ending the session first.
-        try:
-            store.update_tokens(updated)
-        except Exception:
-            unsaved.append(updated)
-
-    try:
-        outcome = end_session(ProtonClient(session, on_refresh=persist))
-    except RateLimited as exc:
-        outcome = UNCONFIRMED
-        print(f"Proton asked to wait {exc.retry_after} s before more requests.", file=sys.stderr)
-    if unsaved:  # one more attempt before reporting
-        with contextlib.suppress(Exception):
-            store.update_tokens(unsaved[-1])
-            unsaved.clear()
-    removed = False
-    if outcome in (REVOKED, REJECTED) or local:
-        removed = store.remove(email, expected_uid=session.uid)
-    return {"email": email, "outcome": outcome, "removed": removed, "unsaved": bool(unsaved)}
 
 
 def _report(result: dict) -> int:
     """Print one account's sign-out result; return its exit status."""
     email, outcome, removed = result.get("email"), result.get("outcome"), result.get("removed")
+    if result.get("retryAfter"):
+        print(f"Proton asked to wait {result['retryAfter']} s before more requests.", file=sys.stderr)
+    if result.get("removeFailed"):
+        what = {
+            REVOKED: "its session was ended on Proton's side",
+            REJECTED: "Proton no longer accepts its saved credentials",
+            sessions.NO_SESSION: "it had no saved session",
+        }.get(outcome, "Proton could not be reached to end its session")
+        print(
+            f"✗ {email}: {what}, but the keyring would not let Promarchy forget it here\n"
+            f"  (is it locked?). Unlock it and run: promarchyctl logout --local {email}",
+            file=sys.stderr,
+        )
+        return 1
     if outcome == REVOKED and removed:
         print(f"Signed out {email}.")
         return 0

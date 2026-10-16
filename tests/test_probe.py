@@ -132,3 +132,17 @@ def test_roundtrip_reports_an_exact_restore(quick):
     api = ProbeAPI([{"labels": {"0"}, "unread": True}])
     result = probe.roundtrip(api, probe.Aliases())
     assert result["restored"] is True and api.messages[0]["unread"] is True
+
+
+def test_roundtrip_restores_after_ctrl_c(monkeypatch):
+    monkeypatch.setattr(probe, "snapshot", lambda: {"counts": {"all": 1}})
+
+    def interrupted(predicate, timeout=0):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(probe, "wait_for", interrupted)
+    api = ProbeAPI([{"labels": {"0"}, "unread": True}])
+    result = probe.roundtrip(api, probe.Aliases())
+    assert api.puts == ["/mail/v4/conversations/read", "/mail/v4/conversations/unread"]
+    assert api.messages[0]["unread"] is True
+    assert result["restored"] is True and result["interrupted"] == "KeyboardInterrupt"

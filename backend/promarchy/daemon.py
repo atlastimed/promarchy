@@ -6,7 +6,10 @@ Protocol (one JSON object per line):
   the bar shows has changed. The same snapshot is mirrored to
   ``$XDG_RUNTIME_DIR/promarchy/state.json`` for scripts (``promarchyctl status``).
 * stdin  <- commands from the QML service: ``configure``, ``refresh``,
-  ``markRead``. EOF on stdin means the shell went away, so we exit.
+  ``poll``, ``markRead``, ``logout``. EOF on stdin means the shell went away,
+  so we exit.
+* control socket <- ``promarchyctl`` (see control.py): this process owns the
+  sessions while it runs, so sign-outs and new sign-ins go through it.
 
 Between polls the process sleeps in a blocking queue read, so it costs
 nothing while idle.
@@ -30,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
 
+from . import control, sessions
 from .api import AuthExpired, NetworkError, ProtonClient, ProtonError, RateLimited, Session
 from .auth import REJECTED, REVOKED, UNCONFIRMED, end_session
 from .avatars import Avatars
@@ -46,8 +50,7 @@ MAX_BACKOFF = 300
 STORE_RETRY_MAX = 120
 AUTH_RECHECK_SECONDS = 120
 SHUTDOWN_GRACE = 10  # seconds a SIGTERM waits for the current step
-CONTROL_SOCKET = "control.sock"
-CONTROL_TIMEOUT = 150
+CONTROL_TIMEOUT = 150  # a socket request still queued after this never runs
 DEMO_INTERVAL = 30.0
 NOTICE_SECONDS = 120
 
@@ -110,8 +113,13 @@ class Account:
 
 
 def _logout_note(result: dict) -> str:
-    email = result["email"]
-    if result["outcome"] == REJECTED:
+    email, outcome = result["email"], result["outcome"]
+    if result.get("removeFailed"):
+        done = "signed out of Proton" if outcome == REVOKED else "not confirmed signed out"
+        return f"{email}: {done}, but the keyring would not let Promarchy forget it (is it locked?)."
+    if outcome == sessions.UNREADABLE:
+        return f"Could not sign out {email}: its saved session could not be read (is the keyring locked?)."
+    if outcome == REJECTED:
         return (
             f"{email}: Proton no longer accepts its saved credentials, so Promarchy could not confirm the "
             "session ended; it was removed here. Check Proton's Settings → Security → Session management."
@@ -177,7 +185,7 @@ class Daemon:
             )
             return 3
         threading.Thread(target=self._read_commands, args=(stdin or sys.stdin,), daemon=True).start()
-        control = self._open_control()
+        control_server = self._open_control()
         # The shell stops us with SIGTERM; finish the current step (a token
         # refresh must be persisted) and leave through the normal path.
         if threading.current_thread() is threading.main_thread():
@@ -198,10 +206,10 @@ class Daemon:
                     break
                 self._drain(timeout=self._sleep_for())
         finally:
-            if control is not None:
-                control.close()
+            if control_server is not None:
+                control_server.close()
                 with contextlib.suppress(OSError):
-                    os.unlink(runtime_dir() / CONTROL_SOCKET)
+                    os.unlink(control.socket_path())
             self._persist_unsaved(force=True)
             for account in self.accounts.values():
                 account.client.close()
@@ -211,10 +219,11 @@ class Daemon:
     # ----------------------------------------------------------- control
 
     def _open_control(self) -> socket.socket | None:
-        """A private socket through which `promarchyctl logout` asks this
-        process, the session's only owner while it runs, to sign out. It
-        lives in our 0700 runtime directory and also checks the caller's uid."""
-        path = runtime_dir() / CONTROL_SOCKET
+        """The private socket through which `promarchyctl` asks this process,
+        the sessions' only owner while it runs, to sign out or to take over a
+        new sign-in. It lives in our 0700 runtime directory and also checks
+        the caller's uid."""
+        path = control.socket_path()
         try:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)  # left over from a crash; we hold the daemon lock
@@ -244,28 +253,24 @@ class Daemon:
                     return
                 conn.settimeout(10)
                 data = b""
-                while b"\n" not in data and len(data) < 4096:
+                while b"\n" not in data and len(data) <= control.MAX_REQUEST:
                     chunk = conn.recv(4096)
                     if not chunk:
                         break
                     data += chunk
-                request = json.loads(data.split(b"\n", 1)[0] or b"{}")
-                if not isinstance(request, dict) or request.get("cmd") != "logout":
-                    conn.sendall(b'{"error": "unsupported request"}\n')
+                try:
+                    if b"\n" not in data and len(data) > control.MAX_REQUEST:
+                        raise control.BadRequest("invalid request")
+                    request = control.parse(data.split(b"\n", 1)[0])
+                except control.BadRequest as exc:
+                    conn.sendall(json.dumps({"error": str(exc)}).encode() + b"\n")
                     return
-                reply: queue.SimpleQueue[dict] = queue.SimpleQueue()
-                self.commands.put(
-                    {
-                        "cmd": "logout",
-                        "account": request.get("account"),
-                        "local": request.get("local") is True,
-                        "reply": reply,
-                    }
-                )
-                result = reply.get(timeout=CONTROL_TIMEOUT)
+                ticket = control.Ticket()
+                self.commands.put({**request, "ticket": ticket})
+                result = ticket.wait(CONTROL_TIMEOUT)
                 conn.settimeout(10)
                 conn.sendall(json.dumps(result).encode() + b"\n")
-            except (OSError, ValueError, queue.Empty) as exc:
+            except Exception as exc:  # one bad client must not take the socket down
                 log_error("serving a control request", exc)
 
     def _on_sigterm(self, *_: object) -> None:
@@ -350,6 +355,16 @@ class Daemon:
                 return
 
     def handle(self, command: dict) -> None:
+        ticket = command.get("ticket")
+        if isinstance(ticket, control.Ticket):
+            if not ticket.start():
+                return  # its caller was told "busy": never act on it late
+            result: dict = {"error": "internal error"}
+            try:
+                result = self._answer(command)
+            finally:
+                ticket.finish(result)  # always answer, even after a bug
+            return
         name = command.get("cmd")
         if name == "quit":
             self.stopping = True
@@ -367,9 +382,8 @@ class Daemon:
                 if account.status != "auth-expired":
                     account.next_poll = max(account.rate_limited_until, account.backoff_until)
         elif name == "logout":
-            results = self._logout(command.get("account"), local=command.get("local") is True)
-            if "reply" in command:
-                command["reply"].put({"results": results})
+            # From the bar's own Sign out button: every account.
+            self._logout(None, local=command.get("local") is True)
         elif name == "markRead":
             kind = "conversation" if command.get("kind") == "conversation" else "message"
             self._mark_read(str(command.get("account") or ""), command.get("ids") or [], kind)
@@ -390,8 +404,17 @@ class Daemon:
                     account.rate_limited_until, min(account.next_poll, self.mono() + config.poll_seconds)
                 )
 
-    def _logout(self, target: Any, local: bool = False) -> list[dict]:
-        """End sessions (all, or one by email) and report each outcome.
+    def _answer(self, request: dict) -> dict:
+        """Run a request from the control socket (already validated)."""
+        if request["cmd"] == "logout":
+            return {"results": self._logout(request["account"], local=request["local"])}
+        if request["cmd"] == "adopt":
+            return self._adopt(request["session"])
+        return {"error": "unsupported request"}
+
+    def _logout(self, target: str | None, local: bool = False) -> list[dict]:
+        """End sessions (every account when `target` is None, or one by
+        email) and report each outcome.
 
         This process owns the sessions while it runs, so it alone renews or
         ends them. An account is forgotten when Proton confirmed the end, or
@@ -399,34 +422,88 @@ class Daemon:
         serve nothing; the result says it could not be confirmed). If Proton
         cannot be reached it stays signed in, unless `local` asks otherwise.
         """
-        emails = [str(target).lower()] if isinstance(target, str) and target else list(self.accounts)
+        if target is not None and not (isinstance(target, str) and target):
+            raise ValueError("invalid account selector")  # never "all" by accident
+        if target is None:
+            try:
+                indexed = self.store.accounts()
+            except Exception as exc:
+                log_error("listing accounts to sign out", exc)
+                indexed = []
+            emails = list(dict.fromkeys([*self.accounts, *indexed]))
+        else:
+            emails = [target.lower()]
         results: list[dict] = []
         for email in emails:
             account = self.accounts.get(email)
-            if account is None or account.client.session is None:
-                results.append({"email": email, "outcome": "not-signed-in", "removed": False})
-                continue
-            wait = account.rate_limited_until - self.mono()
-            outcome = UNCONFIRMED
-            if wait <= 0:
-                try:
-                    outcome = end_session(account.client)
-                except RateLimited as exc:
-                    self._record_failure(account, exc)  # keep Proton's Retry-After
-            removed = False
-            if outcome in (REVOKED, REJECTED) or local:
-                uid = account.client.session.uid if account.client.session else None
-                try:
-                    removed = self.store.remove(email, expected_uid=uid)
-                except Exception as exc:
-                    log_error("removing an account", exc)
-            results.append({"email": email, "outcome": outcome, "removed": removed})
-        problems = [r for r in results if r["outcome"] != REVOKED and r["outcome"] != "not-signed-in"]
+            if account is not None and account.client.session is not None:
+                results.append(self._end_owned(account, local))
+            else:
+                # Listed but not loaded (its keyring item could not be read,
+                # or an older duplicate): still ours to end, from the saved copy.
+                results.append(sessions.sign_out_stored(self.store, email, local, self.client_factory))
+        problems = [
+            r
+            for r in results
+            if r.get("removeFailed")
+            or r["outcome"] not in (REVOKED, sessions.NOT_SIGNED_IN, sessions.NO_SESSION)
+        ]
         if problems:
             self._set_notice(" ".join(_logout_note(r) for r in problems))
         self._sync_accounts()
         self.emit(force=True)
         return results
+
+    def _end_owned(self, account: Account, local: bool) -> dict:
+        outcome = UNCONFIRMED
+        if self.mono() >= account.rate_limited_until:
+            try:
+                outcome = end_session(account.client)
+            except RateLimited as exc:
+                self._record_failure(account, exc)  # keep Proton's Retry-After
+        result = {"email": account.email, "outcome": outcome, "removed": False}
+        if outcome in (REVOKED, REJECTED) or local:
+            uid = account.client.session.uid if account.client.session else None
+            sessions.forget(self.store, result, expected_uid=uid)
+        return result
+
+    def _adopt(self, session: Session) -> dict:
+        """Take over a fresh sign-in from `promarchyctl login`: save it, and
+        end the sessions it replaces with the tokens this process holds for
+        them (the saved copies may be older)."""
+
+        def end(old: Session) -> str:
+            owned = next(
+                (
+                    a
+                    for a in self.accounts.values()
+                    if a.client.session is not None and a.client.session.uid == old.uid
+                ),
+                None,
+            )
+            if owned is None:
+                client = self.client_factory(old)
+                try:
+                    return sessions.end_displaced(client)
+                finally:
+                    client.close()
+            if self.mono() < owned.rate_limited_until:
+                return UNCONFIRMED
+            try:
+                return end_session(owned.client)
+            except RateLimited as exc:
+                self._record_failure(owned, exc)
+                return UNCONFIRMED
+
+        try:
+            result = sessions.adopt(self.store, session, end)
+        except Exception as exc:
+            log_error("saving a new sign-in", exc)
+            detail = str(exc) if isinstance(exc, StoreUnavailable) else exc.__class__.__name__
+            return {"saved": False, "error": detail}
+        self._sync_accounts()  # switch to the new session before polling again
+        self.emit(force=True)
+        return result
 
     def _set_notice(self, text: str) -> None:
         self.notice = text
@@ -779,7 +856,7 @@ class Daemon:
     # ------------------------------------------------------------------ lock
 
     def _acquire_lock(self) -> int | None:
-        fd = open_private(runtime_dir() / "daemon.lock")
+        fd = open_private(runtime_dir() / control.LOCK_NAME)
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
         while True:
             try:

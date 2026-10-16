@@ -112,7 +112,7 @@ What Promarchy does, stated precisely:
 
   Omarchy's notification history also keeps the sender and subject of announced mail.
 - **Sender logos** are fetched from Proton's logo proxy, so Proton (not a third party) sees which sender address is looked up. Logos are requested as raster images and accepted only as PNG, JPEG or WebP (checked by file signature); SVG is never stored or shown.
-- **Signing out** ends the session on Proton's side first and only then forgets it here. While the bar runs, its background process owns the session and does this for the dropdown and for `promarchyctl logout` alike (over a private socket only your user can reach). If Proton cannot be reached, you are told and stay signed in (`--local` forgets it anyway). If Proton no longer accepts the saved credentials, Promarchy removes them and tells you it could not confirm the session ended. Either way you can check under Proton's *Settings → Security → Session management*. Removing the plugin does not sign you out: run `promarchyctl logout --all` first.
+- **Signing out** ends the session on Proton's side first and only then forgets it here. While the bar runs, its background process owns the sessions: it signs out for the dropdown and for `promarchyctl logout` alike, and it saves a new sign-in from `promarchyctl login` and ends the session that sign-in replaces with its own current tokens (all over a private socket only your user can reach). If Proton cannot be reached, you are told and stay signed in (`--local` forgets it anyway). If Proton no longer accepts the saved credentials, or the keyring will not let Promarchy forget an account, you are told so rather than shown a plain success. Either way you can check under Proton's *Settings → Security → Session management*. Removing the plugin does not sign you out: run `promarchyctl logout --all` first.
 - **Writes to your mailbox:** only *mark as read*, and only when you ask.
 - Proton does not publish a third-party API. Promarchy uses the same endpoints as the Proton web app, identifies itself honestly (`x-pm-appversion: Other`, `User-Agent: Promarchy/…`), and keeps its traffic small.
 
@@ -146,7 +146,7 @@ scripts/check-plugin.sh        # Omarchy plugin contract + QML syntax
 
 `omarchy bar set atlastimed.promarchy demo true` swaps in sample data (no account or network), handy for screenshots and UI work. CI runs all of the above on Arch Linux.
 
-`python3 -I scripts/proton_probe.py [--roundtrip]` checks the parsers against the live API through your signed-in session and compares the bar's counts with an independent recount. It prints only shapes, numbers and aliases (never tokens, IDs, senders or subjects) and never renews the session; `--roundtrip` marks one single-message unread conversation read, watches the bar react, and restores it.
+`python3 -I scripts/proton_probe.py [--roundtrip]` checks the parsers against the live API through your signed-in session and compares the bar's counts with an independent recount. It prints only shapes, numbers and aliases (never tokens, IDs, senders or subjects) and never renews the session; `--roundtrip` marks one single-message unread conversation read, watches the bar react, and restores it (also after Ctrl+C), exiting with status 3 and instructions if it cannot confirm the restore.
 
 ## License
 
