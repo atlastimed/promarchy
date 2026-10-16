@@ -1,7 +1,6 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
-import qs.Commons
 
 // Singleton owner of the Python backend. One daemon serves every bar (one
 // per monitor): widgets read the mirrored state below and send commands
@@ -83,18 +82,19 @@ Item {
     openUrl("https://mail.proton.me/inbox#mailto=mailto%3A", openWith)
   }
 
+  // Sign-in is interactive (password, 2FA, maybe a CAPTCHA), so it runs in
+  // Omarchy's floating terminal and waits for Enter so the result stays
+  // readable. argv only: nothing here passes through a shell.
   function signIn() {
     Quickshell.execDetached([
-      "omarchy-launch-floating-terminal-with-presentation",
-      "python3 -I " + Util.shellQuote(backend) + " login"
+      "uwsm-app", "--", "xdg-terminal-exec",
+      "--app-id=org.omarchy.terminal", "--title=Proton Mail sign-in",
+      "-e", "python3", "-I", backend, "login", "--wait"
     ])
   }
 
   function signOut() {
-    Quickshell.execDetached([
-      "omarchy-launch-floating-terminal-with-presentation",
-      "python3 -I " + Util.shellQuote(backend) + " logout --all"
-    ])
+    Quickshell.execDetached(["python3", "-I", backend, "logout", "--all"])
   }
 
   function ingest(line) {

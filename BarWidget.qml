@@ -63,6 +63,7 @@ Panel {
   property int cursorIndex: 0
   property bool cursorActive: false
   property real now: Date.now()
+  property bool confirmSignOut: false
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -104,6 +105,12 @@ Panel {
     repeat: true
     running: root.opened
     onTriggered: root.now = Date.now()
+  }
+
+  Timer {
+    id: signOutTimer
+    interval: 4000
+    onTriggered: root.confirmSignOut = false
   }
 
   // ---- actions -----------------------------------------------------------------
@@ -501,14 +508,20 @@ Panel {
               }
             }
 
+            // Signing back in may need a CAPTCHA, so ask for a second click.
             PanelActionButton {
               iconText: "󰍃"
-              tooltipText: "Sign out"
-              foreground: root.foreground
+              tooltipText: root.confirmSignOut ? "Click again to sign out of every account" : "Sign out"
+              foreground: root.confirmSignOut ? root.highlight : root.foreground
               fontFamily: root.fontFamily
               onClicked: {
+                if (!root.confirmSignOut) {
+                  root.confirmSignOut = true
+                  signOutTimer.restart()
+                  return
+                }
+                root.confirmSignOut = false
                 if (root.mail) root.mail.signOut()
-                root.close()
               }
             }
           }

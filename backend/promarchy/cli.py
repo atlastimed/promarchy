@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
+import os
+import shutil
+import subprocess
 import sys
+import time
 import webbrowser
+from urllib.parse import quote
 
 from . import __version__
 from .api import HumanVerificationRequired, ProtonClient, ProtonError, WrongCredentials
@@ -19,12 +25,13 @@ from .auth import (
     request_verification_code,
     submit_totp,
 )
-from .paths import runtime_dir
+from .paths import runtime_dir, state_dir
 from .store import SessionStore, StoreUnavailable
 
 BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
+VERIFY_PREFIX = "https://verify.proton.me/"
 
 
 def _style(text: str, code: str) -> str:
@@ -41,20 +48,42 @@ def _ask(prompt: str) -> str:
 # --------------------------------------------------------------------- login
 
 
+class LoginFailed(Exception):
+    pass
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     print(_style("Promarchy · sign in to Proton Mail", BOLD))
     print(_style("Your password is used locally for Proton's SRP handshake and is never stored.\n", DIM))
+    try:
+        email = _login(args.username)
+    except LoginFailed as exc:
+        print(f"\n✗ {exc}", file=sys.stderr)
+        record_login(False, str(exc))
+        code = 1
+    except KeyboardInterrupt:
+        print()
+        record_login(False, "Sign-in cancelled")
+        return 130
+    else:
+        print(f"\n✓ Signed in as {_style(email, BOLD)}. The bar picks this up within a few seconds.")
+        record_login(True, email)
+        code = 0
+    if args.wait:
+        _ask("\nPress Enter to close… ")
+    return code
+
+
+def _login(username: str | None) -> str:
     store = SessionStore()
     try:
         _ = store.secrets  # fail early if the keyring is unavailable
     except StoreUnavailable as exc:
-        print(f"✗ {exc}", file=sys.stderr)
-        return 1
+        raise LoginFailed(str(exc)) from exc
 
-    username = args.username or _ask("Proton username or address: ")
+    username = username or _ask("Proton username or address: ")
     if not username:
-        print("✗ No username given.", file=sys.stderr)
-        return 1
+        raise LoginFailed("No username given.")
     password = getpass.getpass("Password: ")
 
     client = ProtonClient()
@@ -67,47 +96,38 @@ def cmd_login(args: argparse.Namespace) -> int:
             except HumanVerificationRequired as exc:
                 hv = _human_verification(client, exc)
                 if hv is None:
-                    return 1
+                    raise LoginFailed("Proton's human verification was not completed.") from exc
         else:
-            print("✗ Proton did not accept the verification.", file=sys.stderr)
-            return 1
-    except WrongCredentials:
-        print("✗ Incorrect username or password.", file=sys.stderr)
-        return 1
+            raise LoginFailed("Proton did not accept the verification. Try again in a minute.")
+    except WrongCredentials as exc:
+        raise LoginFailed("Incorrect username or password.") from exc
     except MissingDependency as exc:
-        print(f"✗ {exc}", file=sys.stderr)
-        return 1
+        raise LoginFailed(str(exc)) from exc
     except ProtonError as exc:
-        print(f"✗ Sign-in failed: {exc}", file=sys.stderr)
-        return 1
+        raise LoginFailed(f"Sign-in failed: {exc}") from exc
     finally:
         password = ""  # noqa: F841 - drop our reference as early as possible
 
     client.session = pending.session
     try:
         if pending.needs_fido2_only:
-            print(
-                "✗ This account only accepts a security key as its second factor.\n"
-                "  Promarchy supports authenticator-app codes (TOTP). Add one in\n"
-                "  Proton's account settings, then sign in again.",
-                file=sys.stderr,
-            )
             logout(client)
-            return 1
+            raise LoginFailed(
+                "This account only accepts a security key as its second factor.\n"
+                "  Promarchy supports authenticator-app codes (TOTP). Add one in\n"
+                "  Proton's account settings, then sign in again."
+            )
         if pending.needs_totp and not _two_factor(client):
             logout(client)
-            return 1
+            raise LoginFailed("Two-factor authentication was not completed.")
         email = (primary_address(client) or username).strip().lower()
     except WrongCredentials as exc:
-        print(f"✗ {exc}", file=sys.stderr)
-        return 1
+        raise LoginFailed(str(exc)) from exc
     except ProtonError as exc:
-        print(f"✗ Sign-in failed: {exc}", file=sys.stderr)
         logout(client)
-        return 1
+        raise LoginFailed(f"Sign-in failed: {exc}") from exc
 
     pending.session.email = email
-    previous = None
     try:
         previous = store.load(email)
     except Exception:
@@ -115,8 +135,7 @@ def cmd_login(args: argparse.Namespace) -> int:
     store.save(pending.session)
     if previous and previous.uid != pending.session.uid:
         logout(ProtonClient(previous))  # revoke the session we just replaced
-    print(f"\n✓ Signed in as {_style(email, BOLD)}. The bar picks this up within a few seconds.")
-    return 0
+    return email
 
 
 def _two_factor(client: ProtonClient) -> bool:
@@ -133,8 +152,26 @@ def _two_factor(client: ProtonClient) -> bool:
 
 
 def _human_verification(client: ProtonClient, exc: HumanVerificationRequired) -> HumanVerification | None:
+    """Complete Proton's human verification the way Proton Bridge does.
+
+    For a CAPTCHA, Proton verifies the token server-side once it is solved in
+    a browser, so we open the page, wait for the user, and replay the same
+    token on the next sign-in attempt.
+    """
     methods = exc.methods
-    print("\nProton wants to confirm you are human before this sign-in.")
+    token = exc.token
+    print("\nProton asks for a quick human check before signing in from a new app.")
+    if "captcha" in methods and token:
+        url = str(exc.details.get("WebUrl") or "")
+        if not url.startswith(VERIFY_PREFIX):
+            url = f"{VERIFY_PREFIX}?methods=captcha&token={quote(token)}"
+        print("Opening the CAPTCHA in your browser. Solve it there, then come back here.")
+        print(_style(f"  {url}", DIM))
+        open_in_browser(url)
+        answer = _ask("Press Enter once it says you're verified (q to cancel): ")
+        if answer.lower().startswith("q"):
+            return None
+        return HumanVerification(",".join(methods), token)
     if "email" in methods:
         address = _ask("Send a verification code to which email address? ")
         if address:
@@ -147,7 +184,7 @@ def _human_verification(client: ProtonClient, exc: HumanVerificationRequired) ->
             if code:
                 return HumanVerification("email", f"{address}:{code}")
     if "sms" in methods:
-        phone = _ask("Or send a code by SMS to which number (blank to skip)? ")
+        phone = _ask("Send a code by SMS to which number (blank to skip)? ")
         if phone:
             try:
                 request_verification_code(client, "sms", phone)
@@ -157,19 +194,32 @@ def _human_verification(client: ProtonClient, exc: HumanVerificationRequired) ->
             code = _ask("Code from the SMS: ")
             if code:
                 return HumanVerification("sms", f"{phone}:{code}")
-    if "captcha" in methods and exc.token:
-        url = f"https://verify.proton.me/?methods=captcha&token={exc.token}"
-        print(
-            "Proton only offered a CAPTCHA, which has to be solved in a browser.\n"
-            f"  {url}\n"
-            "Solving it there does not hand the result back to a terminal. Sign in once at\n"
-            "https://mail.proton.me from this network, wait a little, and run this again."
-        )
-        if _ask("Open the CAPTCHA page now? [y/N] ").lower().startswith("y"):
-            webbrowser.open(url)
-        return None
-    print("✗ Proton did not offer a verification method Promarchy can handle.", file=sys.stderr)
     return None
+
+
+def open_in_browser(url: str) -> None:
+    launcher = shutil.which("omarchy-launch-browser")
+    if launcher:
+        subprocess.Popen(
+            [launcher, url],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    else:
+        webbrowser.open(url)
+
+
+def record_login(ok: bool, detail: str) -> None:
+    """Leave the outcome where the daemon can show it in the dropdown."""
+    path = state_dir() / "last-login.json"
+    with contextlib.suppress(OSError):
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"time": int(time.time()), "ok": ok, "detail": detail[:300]}, fh)
+        os.replace(tmp, path)
 
 
 # -------------------------------------------------------------------- others
@@ -243,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
 
     login = sub.add_parser("login", help="sign in to a Proton account")
     login.add_argument("username", nargs="?", help="Proton username or address")
+    login.add_argument("--wait", action="store_true", help="wait for Enter before exiting (used by the bar)")
     login.set_defaults(func=cmd_login)
 
     out = sub.add_parser("logout", help="sign out and revoke the session")

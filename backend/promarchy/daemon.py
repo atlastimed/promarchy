@@ -396,7 +396,7 @@ class Daemon:
         if self.store_error:
             return "error", self.store_error
         if not accounts:
-            return "signed-out", "Sign in to see your mail"
+            return "signed-out", self._last_login_failure() or "Sign in to see your mail"
         statuses = {a["status"] for a in accounts}
         if statuses == {"auth-expired"}:
             return "auth-expired", "Your Proton session expired. Sign in again."
@@ -408,6 +408,16 @@ class Daemon:
         if "error" in statuses:
             return "error", next(a["error"] for a in accounts if a["status"] == "error")
         return "starting", "Connecting to Proton…"
+
+    def _last_login_failure(self) -> str:
+        """A recent failed sign-in, so the dropdown can say what went wrong."""
+        try:
+            data = json.loads((self.store.root / "last-login.json").read_text())
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(data, dict) or data.get("ok") or time.time() - float(data.get("time") or 0) > 1800:
+            return ""
+        return f"Last sign-in failed: {str(data.get('detail') or 'unknown error')[:200]}"
 
     def emit(self, force: bool = False, override: dict | None = None) -> None:
         state = self.snapshot()
