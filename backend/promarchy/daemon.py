@@ -40,6 +40,7 @@ STAMP_CHECK_SECONDS = 5
 LOCK_WAIT_SECONDS = 15
 MAX_BACKOFF = 300
 STORE_RETRY_MAX = 120
+SHUTDOWN_GRACE = 10  # seconds a SIGTERM waits for the current step
 
 
 def _clamp(value: Any, low: int, high: int, default: int) -> int:
@@ -122,13 +123,16 @@ class Daemon:
         self.state_path = state_path
         self.config = Config()
         self.accounts: dict[str, Account] = {}
-        self.commands: queue.Queue[dict] = queue.Queue()
+        # SimpleQueue.put is safe to call from a signal handler; Queue.put is not.
+        self.commands: queue.SimpleQueue[dict] = queue.SimpleQueue()
         self.generation: int | None = None
         self.store_error = ""
         self.store_failures = 0
         self.store_retry_at = 0.0
         self.missing: set[str] = set()  # in the index, but no session in the keyring
         self.unsaved: dict[str, Session] = {}  # rotated tokens not yet persisted
+        self.unsaved_failures = 0
+        self.unsaved_retry_at = 0.0
         self.configured = False
         self.stopping = False
         self._last_payload = ""
@@ -147,7 +151,7 @@ class Daemon:
         threading.Thread(target=self._read_commands, args=(stdin or sys.stdin,), daemon=True).start()
         # The shell stops us with SIGTERM; finish the current step (a token
         # refresh must be persisted) and leave through the normal path.
-        signal.signal(signal.SIGTERM, lambda *_: self.commands.put({"cmd": "quit"}))
+        signal.signal(signal.SIGTERM, self._on_sigterm)
         try:
             self._sync_accounts()
             self.emit(force=True)
@@ -160,11 +164,19 @@ class Daemon:
                     break
                 self._drain(timeout=self._sleep_for())
         finally:
-            self._persist_unsaved()
+            self._persist_unsaved(force=True)
             for account in self.accounts.values():
                 account.client.close()
             os.close(lock_fd)
         return 0
+
+    def _on_sigterm(self, *_: object) -> None:
+        self.commands.put({"cmd": "quit"})
+        # A step can be slow (a keyring unlock prompt, network timeouts); do
+        # not hold up a replacement daemon waiting for our lock.
+        watchdog = threading.Timer(SHUTDOWN_GRACE, os._exit, args=(0,))
+        watchdog.daemon = True
+        watchdog.start()
 
     def tick(self) -> None:
         if self.config.demo:
@@ -280,14 +292,17 @@ class Daemon:
         generation = self.store.generation()
         if generation == self.generation:
             return
-        if self.store_error and self.mono() < self.store_retry_at:
+        if (self.store_error or self.missing) and self.mono() < self.store_retry_at:
             return
         emails = self.store.accounts()
         for email in list(self.accounts):
             if email not in emails:
                 self.accounts.pop(email).client.close()
                 self.unsaved.pop(email, None)
-                self.watermarks.forget(email)
+                try:
+                    self.watermarks.forget(email)
+                except OSError:
+                    traceback.print_exc(file=sys.stderr)
         missing: set[str] = set()
         for email in emails:
             try:
@@ -308,27 +323,35 @@ class Daemon:
                 current.client.close()
             self.unsaved.pop(email, None)
             self.accounts[email] = self._make_account(email, session)
-        self.generation = generation
         self.store_error = ""
-        self.store_failures = 0
         self.missing = missing
+        if missing:
+            # An empty answer may be a locked keyring or a dismissed unlock
+            # prompt rather than a deleted item, so look again later.
+            self._schedule_store_retry()
+            return
+        self.generation = generation
+        self.store_failures = 0
 
     def _store_failed(self, exc: Exception) -> None:
         """Remember the failure and try again later instead of giving up."""
-        self.generation = None
-        self.store_failures += 1
-        self.store_retry_at = self.mono() + min(STORE_RETRY_MAX, 5 * 2 ** min(self.store_failures, 5))
+        self._schedule_store_retry()
         if isinstance(exc, StoreUnavailable):
             self.store_error = str(exc)
         else:
             self.store_error = f"Could not read the keyring: {exc.__class__.__name__}"
 
+    def _schedule_store_retry(self) -> None:
+        self.generation = None
+        self.store_failures += 1
+        self.store_retry_at = self.mono() + min(STORE_RETRY_MAX, 5 * 2 ** min(self.store_failures, 5))
+
     def _make_account(self, email: str, session: Session) -> Account:
         def persist(updated: Session) -> None:
             # Refresh tokens are single-use: until this lands in the keyring,
-            # a restart would sign the account out. Retried every tick.
+            # a restart would sign the account out. Retried with backoff.
             self.unsaved[email] = updated
-            self._persist_unsaved()
+            self._persist_unsaved(force=True)
 
         client = self.client_factory(session, on_refresh=persist)
         mailbox = Mailbox(
@@ -341,16 +364,25 @@ class Daemon:
         )
         return Account(email=email, client=client, mailbox=mailbox)
 
-    def _persist_unsaved(self) -> None:
+    def _persist_unsaved(self, force: bool = False) -> None:
+        if not self.unsaved or (not force and self.mono() < self.unsaved_retry_at):
+            return
+        failed = False
         for email, session in list(self.unsaved.items()):
             try:
                 self.store.update_tokens(session)
             except Exception as exc:
                 print(f"promarchy: could not save rotated tokens: {exc.__class__.__name__}", file=sys.stderr)
+                failed = True
                 continue
             # Saved, or deliberately skipped because the account was signed
             # out or replaced by a newer sign-in meanwhile.
             self.unsaved.pop(email, None)
+        if failed:
+            self.unsaved_failures += 1
+            self.unsaved_retry_at = self.mono() + min(STORE_RETRY_MAX, 5 * 2 ** min(self.unsaved_failures, 5))
+        else:
+            self.unsaved_failures = 0
 
     # ------------------------------------------------------------------ poll
 
@@ -459,7 +491,10 @@ class Daemon:
         if self.store_error and not accounts:
             return "error", self.store_error
         if not accounts and self.missing:
-            return "auth-expired", f"No saved session for {sorted(self.missing)[0]}. Sign in again."
+            return "auth-expired", (
+                f"Could not find the saved session for {sorted(self.missing)[0]}. "
+                "If your keyring is locked, unlock it; otherwise sign in again."
+            )
         if not accounts:
             return "signed-out", self._last_login_failure() or "Sign in to see your mail"
         statuses = {a["status"] for a in accounts}

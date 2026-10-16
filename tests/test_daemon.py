@@ -339,6 +339,7 @@ def test_rotated_tokens_are_saved_and_retried(env, monkeypatch):
     env.daemon.unsaved["me@proton.me"] = rotated  # what the on_refresh callback records
     env.daemon._persist_unsaved()
     assert "me@proton.me" in env.daemon.unsaved  # first save failed, kept for retry
+    env.clock.advance(15)  # past the retry backoff
     env.daemon.tick()
     assert env.daemon.unsaved == {}
     assert env.store.load("me@proton.me").refresh_token == "r2"
@@ -408,3 +409,57 @@ def test_token_rotation_reaches_the_keyring(env):
     assert env.store.load("me@proton.me").refresh_token == "r2"
     assert env.daemon.unsaved == {}
     assert env.store.generation() == generation  # not mistaken for a new sign-in
+
+
+def test_empty_keyring_answer_at_start_is_retried(env):
+    store = FlakyStore(secrets=MemorySecrets(), root=env.tmp / "flaky")
+    (env.tmp / "flaky").mkdir()
+    store.save(Session(uid="u", access_token="a", refresh_token="r", email="me@proton.me"))
+    store.hide = True  # keyring locked when the session starts
+    daemon = make_daemon(env, store)
+    daemon.tick()
+    assert env.states()[-1]["status"] == "auth-expired"
+    store.hide = False  # user unlocks the keyring
+    env.clock.advance(15)
+    daemon.tick()
+    assert env.states()[-1]["status"] == "ok"
+
+
+def test_failed_token_saves_back_off(env, monkeypatch):
+    env.sign_in()
+    env.daemon.tick()
+    attempts = []
+
+    def always_fails(session):
+        attempts.append(session)
+        raise StoreUnavailable("locked")
+
+    monkeypatch.setattr(env.store, "update_tokens", always_fails)
+    env.daemon.unsaved["me@proton.me"] = env.api.session
+    env.daemon._persist_unsaved(force=True)
+    for _ in range(5):
+        env.clock.advance(1)
+        env.daemon._persist_unsaved()
+    assert len(attempts) == 1  # waits out the backoff instead of retrying every tick
+    env.clock.advance(60)
+    env.daemon._persist_unsaved()
+    assert len(attempts) == 2
+
+
+def test_removed_account_with_unwritable_watermarks_does_not_crash(env, monkeypatch):
+    env.sign_in()
+    env.daemon.tick()
+
+    def broken(email):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(env.daemon.watermarks, "forget", broken)
+    env.store.remove("me@proton.me")
+    env.daemon.tick()
+    assert env.states()[-1]["status"] == "signed-out"
+
+
+def test_sigterm_handler_uses_a_signal_safe_queue(env):
+    import queue
+
+    assert isinstance(env.daemon.commands, queue.SimpleQueue)
