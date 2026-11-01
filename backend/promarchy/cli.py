@@ -171,18 +171,20 @@ def _hand_over(store: SessionStore, session: Session) -> dict:
     saved. When the outcome is unknown, revoking could end a session the bar
     has just taken, so the owner is asked once more instead, even if the
     keyring already lists it (only the owner switching over completes a
-    sign-in). Adopting the same session again is harmless: the owner either
-    finishes registering it (keeping any tokens renewed since), finds it
-    already held, or, if a sign-out or a newer sign-in has replaced it
-    meanwhile, refuses to bring it back. As a retry it never replaces a
-    sign-in newer than this one, however that one got there.
+    sign-in). The retry carries what was saved for this account before the
+    first attempt: the owner repeats the hand-over only if this session is
+    what is saved now (finishing its registration, with any tokens renewed
+    since) or nothing changed meanwhile. Anything else is a later sign-in or
+    sign-out, which it refuses to undo; and if it cannot tell, the sign-in
+    is kept and reported as unconfirmed.
     """
+    expect = store.account_uids(session)
     outcome, reply = _attempt(store, session)
     if outcome == "saved":
         return reply
     if outcome in ("refused", "superseded"):
         raise LoginFailed(reply)
-    outcome, reply = _attempt(store, session, retry=True)
+    outcome, reply = _attempt(store, session, retry=True, expect=expect)
     if outcome == "saved":
         # The lost first attempt may already have ended older sessions, and
         # its report is gone: do not vouch for them either way.
@@ -198,13 +200,17 @@ def _hand_over(store: SessionStore, session: Session) -> dict:
     }
 
 
-def _attempt(store: SessionStore, session: Session, retry: bool = False) -> tuple[str, Any]:
+def _attempt(
+    store: SessionStore, session: Session, retry: bool = False, expect: list[str] | None = None
+) -> tuple[str, Any]:
     """One hand-over: ("saved", reply), ("refused", why) when nothing was
     saved, ("superseded", why) when a newer sign-in or a sign-out already
-    replaced it, or ("unknown", None). `retry`: see _hand_over."""
-    request = {"cmd": "adopt", "session": session.to_dict()}
+    replaced it, or ("unknown", None). `retry`, `expect`: see _hand_over."""
+    request: dict[str, Any] = {"cmd": "adopt", "session": session.to_dict()}
     if retry:
         request["retry"] = True
+        if expect is not None:
+            request["expect"] = expect
     reply = control.ask(request)
     if reply is None:  # no bar running: become the owner for this step
         lock = control.take_lock()
@@ -212,7 +218,11 @@ def _attempt(store: SessionStore, session: Session, retry: bool = False) -> tupl
             return "refused", BAR_NOT_ANSWERING
         try:
             reply = sessions.adopt(
-                store, session, lambda old: sessions.end_displaced(ProtonClient(old)), retry=retry
+                store,
+                session,
+                lambda old: sessions.end_displaced(ProtonClient(old)),
+                retry=retry,
+                expect=expect,
             )
             return "saved", reply
         except Superseded:
@@ -562,14 +572,18 @@ def _published_state() -> tuple[dict | None, str]:
         if reply is None or not (reply.get("alive") is True or reply.get("error") == "unsupported request"):
             return None, "The Promarchy daemon is not running (is the bar widget enabled?)."
         payload = text.rstrip("\n")
-        # A daemon from before 0.2.0 cannot say which file is current.
-        published = reply["snapshot"] if "snapshot" in reply else control.snapshot_digest(payload)
-        if payload and published == control.snapshot_digest(payload):
-            try:
-                state = json.loads(payload)
-            except ValueError:
-                state = None
-            if isinstance(state, dict):
+        try:
+            state = json.loads(payload) if payload else None
+        except ValueError:
+            state = None
+        if isinstance(state, dict):
+            if "snapshot" in reply:  # the digest of what it published last (None: nothing yet)
+                current = reply["snapshot"] == control.snapshot_digest(payload)
+            elif "instance" in reply:  # a daemon from e07cc75 names its own snapshots
+                current = state.get("instance") == reply["instance"]
+            else:  # older daemons cannot say which file is current
+                current = True
+            if current:
                 return state, ""
     return None, "Promarchy has no current snapshot (starting, or it could not write one); try again soon."
 

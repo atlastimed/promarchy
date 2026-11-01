@@ -14,13 +14,13 @@ from test_hardening import daemon_env  # noqa: F401  (fixture)
 from test_ownership import daemon_running, make_daemon, make_store, pending_sign_in, shared_api_factory
 from test_probe import ProbeAPI, probe
 from test_rereview import AuthServer, stored_session
-from test_review_round_two import recording_factory, session, two_account_daemon
+from test_review_round_two import FlakyKeyring, recording_factory, session, two_account_daemon
 
 from promarchy import cli, control
 from promarchy import daemon as daemon_module
 from promarchy import store as store_module
 from promarchy.api import ProtonClient, ProtonError, RateLimited, Session
-from promarchy.auth import REVOKED
+from promarchy.auth import REVOKED, TWO_FACTOR_TOTP, PendingLogin
 from promarchy.mailbox import Mailbox
 from promarchy.paths import runtime_dir
 from promarchy.store import SessionStore, StoreUnavailable
@@ -361,48 +361,124 @@ def test_a_saved_sign_in_is_never_revoked_over_a_bookkeeping_failure(tmp_path, m
     store = make_store(tmp_path)
     daemon = make_daemon(store, tmp_path, recording_factory([]))
     assert daemon._adopt(session("old"))["saved"]
-    real_open = store_module.open_private
-    opens = []
+    real_open, real_set = store_module.open_private, store.secrets.set
+    armed = []
 
-    def fails_after_the_save(path):
-        opens.append(path)
-        if len(opens) == 2:  # the first is the save itself
+    def saves_then_arms(key, value):
+        real_set(key, value)
+        armed.append(True)
+
+    def fails_once_armed(path):
+        if armed:
+            armed.clear()
             raise OSError(errno.EROFS, "Read-only file system")
         return real_open(path)
 
-    monkeypatch.setattr(store_module, "open_private", fails_after_the_save)
+    monkeypatch.setattr(store.secrets, "set", saves_then_arms)
+    monkeypatch.setattr(store_module, "open_private", fails_once_armed)
     monkeypatch.setattr(cli, "SessionStore", lambda: store)
     monkeypatch.setattr(cli, "ProtonClient", FakeProton)
     monkeypatch.setattr(control, "ask", answering(daemon))
     revoked = pending_sign_in(monkeypatch, uid="new", user_id="U")
     with contextlib.suppress(cli.LoginFailed):
         cli._login("me@proton.me")
-    assert len(opens) >= 2
     assert store.load("me@proton.me").uid == "new" and revoked == []
 
 
-def test_a_retry_after_the_owner_restarted_never_replaces_a_newer_sign_in(tmp_path, monkeypatch):
-    """V03: A's answer is lost; B replaces A while the state directory is
-    full, so only the running bar remembers A is over; the bar restarts; A's
-    retry reaches the new one."""
+@pytest.mark.parametrize("a_started", [1.0, 20.0], ids=["started-first", "started-last"])
+def test_a_retry_after_the_owner_restarted_never_undoes_a_later_sign_in(tmp_path, monkeypatch, a_started):
+    """V03 and W01: A is adopted but its answer is lost; B replaces A while the
+    state directory is full, so only the running bar remembers A is over; the
+    bar restarts; A's retry reaches the new one. Whichever of the two started
+    first (B may have waited for its 2FA code), B was adopted last."""
     store = make_store(tmp_path)
-    ended = []
+    ended, calls = [], []
     first = make_daemon(store, tmp_path, recording_factory(ended))
-    a, b = session("a"), session("b", created_at=2.0)
-    assert first._adopt(a)["saved"]
-    with monkeypatch.context() as fault:
-        fault.setattr(store_module, "write_private", disk_full)
-        assert first._adopt(b)["saved"]
-    assert first._adopt(a).get("superseded") is True  # that bar remembers
+    a, b = session("a", created_at=a_started), session("b", created_at=10.0)
+    owner = {"now": first}
 
-    reopened = SessionStore(secrets=store.secrets, root=store.root)
-    second = make_daemon(reopened, tmp_path, recording_factory(ended))
-    second._sync_accounts()
-    assert second.accounts[b.email].client.session.uid == "b"
-    monkeypatch.setattr(control, "ask", first_answer_lost(second))
+    def lost_answer_then_restart(request, **kw):
+        parsed = control.parse(json.dumps(request).encode())
+        calls.append((parsed["session"].uid, parsed["retry"]))
+        if len(calls) == 1:
+            assert first._answer(parsed)["saved"]
+            with monkeypatch.context() as fault:
+                fault.setattr(store_module, "write_private", disk_full)
+                assert first._adopt(b)["saved"]
+            assert first._adopt(a).get("superseded") is True  # that bar remembers
+            reopened = SessionStore(secrets=store.secrets, root=store.root)
+            owner["now"] = make_daemon(reopened, tmp_path, recording_factory(ended))
+            owner["now"]._sync_accounts()
+            assert owner["now"].accounts[b.email].client.session.uid == "b"
+            return {"error": "no answer"}
+        return owner["now"]._answer(parsed)
+
+    monkeypatch.setattr(control, "ask", lost_answer_then_restart)
     with pytest.raises(cli.LoginFailed, match="newer sign-in"):
-        cli._hand_over(reopened, a)
-    assert ended == ["a"] and reopened.load(a.email).uid == "b"
+        cli._hand_over(store, a)
+    assert calls == [("a", False), ("a", True)]
+    assert ended == ["a"] and owner["now"].store.load(b.email).uid == "b"
+
+
+def test_a_sign_in_that_finished_its_2fa_last_is_kept_even_if_it_started_first(tmp_path, monkeypatch):
+    """W01: A waits for its 2FA code while B completes; A's save then lands but
+    cannot be read back. Start order is not adoption order: A is the latest,
+    so its retry finishes it and ends B (never the other way round)."""
+    store = SessionStore(secrets=FlakyKeyring(), root=make_store(tmp_path).root)
+    ended = []
+    daemon = make_daemon(store, tmp_path, recording_factory(ended))
+    pending = session("started-first", created_at=10.0)
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", FakeProton)
+    revoked = pending_sign_in(monkeypatch, uid=pending.uid, user_id="U")
+    monkeypatch.setattr(cli, "begin_login", lambda *args: PendingLogin(pending, TWO_FACTOR_TOTP))
+
+    def finishing_2fa_after_another_sign_in(client):
+        assert daemon._adopt(session("finished-first", created_at=20.0))["saved"]
+        store.secrets.arm = True  # the next save lands, and reading it back fails once
+        return True
+
+    monkeypatch.setattr(cli, "_two_factor", finishing_2fa_after_another_sign_in)
+    monkeypatch.setattr(control, "ask", answering(daemon))
+    assert cli._login(pending.email) == pending.email
+    assert store.load(pending.email).uid == "started-first" and revoked == []
+    assert ended == ["finished-first"]
+    assert daemon.accounts[pending.email].client.session.uid == "started-first"
+
+
+def test_a_signed_out_sign_in_is_not_brought_back_after_a_restart(tmp_path, monkeypatch):
+    """W02: A is adopted, its answer lost; the user signs out (Proton confirms,
+    the keyring entry is deleted) while the state directory takes no writes;
+    the bar restarts. An empty account no longer proves the first save never
+    landed, so the retry keeps the sign-in unconfirmed instead of saving a
+    revoked session and calling it signed in."""
+    store = make_store(tmp_path)
+    ended, retries = [], []
+    first = make_daemon(store, tmp_path, recording_factory(ended))
+    a = session("signed-out")
+    owner = {"now": first}
+
+    def lost_answer_then_restart(request, **kw):
+        parsed = control.parse(json.dumps(request).encode())
+        retries.append(parsed["retry"])
+        reply = owner["now"]._answer(parsed)
+        if len(retries) == 1:
+            assert reply["saved"]
+            with monkeypatch.context() as fault:
+                fault.setattr(store_module, "write_private", disk_full)
+                assert first._logout(a.email)[0]["outcome"] == REVOKED
+                assert store.load(a.email) is None
+            reopened = SessionStore(secrets=store.secrets, root=store.root)
+            owner["now"] = make_daemon(reopened, tmp_path, recording_factory(ended))
+            owner["now"]._sync_accounts()
+            assert not owner["now"].accounts
+            return {"error": "no answer"}
+        return reply
+
+    monkeypatch.setattr(control, "ask", lost_answer_then_restart)
+    result = cli._hand_over(store, a)
+    assert retries == [False, True] and result.get("unconfirmed") is True
+    assert owner["now"].store.load(a.email) is None
 
 
 def test_a_retry_still_finishes_a_sign_in_whose_first_save_never_landed(tmp_path, monkeypatch):
@@ -426,7 +502,9 @@ def test_a_retry_never_ends_a_newer_sign_in_the_bar_holds(tmp_path):
     assert daemon._adopt(b)["saved"]
     store.secrets.delete(store_module._key(b.email))
     reply = answering(daemon)({"cmd": "adopt", "session": a.to_dict(), "retry": True})
-    assert reply.get("superseded") is True and ended == []
+    assert reply.get("saved") is not True and ended == []  # it cannot tell: nothing is replaced
+    reply = answering(daemon)({"cmd": "adopt", "session": a.to_dict(), "retry": True, "expect": ["b"]})
+    assert reply.get("superseded") is True and ended == []  # B is gone since: a sign-out, never undone
 
 
 def test_a_later_retirement_write_carries_the_ones_that_failed(tmp_path, monkeypatch):
@@ -499,3 +577,15 @@ def test_status_never_vouches_for_a_snapshot_that_failed_to_save(tmp_path, monke
 
     daemon.emit()  # storage is back: the unchanged snapshot is written after all
     assert json.loads(path.read_text())["status"] == "throttled"
+
+
+def test_status_keeps_the_instance_check_of_a_daemon_from_e07cc75(monkeypatch, capsys):
+    """W03: during an update the new CLI may ask a daemon still running
+    e07cc75, which names its snapshots with an instance ID instead."""
+    state = {"type": "state", "status": "ok", "counts": {"1h": 999}, "instance": "old-owner"}
+    (runtime_dir() / "state.json").write_text(json.dumps(state))
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(control, "ask", lambda request, **kw: {"alive": True, "instance": "running-owner"})
+    assert cli.main(["status", "--window", "1h"]) == 1 and capsys.readouterr().out == ""
+    monkeypatch.setattr(control, "ask", lambda request, **kw: {"alive": True, "instance": "old-owner"})
+    assert cli.main(["status", "--window", "1h"]) == 0 and capsys.readouterr().out.strip() == "999"

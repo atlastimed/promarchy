@@ -433,7 +433,9 @@ class Daemon:
         if request["cmd"] == "logout":
             return {"results": self._logout(request["account"], local=request["local"])}
         if request["cmd"] == "adopt":
-            return self._adopt(request["session"], retry=request.get("retry") is True)
+            return self._adopt(
+                request["session"], retry=request.get("retry") is True, expect=request.get("expect")
+            )
         return {"error": "unsupported request"}
 
     def _logout(self, target: str | None, local: bool = False) -> list[dict]:
@@ -491,11 +493,11 @@ class Daemon:
             sessions.forget(self.store, result, expected_uid=uid)
         return result
 
-    def _adopt(self, session: Session, retry: bool = False) -> dict:
+    def _adopt(self, session: Session, retry: bool = False, expect: list[str] | None = None) -> dict:
         """Take over a fresh sign-in from `promarchyctl login`: save it, and
         end the sessions it replaces with the tokens this process holds for
-        them (the saved copies may be older). `retry`: the CLI's repeat after
-        a lost answer, which never replaces a newer sign-in."""
+        them (the saved copies may be older). `retry`, `expect`: the CLI's
+        repeat after a lost answer (see SessionStore.replace)."""
 
         def end(old: Session) -> str:
             owned = next(
@@ -537,7 +539,7 @@ class Daemon:
             and (email == session.email or (session.user_id and a.client.session.user_id == session.user_id))
         ]
         try:
-            result = sessions.adopt(self.store, session, end, also=replaced, retry=retry)
+            result = sessions.adopt(self.store, session, end, also=replaced, retry=retry, expect=expect)
         except Superseded as exc:
             # A late retry of a sign-in that a newer one (or a sign-out) has
             # already replaced: bringing it back would undo the newer one.

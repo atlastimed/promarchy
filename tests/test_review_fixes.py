@@ -260,12 +260,28 @@ def test_standalone_sign_in_after_an_interrupted_write_is_discoverable(tmp_path,
 
 
 def test_an_unknown_first_write_is_retried_and_confirmed(tmp_path, monkeypatch, capsys):
-    store = store_with(tmp_path, DiesFirst())
+    secrets = DiesFirst(failures=0)
+    store = store_with(tmp_path, secrets)
+    store.save(session(uid="u1"))  # what the sign-in replaces
+    secrets.failures = 1
     monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", lambda *a, **kw: FakeProton())
     revoked = pending_sign_in(monkeypatch, uid="u2")
     assert cli._login("me@proton.me") == "me@proton.me"
     assert revoked == [] and store.accounts() == ["me@proton.me"]
+    assert store.load("me@proton.me").uid == "u2"
     assert "could not confirm whether an older session" in capsys.readouterr().err
+
+
+def test_a_first_sign_in_whose_save_cannot_be_traced_is_kept_and_reported(tmp_path, monkeypatch):
+    """With nothing saved before, an empty account after a lost save could
+    also mean a sign-out meanwhile: keep the session and say so, never guess."""
+    store = store_with(tmp_path, DiesFirst())
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    revoked = pending_sign_in(monkeypatch, uid="u2")
+    with pytest.raises(cli.LoginFailed, match="could not confirm the keyring saved"):
+        cli._login("me@proton.me")
+    assert revoked == []
 
 
 def test_a_write_that_never_confirms_keeps_the_session_and_says_so(tmp_path, monkeypatch):

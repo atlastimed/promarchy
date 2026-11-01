@@ -216,7 +216,9 @@ class SessionStore:
         update_tokens, which writes only onto the same live session."""
         self.replace(session)
 
-    def replace(self, session: Session, *, retry: bool = False) -> list[Session]:
+    def replace(
+        self, session: Session, *, retry: bool = False, expect: list[str] | None = None
+    ) -> list[Session]:
         """Store a (new) session and return every session it displaced.
 
         A Proton account is identified by its UserID, not by the address you
@@ -225,9 +227,13 @@ class SessionStore:
         happen under one lock, so racing sign-ins each get back exactly what
         they displaced, and the caller revokes it on Proton's side.
 
-        `retry`: a repeat of a hand-over whose answer was lost. By then a
-        newer sign-in to this account may be saved (whatever happened to this
-        one meanwhile), and a retry never replaces a newer one.
+        `retry`: a repeat of a hand-over whose answer was lost, made with
+        `expect`, what account_uids() said before the first attempt. It goes
+        ahead only if this session is what is saved now (the first attempt
+        landed) or nothing changed since (it did not): anything else is a
+        later sign-in or sign-out, never to be undone. An account that is
+        empty now and was before proves nothing (a sign-out would have
+        emptied it too), so that, like an unknown `expect`, is indeterminate.
 
         Outcomes: StoreUnavailable means nothing changed; SaveIndeterminate
         means the new session may or may not be stored; Superseded means it
@@ -256,10 +262,12 @@ class SessionStore:
                         aliases.append((other, stored))
             previous = self.load(session.email)
             copies = [previous, *(stored for _, stored in aliases)]
-            if retry and any(
-                s is not None and s.uid != session.uid and s.created_at > session.created_at for s in copies
-            ):
-                raise Superseded("a newer sign-in replaced this one")
+            saved = _uids(copies)
+            if retry and session.uid not in saved:
+                if expect is None or not (saved or expect):
+                    raise SaveIndeterminate("could not tell what became of this sign-in")
+                if saved != sorted(expect):
+                    raise Superseded("a newer sign-in or a sign-out replaced this one")
             same = next((s for s in copies if s is not None and s.uid == session.uid), None)
             if same is not None:
                 # This very session is already saved (a retried hand-over), and
@@ -312,6 +320,25 @@ class SessionStore:
                 log_error("updating the account list", exc)
                 self.index_failed = True
         return displaced
+
+    def account_uids(self, session: Session) -> list[str] | None:
+        """The sessions saved for this sign-in's Proton account (under its
+        address or another listed one), or None if they cannot be read: what
+        a hand-over is about to replace, for its retry (see replace)."""
+        email = session.email.strip().lower()
+        try:
+            with self._locked():
+                copies = [self.load(email)]
+                if session.user_id:
+                    for other in self.accounts():
+                        if other.lower() != email:
+                            stored = self.load(other)
+                            if stored is not None and stored.user_id == session.user_id:
+                                copies.append(stored)
+                return _uids(copies)
+        except Exception as exc:
+            log_error("reading the sessions a sign-in replaces", exc)
+            return None
 
     def _holds(self, session: Session) -> bool:
         """True only if the keyring positively holds this exact session."""
@@ -430,6 +457,10 @@ class SessionStore:
         # repeat even after the stamp was deleted or written by an older version.
         with self._locked():
             write_private(self._stamp, str(max(self.generation() + 1, time.time_ns())))
+
+
+def _uids(sessions: Iterable[Session | None]) -> list[str]:
+    return sorted({s.uid for s in sessions if s is not None})
 
 
 def _key(email: str) -> str:

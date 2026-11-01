@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable
 from .api import ProtonClient, RateLimited, Session
 from .auth import REJECTED, REVOKED, UNCONFIRMED, end_session
 from .log import log_error
-from .store import SessionStore, StoreUnavailable, Superseded
+from .store import SessionStore, StoreUnavailable
 
 NOT_SIGNED_IN = "not-signed-in"
 UNREADABLE = "unreadable"
@@ -84,21 +84,19 @@ def adopt(
     end: Callable[[Session], str],
     also: Iterable[Session] = (),
     retry: bool = False,
+    expect: list[str] | None = None,
 ) -> dict:
     """Save a fresh sign-in and end every session it replaces.
 
     `end` ends one displaced session with the owner's current tokens for it
     (the saved copy may be older than what the owner holds). `also`: sessions
     the owner holds that this sign-in replaces, in case their saved copies
-    could not be read. `retry`: see SessionStore.replace. Raises
+    could not be read. `retry`, `expect`: see SessionStore.replace. Raises
     StoreUnavailable if nothing changed, SaveIndeterminate if the new session
     may or may not have been saved, and Superseded if it was already replaced
     or signed out (nothing changed).
     """
-    also = list(also)
-    if retry and any(held.uid != session.uid and held.created_at > session.created_at for held in also):
-        raise Superseded("a newer sign-in replaced this one")  # held here, whatever the keyring says
-    displaced = [old for old in store.replace(session, retry=retry) if old.uid != session.uid]
+    displaced = [old for old in store.replace(session, retry=retry, expect=expect) if old.uid != session.uid]
     known = {old.uid for old in displaced}
     for held in also:
         if held.uid != session.uid and held.uid not in known:

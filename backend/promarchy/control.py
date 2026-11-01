@@ -75,15 +75,26 @@ def parse(line: bytes) -> dict:
             raise BadRequest("invalid request")
         return {"cmd": "logout", "account": account.strip().lower() if account else None, "local": local}
     if cmd == "adopt":
-        retry = request.get("retry", False)  # a repeat after a lost answer
+        # A repeat after a lost answer, with the sessions the first attempt
+        # was about to replace (see SessionStore.replace).
+        retry, expect = request.get("retry", False), request.get("expect")
         try:
             session = Session.from_dict(request["session"])
         except (KeyError, TypeError, ValueError):
             raise BadRequest("invalid request") from None
-        if not session.email or not isinstance(retry, bool):
+        if not session.email or not isinstance(retry, bool) or not _uid_list(expect):
             raise BadRequest("invalid request")
-        return {"cmd": "adopt", "session": session, "retry": retry}  # from_dict lowercased the address
+        # from_dict lowercased the address
+        return {"cmd": "adopt", "session": session, "retry": retry, "expect": expect}
     raise BadRequest("unsupported request")
+
+
+def _uid_list(value: object) -> bool:
+    return value is None or (
+        isinstance(value, list)
+        and len(value) <= 16
+        and all(isinstance(u, str) and 0 < len(u) <= 256 for u in value)
+    )
 
 
 class Ticket:
