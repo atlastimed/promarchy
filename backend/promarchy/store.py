@@ -463,11 +463,13 @@ def _check_retry(
 ) -> None:
     """Whether a retry of a lost hand-over may go ahead; SaveIndeterminate if
     not. Only positive evidence counts, because a keyring that is locked can
-    answer "nothing saved", and a sign-out after a restart leaves no record:
+    answer "nothing saved", and a sign-out followed by a restart can leave
+    the account looking just as it was. So it takes the owner that handled
+    the first attempt, still owning the sessions (it alone saw any sign-out
+    since), and then:
 
-    - this session is saved now: its first attempt landed. Only the owner
-      that handled that attempt knows no sign-out happened since, and the
-      only others it may end are the ones the sign-in meant to replace;
+    - this session is saved now: its first attempt landed, and the only
+      others it may end are the ones the sign-in meant to replace;
     - it is not saved, and exactly what was saved before still is (not
       nothing: an emptied account may be a sign-out): it never landed.
 
@@ -476,11 +478,12 @@ def _check_retry(
     """
     others = (set(saved) | set(held)) - {uid}
     known = set(expect) if expect is not None else None
-    if uid in saved:
-        if seen_first and (not others if known is None else others <= known):
+    if seen_first:
+        if uid in saved:
+            if not others if known is None else others <= known:
+                return
+        elif known and set(saved) == known and others <= known:
             return
-    elif known and set(saved) == known and others <= known:
-        return
     raise SaveIndeterminate("could not tell what became of this sign-in")
 
 

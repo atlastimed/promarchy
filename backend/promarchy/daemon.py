@@ -451,6 +451,9 @@ class Daemon:
         """
         if target is not None and not (isinstance(target, str) and target):
             raise ValueError("invalid account selector")  # never "all" by accident
+        # A sign-in handed over before this sign-out may retry after it: from
+        # now on this process cannot vouch for any of them (see _adopt).
+        self.attempted = []
         if target is None:
             try:
                 indexed = self.store.accounts()
@@ -529,13 +532,15 @@ class Daemon:
             # Signed out or replaced here already, even if the keyring kept
             # its entry: a late retry must not be told it is signed in.
             return {"saved": False, "superseded": True, "unchanged": True, "error": "replaced or signed out"}
-        if any(
-            a.client.session is not None and a.client.session.uid == session.uid
-            for a in self.accounts.values()
-        ):
-            if retry and not seen_first:
-                # Loaded from the keyring after a restart: it may have been
-                # signed out since, which only the previous process knew.
+        held = next(
+            (a for a in self.accounts.values() if a.client.session and a.client.session.uid == session.uid),
+            None,
+        )
+        if held is not None:
+            if retry and (not seen_first or held.status == "auth-expired"):
+                # Loaded from the keyring after a restart (it may have been
+                # signed out since, which only the previous process knew), or
+                # already known not to work: never confirm it.
                 return {"saved": False, "indeterminate": True, "error": "could not tell"}
             # A repeat of a session we already hold: our tokens are the newer.
             return {"saved": True, "displaced": [], "cleanupFailures": []}

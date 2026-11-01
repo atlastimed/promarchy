@@ -3,6 +3,7 @@ and its follow-up on e07cc75 (V01 to V05)."""
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import errno
 import json
@@ -16,14 +17,14 @@ from test_probe import ProbeAPI, probe
 from test_rereview import AuthServer, stored_session
 from test_review_round_two import FlakyKeyring, recording_factory, session, two_account_daemon
 
-from promarchy import cli, control
+from promarchy import cli, control, sessions
 from promarchy import daemon as daemon_module
 from promarchy import store as store_module
-from promarchy.api import ProtonClient, ProtonError, RateLimited, Session
+from promarchy.api import AuthExpired, ProtonClient, ProtonError, RateLimited, Session
 from promarchy.auth import REVOKED, TWO_FACTOR_TOTP, PendingLogin
 from promarchy.mailbox import Mailbox
 from promarchy.paths import runtime_dir
-from promarchy.store import SaveIndeterminate, SessionStore, StoreUnavailable
+from promarchy.store import RETIRED_KEEP, SaveIndeterminate, SessionStore, StoreUnavailable
 
 INBOX = "https://mail.proton.me/inbox"
 
@@ -481,15 +482,36 @@ def test_a_signed_out_sign_in_is_not_brought_back_after_a_restart(tmp_path, monk
 
 
 def test_a_retry_still_finishes_a_sign_in_whose_first_save_never_landed(tmp_path, monkeypatch):
-    """The other side of V03's rule: an older session is still replaced and
-    ended, so a retry recovers when the first attempt changed nothing."""
+    """The other side of the retry rule: when the bar that handled the first
+    attempt saw its save fail and nothing else change, the retry replaces and
+    ends the older session after all."""
+    store = make_store(tmp_path)
+    ended = []
+    daemon = make_daemon(store, tmp_path, recording_factory(ended))
+    assert daemon._adopt(session("old"))["saved"]
+    real_set, failures = store.secrets.set, [SaveIndeterminate("helper died before it wrote")]
+
+    def first_save_never_lands(key, value):
+        if failures:
+            raise failures.pop()
+        real_set(key, value)
+
+    monkeypatch.setattr(store.secrets, "set", first_save_never_lands)
+    monkeypatch.setattr(control, "ask", answering(daemon))
+    reply = cli._hand_over(store, session("new", created_at=2.0))
+    assert reply["saved"] is True and ended == ["old"] and store.load("me@proton.me").uid == "new"
+
+
+def test_a_retry_an_owner_never_saw_stays_unconfirmed(tmp_path, monkeypatch):
+    """Y02's rule: an owner that did not handle the first attempt cannot tell
+    "never landed" from "landed, signed out, and back to how it looked"."""
     store = make_store(tmp_path)
     ended = []
     daemon = make_daemon(store, tmp_path, recording_factory(ended))
     assert daemon._adopt(session("old"))["saved"]
     monkeypatch.setattr(control, "ask", first_answer_lost(daemon))  # lost before the owner acted
     reply = cli._hand_over(store, session("new", created_at=2.0))
-    assert reply["saved"] is True and ended == ["old"] and store.load("me@proton.me").uid == "new"
+    assert reply.get("unconfirmed") is True and ended == [] and store.load("me@proton.me").uid == "old"
 
 
 def test_a_retry_never_ends_a_newer_sign_in_the_bar_holds(tmp_path):
@@ -782,3 +804,166 @@ def test_a_retry_to_the_bar_that_took_the_first_attempt_is_confirmed_before_any_
     assert bar._adopt(a)["saved"]
     assert not bar.accounts[a.email].mailbox.synced
     assert bar._adopt(a, retry=True, expect=[])["saved"]
+
+
+# ========================================= fifth pass, on eeba389 (Y01 to Y04)
+
+
+def test_a_cli_keeps_ownership_from_its_first_attempt_to_its_retry(tmp_path, monkeypatch):
+    """Y01: between a local first attempt and its retry no other owner may
+    act (it could sign the new session out unseen), so the CLI keeps the
+    lock, and the retry, seeing its own save, finishes the sign-in."""
+    store = SessionStore(secrets=FlakyKeyring(), root=make_store(tmp_path).root)
+    store.save(session("old"))
+    asked, contested = [], []
+
+    def no_bar(request, **kw):
+        asked.append(request)
+        store.secrets.arm = True  # the first save lands, and reading it back fails
+        return None
+
+    real_adopt = sessions.adopt
+
+    def adopt(*args, **kw):
+        if kw.get("retry"):
+            contested.append(control.take_lock())  # another would-be owner, right now
+        return real_adopt(*args, **kw)
+
+    monkeypatch.setattr(control, "ask", no_bar)
+    monkeypatch.setattr(sessions, "adopt", adopt)
+    monkeypatch.setattr(cli, "ProtonClient", lambda *a, **kw: FakeProton())
+    result = cli._hand_over(store, session("a"))
+    assert len(asked) == 1 and contested == [None]
+    assert result["saved"] is True and store.load("me@proton.me").uid == "a"
+    assert control.take_lock() is not None  # released afterwards
+
+
+def test_a_bar_restored_to_how_it_looked_never_brings_a_signed_out_sign_in_back(tmp_path, monkeypatch):
+    """Y02: A replaced O (whose old alias entry could not be deleted), was
+    signed out, and the bar restarted: the account looks exactly as A's
+    first attempt found it. That proves nothing about A."""
+    store = make_store(tmp_path)
+    ended, requests = [], []
+    first = make_daemon(store, tmp_path, recording_factory(ended))
+    predecessor = session("old", email="old@proton.me")
+    a = session("a", email="new@proton.me")
+    assert first._adopt(predecessor)["saved"]
+    owner = {"now": first}
+    real_delete = store.secrets.delete
+
+    def cannot_delete_the_alias(key):
+        if key == "session:" + predecessor.email:
+            raise StoreUnavailable("keyring refused old alias cleanup")
+        return real_delete(key)
+
+    def answer(request, **kw):
+        parsed = control.parse(json.dumps(request).encode())
+        requests.append(parsed)
+        if len(requests) == 1:
+            with monkeypatch.context() as fault:
+                fault.setattr(store_module, "write_private", disk_full)
+                fault.setattr(store.secrets, "delete", cannot_delete_the_alias)
+                assert first._answer(parsed)["saved"]
+                result = first._answer(control.parse(b'{"cmd":"logout"}'))["results"][0]
+                assert result["outcome"] == REVOKED and store.load(a.email) is None
+            reopened = SessionStore(secrets=store.secrets, root=store.root)
+            assert reopened.account_uids(a) == [predecessor.uid]
+            owner["now"] = make_daemon(reopened, tmp_path, recording_factory(ended))
+            owner["now"]._sync_accounts()
+            return {"error": "no answer"}
+        return owner["now"]._answer(parsed)
+
+    monkeypatch.setattr(control, "ask", answer)
+    result = cli._hand_over(store, a)
+    assert requests[1]["expect"] == [predecessor.uid] and result.get("unconfirmed") is True
+    assert owner["now"].store.load(a.email) is None
+
+
+def test_a_lock_that_cannot_be_opened_never_gets_a_saved_sign_in_revoked(tmp_path, monkeypatch):
+    """Y03: the bar saved A, its answer was lost and it exited; the CLI cannot
+    even open the ownership lock for the retry. That says nothing about A."""
+    store = make_store(tmp_path)
+    bar = make_daemon(store, tmp_path, recording_factory([]))
+    calls = []
+
+    def read_only(path):
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    def ask(request, **kw):
+        calls.append(request)
+        if len(calls) == 1:
+            assert answering(bar)(request)["saved"]
+            return {"error": "no answer"}
+        return None  # the bar has exited
+
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", FakeProton)
+    monkeypatch.setattr(control, "ask", ask)
+    monkeypatch.setattr(control, "open_private", read_only)
+    revoked = pending_sign_in(monkeypatch, uid="a", user_id="U")
+    with pytest.raises(cli.LoginFailed):
+        cli._login("me@proton.me")
+    assert store.load("me@proton.me").uid == "a" and revoked == []
+
+
+def test_a_bar_never_confirms_a_sign_in_it_has_seen_fail(tmp_path, monkeypatch, capsys):
+    """Y04: between the lost answer and the retry, the bar found the new
+    session rejected; the CLI must not print that it signed in."""
+    store = make_store(tmp_path)
+    bar = make_daemon(store, tmp_path, recording_factory([]))
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", FakeProton)
+    pending_sign_in(monkeypatch, uid="a", user_id="U")
+    calls = []
+
+    def ask(request, **kw):
+        calls.append(request)
+        reply = answering(bar)(request)
+        if len(calls) == 1:
+            assert reply["saved"]
+            account = bar.accounts["me@proton.me"]
+            account.client.fail_with = AuthExpired("Session rejected")
+            bar._poll(account)
+            assert account.status == "auth-expired"
+            return {"error": "no answer"}
+        return reply
+
+    monkeypatch.setattr(control, "ask", ask)
+    code = cli.cmd_login(argparse.Namespace(username="me@proton.me", wait=False))
+    assert code != 0 and "Signed in as" not in capsys.readouterr().out
+
+
+def test_a_sign_out_ends_the_bars_word_for_earlier_sign_ins(tmp_path, monkeypatch):
+    """Y04, eviction: A's sign-out could not delete its keyring entry, and 64
+    later sign-outs pushed A out of the bounded record of ended sessions.
+    The bar's note that it handled A's first attempt must not outlive A's
+    sign-out."""
+    store = make_store(tmp_path)
+    others = [session(f"o{i}", email=f"o{i}@example.test", user_id=f"U{i}") for i in range(RETIRED_KEEP)]
+    for other in others:
+        store.save(other)
+    ended, calls = [], []
+    bar = make_daemon(store, tmp_path, recording_factory(ended))
+    bar._sync_accounts()
+    a = session("a")
+
+    def cannot_delete(key):
+        raise StoreUnavailable("keyring refused deletion")
+
+    def ask(request, **kw):
+        calls.append(request)
+        if len(calls) == 1:
+            assert answering(bar)(request)["saved"]
+            with monkeypatch.context() as fault:
+                fault.setattr(store.secrets, "delete", cannot_delete)
+                assert bar._logout(a.email)[0]["removeFailed"]
+            for other in others:
+                assert bar._logout(other.email)[0]["outcome"] == REVOKED
+            assert a.uid not in store.retired()
+            assert bar.accounts[a.email].client.session.uid == a.uid
+            return {"error": "no answer"}
+        return answering(bar)(request)
+
+    monkeypatch.setattr(control, "ask", ask)
+    result = cli._hand_over(store, a)
+    assert ended.count(a.uid) == 1 and result.get("unconfirmed") is True

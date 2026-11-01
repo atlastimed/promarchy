@@ -178,12 +178,17 @@ def _hand_over(store: SessionStore, session: Session) -> dict:
     reported as unconfirmed, and a sign-out the owner knows of is reported.
     """
     expect = store.account_uids(session)
-    outcome, reply, here = _attempt(store, session)
-    if outcome == "saved":
-        return reply
-    if outcome in ("refused", "superseded"):
-        raise LoginFailed(reply)
-    outcome, reply, _ = _attempt(store, session, retry=True, expect=expect, seen_first=here)
+    owned: list[int] = []  # the ownership lock, kept from a local first attempt to its retry
+    try:
+        outcome, reply, here = _attempt(store, session, keep=owned)
+        if outcome == "saved":
+            return reply
+        if outcome in ("refused", "superseded"):
+            raise LoginFailed(reply)
+        outcome, reply, _ = _attempt(store, session, retry=True, expect=expect, seen_first=here, keep=owned)
+    finally:
+        for fd in owned:
+            os.close(fd)
     if outcome == "saved":
         # The lost first attempt may already have ended older sessions, and
         # its report is gone: do not vouch for them either way.
@@ -205,21 +210,32 @@ def _attempt(
     retry: bool = False,
     expect: list[str] | None = None,
     seen_first: bool = False,
+    keep: list[int] | None = None,
 ) -> tuple[str, Any, bool]:
     """One hand-over: ("saved", reply), ("refused", why) when nothing was
     saved, ("superseded", why) when a newer sign-in or a sign-out already
     replaced it, or ("unknown", None); and whether this process was the owner
-    for it. `retry`, `expect`, `seen_first`: see _hand_over."""
+    for it. `retry`, `expect`, `seen_first`: see _hand_over. `keep`: where to
+    keep the ownership lock for the caller to release, if this process takes
+    it; while it holds it, no other owner exists and the bar is not asked."""
     request: dict[str, Any] = {"cmd": "adopt", "session": session.to_dict()}
     if retry:
         request["retry"] = True
         if expect is not None:
             request["expect"] = expect
-    reply = control.ask(request)
+    reply = None if keep else control.ask(request)
     if reply is None:  # no bar running: become the owner for this step
-        lock = control.take_lock()
-        if lock is None:
-            return "refused", BAR_NOT_ANSWERING, False
+        if keep:
+            lock = keep[0]
+        else:
+            try:
+                lock = control.take_lock()
+            except OSError as exc:  # nothing happened here; a retry stays unconfirmed
+                return "refused", f"Signed in, but could not take over saving it: {exc}", False
+            if lock is None:
+                return "refused", BAR_NOT_ANSWERING, False
+            if keep is not None:
+                keep.append(lock)
         try:
             reply = sessions.adopt(
                 store,
@@ -237,7 +253,8 @@ def _attempt(
         except Exception as exc:  # nothing was written
             return "refused", f"Signed in, but could not save the session to your keyring: {exc}", True
         finally:
-            os.close(lock)
+            if keep is None:
+                os.close(lock)
     if reply.get("saved") is True:
         return "saved", reply, False
     if reply.get("superseded") is True:
