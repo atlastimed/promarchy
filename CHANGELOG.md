@@ -1,6 +1,36 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.2.0 (2026-11-01)
+
+Design refinements from an Omarchy design review, and fixes from two code reviews.
+
+Interface:
+
+- Secondary text (read subjects, times, labels) is derived against the popup's own background with a 4.5:1 contrast floor: readable in all 22 stock themes (8 fell below it before) and quieter than the main text on light themes (4 had it brighter).
+- The bar shows state without opening the dropdown: a small mark beside the envelope when offline, when a session needs signing in again, when some accounts are not counted, or when a renewed sign-in is not yet saved, and a count from an earlier sync steps back from the attention colour.
+- The dropdown always shows what the backend reported (a locked keyring, a sign-out Proton could not confirm, credentials not yet saved) next to short guidance. Signing in starts with what to do rather than how it works.
+- "Unread from" labels the count controls and "Recent inbox" the list; a hidden badge reads "Badge off". Empty lists say why (loading, offline, empty inbox), and a list turned off is hidden.
+- The header and footer stay in place while a long list scrolls; hovering a row shows the full sender, address and subject; account labels on rows stay short.
+- *Add account* and *Sign out* moved into an accounts section that lists each account's state. Signing out asks in words, with a Cancel button, instead of a second click within four seconds.
+- Row actions need a visible row: with no row selected, <kbd>m</kbd> or <kbd>x</kbd> first shows the cursor.
+- Logo tiles follow the theme's corner radius, share the control border, and use plain white so Proton's opaque logos sit flush.
+- Colours are read through the qualified `Commons.Color`, as the shell's own components do.
+- Demo mode can show other states (`offline`, `expired`, `partial`, `warning`, `signed-out`, `empty`, `long`, `multi`) and never acts on real accounts.
+- New marketplace preview and README screenshots, captured natively at 2× scale.
+
+Fixes:
+
+- A sign-in whose keyring write landed before the helper was interrupted is now registered, rather than reported as signed in while invisible to the bar and to `logout --all`. An unknown outcome is retried once with the session's owner before it is reported as unconfirmed.
+- In Proton's single-message view the dropdown lists messages, so every link opens; view-mode changes are picked up while running and on refresh.
+- A throttled session renewal (429 with Retry-After) triggered by the settings request or a logo request holds the whole account until Proton's deadline. Logos still pause on their own limit, and keep loading on idle polls instead of stopping after the first batch.
+- Store changes are tracked with a counter instead of a file timestamp, so two quick changes are never seen as one on filesystems with coarse timestamps.
+- Malformed sign-in replies fail with a clear error instead of a traceback, and tokens from sign-in are shape-checked like every other.
+- A refresh refused as wrong credentials (code 8002) means "sign in again", whatever its HTTP status.
+- `promarchyctl status` no longer presents a stopped daemon's last snapshot as current; `promarchyctl logout` with several accounts asks which one (or `--all`).
+- Credentials in `https_proxy` are sent to the proxy on CONNECT.
+- The unsaved-credentials warning has its own field, so `partial` means only that some accounts are not counted. Mark-as-read ignores IDs that are not a list; an evicted duplicate account forgets its notification watermark.
+
+## 0.1.0 (2026-10-16)
 
 First release.
 

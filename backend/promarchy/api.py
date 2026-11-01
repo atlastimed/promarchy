@@ -58,6 +58,9 @@ class RateLimited(ProtonError):
     def __init__(self, message: str, retry_after: int, **kw: Any) -> None:
         super().__init__(message, **kw)
         self.retry_after = retry_after
+        # Set when Proton throttled the session's own renewal: that limit
+        # applies to the whole account, whichever request needed the renewal.
+        self.during_refresh = False
 
 
 class AuthExpired(ProtonError):
@@ -219,13 +222,18 @@ class ProtonClient:
                     _retry_auth=False,
                 )
                 break
-            except (NetworkError, RateLimited):
+            except RateLimited as exc:
+                exc.during_refresh = True
+                raise
+            except NetworkError:
                 raise
             except ProtonError as exc:
                 # 409: the refresh raced another one server-side; retry once.
                 if exc.status == 409 and attempt == 0:
                     continue
-                if exc.status in (400, 401, 403, 422):
+                # Any refusal of the refresh token itself (including code
+                # 8002, whatever the HTTP status) means the session is over.
+                if exc.status in (400, 401, 403, 422) or isinstance(exc, WrongCredentials):
                     raise AuthExpired("Your Proton session expired. Sign in again.") from exc
                 raise
         try:

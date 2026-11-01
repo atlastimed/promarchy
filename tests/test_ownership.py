@@ -694,8 +694,9 @@ def test_tokens_kept_only_in_memory_are_shown(tmp_path):
     )
     daemon._persist_unsaved(force=True)
     state = daemon.snapshot()
-    assert state["status"] == "partial"
-    assert "not yet saved to the keyring" in state["message"]
+    # Its own field: "partial" stays reserved for accounts that are not counted.
+    assert state["status"] == "ok"
+    assert "not yet saved to the keyring" in state["warning"]
 
 
 # ------------------------------------------- final release review (P1, P2s)
@@ -775,4 +776,4 @@ def test_the_unsaved_warning_survives_going_offline(tmp_path):
     daemon.tick()
     state = daemon.snapshot()
     assert state["status"] == "offline"
-    assert "not yet saved to the keyring" in state["message"]
+    assert "not yet saved to the keyring" in state["warning"]

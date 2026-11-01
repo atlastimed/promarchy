@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Protocol
@@ -175,8 +176,19 @@ class SessionStore:
             return None
 
     def generation(self) -> int:
-        """Changes whenever an account is added, removed or re-authenticated."""
+        """Changes whenever an account is added, removed or re-authenticated.
+
+        A counter kept inside the stamp file rather than its timestamp: on a
+        filesystem with coarse timestamps, two changes within one tick would
+        otherwise look like one, and the bar would miss the second.
+        """
         try:
+            text = self._stamp.read_text().strip()
+        except OSError:
+            return 0
+        if text.isdigit():
+            return int(text)
+        try:  # an empty stamp from an older version: only its timestamp moves
             return self._stamp.stat().st_mtime_ns
         except OSError:
             return 0
@@ -224,10 +236,19 @@ class SessionStore:
             # every existing entry is still intact.
             try:
                 self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
+            except SaveIndeterminate:
+                # The helper may have stored it and died before saying so. If
+                # the keyring now holds this very session, finish registering
+                # it below; stopping here would leave it saved but unlisted.
+                if not self._holds(session):
+                    raise
+                log_error("saving a session (confirmed by reading it back)")
             except StoreUnavailable:
                 raise
             except Exception as exc:
-                raise SaveIndeterminate("the keyring may or may not hold the new session") from exc
+                if not self._holds(session):
+                    raise SaveIndeterminate("the keyring may or may not hold the new session") from exc
+                log_error("saving a session (confirmed by reading it back)", exc)
             # From here on the new session is saved: finish what we can and
             # report the rest, never raise as if nothing had happened.
             if previous is not None and previous.uid != session.uid:
@@ -257,6 +278,14 @@ class SessionStore:
                 log_error("updating the account list", exc)
                 self.index_failed = True
         return displaced
+
+    def _holds(self, session: Session) -> bool:
+        """True only if the keyring positively holds this exact session."""
+        try:
+            stored = self.load(session.email)
+        except Exception:
+            return False
+        return stored is not None and stored.to_dict() == session.to_dict()
 
     def update_tokens(self, session: Session) -> bool:
         """Persist rotated tokens, but only onto the same live session.
@@ -325,11 +354,10 @@ class SessionStore:
         write_private(self._index, json.dumps({"accounts": accounts}))
 
     def _bump(self) -> None:
-        fd = open_private(self._stamp)
-        try:
-            os.utime(fd)
-        finally:
-            os.close(fd)
+        # Strictly increasing, and never below the clock, so a value cannot
+        # repeat even after the stamp was deleted or written by an older version.
+        with self._locked():
+            write_private(self._stamp, str(max(self.generation() + 1, time.time_ns())))
 
 
 def _key(email: str) -> str:

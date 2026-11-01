@@ -3,6 +3,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -36,41 +37,63 @@ Panel {
     groupThreads: flag("groupThreads", true),
     notify: notifyEnabled,
     senderImages: flag("senderImages", true),
-    demo: flag("demo", false)
+    // true, or a sample state such as "offline" (see backend/promarchy/demo.py)
+    demo: String(setting("demo", "false"))
   })
 
   // ---- state -----------------------------------------------------------------
   readonly property string status: mail ? mail.status : "starting"
+  readonly property string warning: mail ? mail.warning : ""
+  readonly property bool demo: mail ? mail.demo : false
   readonly property var counts: mail ? mail.counts : ({})
   readonly property bool capped: mail ? mail.capped : false
   readonly property var messages: mail ? mail.messages : []
+  readonly property var accounts: mail ? mail.accounts : []
   readonly property bool signedIn: mail ? mail.signedIn : false
   readonly property int badgeCount: Model.countFor(counts, countWindow)
   readonly property int headerCount: Model.countFor(counts, headerWindow)
   // "partial": some accounts work and some do not; counts are still shown.
   readonly property bool healthy: status === "ok" || status === "partial"
+  // Counts from an earlier sync: shown, but not as if they were current.
+  readonly property bool stale: status === "offline" || status === "error" || status === "auth-expired"
+  readonly property bool listEnabled: daemonConfig.recentLimit > 0
   readonly property bool needsSignIn: {
     if (status === "signed-out" || status === "auth-expired") return true
-    var list = mail ? mail.accounts : []
-    for (var i = 0; i < list.length; i++) if (list[i].status === "auth-expired") return true
+    for (var i = 0; i < accounts.length; i++) if (accounts[i].status === "auth-expired") return true
     return false
   }
   readonly property bool anyUnreadShown: {
     for (var i = 0; i < messages.length; i++) if (messages[i].unread) return true
     return false
   }
+  readonly property string accountLabel: accounts.length === 1 ? accounts[0].email
+    : accounts.length > 1 ? accounts.length + " accounts" : ""
 
   // ---- look --------------------------------------------------------------------
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color dim: Qt.darker(foreground, 1.55)
-  readonly property color highlight: bar ? bar.urgent : Color.urgent
+  // Panel text follows the bar's text colour, as first-party panels do; the
+  // secondary shade is derived against the popup's own background with a
+  // contrast floor (Qt.darker turns it unreadable on some themes and brighter
+  // than the main text on light ones).
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color surface: Commons.Color.popups.background
+  readonly property color dim: {
+    var c = Model.secondary(foreground, surface, 4.5, 0.4)
+    return Qt.rgba(c.r, c.g, c.b, 1)
+  }
+  readonly property color highlight: bar ? bar.urgent : Commons.Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property color barIconColor: healthy || status === "starting" ? barForeground : Qt.darker(barForeground, 1.6)
+  readonly property color barDim: {
+    var c = Model.secondary(barForeground, Commons.Color.bar.background, 3.0, 0.45)
+    return Qt.rgba(c.r, c.g, c.b, 1)
+  }
+  readonly property color barIconColor: healthy || status === "starting" ? barForeground : barDim
+  readonly property string statusMark: Model.statusMark(status, warning)
 
   // ---- cursor ------------------------------------------------------------------
   property int cursorIndex: 0
   property bool cursorActive: false
   property real now: Date.now()
+  property bool accountsOpen: false
   property bool confirmSignOut: false
 
   implicitWidth: button.implicitWidth
@@ -94,10 +117,13 @@ Panel {
     now = Date.now()
     cursorActive = false
     cursorIndex = 0
+    accountsOpen = false
+    confirmSignOut = false
     if (flick) flick.contentY = 0
     if (mail) mail.poll()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
+  onAccountsOpenChanged: if (!accountsOpen) confirmSignOut = false
 
   // The service can appear after the widget (plugin rescans, hot reloads).
   Timer {
@@ -113,12 +139,6 @@ Panel {
     repeat: true
     running: root.opened
     onTriggered: root.now = Date.now()
-  }
-
-  Timer {
-    id: signOutTimer
-    interval: 4000
-    onTriggered: root.confirmSignOut = false
   }
 
   // ---- actions -----------------------------------------------------------------
@@ -162,6 +182,18 @@ Panel {
       mail.markRead(message.account, message.unreadIds, message.kind)
   }
 
+  // A row action needs a row the user can see: the first press only shows
+  // the cursor, the next one acts on it.
+  function markSelectedRead() {
+    if (messages.length === 0) return
+    if (!cursorActive) {
+      cursorActive = true
+      scrollCursorIntoView()
+      return
+    }
+    markRead(selectedMessage())
+  }
+
   function markAllRead() {
     if (!mail) return
     var groups = {}
@@ -192,6 +224,7 @@ Panel {
     if (messages.length === 0) return
     if (!cursorActive) {
       cursorActive = true
+      scrollCursorIntoView()
       return
     }
     cursorIndex = Math.max(0, Math.min(messages.length - 1, cursorIndex + dy))
@@ -211,7 +244,7 @@ Panel {
   function handleKey(text) {
     switch (text) {
     case "r": if (mail) mail.refresh(); break
-    case "m": markRead(selectedMessage()); break
+    case "m": markSelectedRead(); break
     case "a": markAllRead(); break
     case "o": openInbox(); break
     case "c": compose(); break
@@ -224,9 +257,9 @@ Panel {
   }
 
   function scrollCursorIntoView() {
-    var item = rows.itemAt(cursorIndex)
-    if (!item || !flick) return
     Qt.callLater(function() {
+      var item = rows.itemAt(cursorIndex)
+      if (!item || !flick) return
       var point = item.mapToItem(flick.contentItem, 0, 0)
       var margin = Style.space(6)
       var maxY = Math.max(0, flick.contentHeight - flick.height)
@@ -245,7 +278,7 @@ Panel {
     hasVisualContent: true
     fixedWidth: root.vertical ? -1 : badgeLayout.implicitWidth + Style.space(14)
     fixedHeight: root.vertical ? badgeLayout.implicitHeight + Style.space(12) : -1
-    tooltipText: root.opened ? "" : Model.tooltip(root.status, root.badgeCount, root.countWindow, root.capped)
+    tooltipText: root.opened ? "" : Model.tooltip(root.status, root.badgeCount, root.countWindow, root.capped, root.warning)
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.openInbox()
@@ -256,7 +289,7 @@ Panel {
     Grid {
       id: badgeLayout
       anchors.centerIn: parent
-      columns: root.vertical ? 1 : 2
+      columns: root.vertical ? 1 : 3
       columnSpacing: Style.space(4)
       rowSpacing: Style.space(1)
       horizontalItemAlignment: Grid.AlignHCenter
@@ -264,7 +297,9 @@ Panel {
 
       ProtonMark {
         size: Style.bar.iconCanvas - 1
-        color: root.badgeCount > 0 ? root.highlight : root.barIconColor
+        // Unread mail takes the bar's attention colour only while the count
+        // is current; stale counts keep their shape but step back.
+        color: root.badgeCount > 0 && !root.stale ? root.highlight : root.barIconColor
         filled: root.badgeCount > 0
 
         Behavior on color {
@@ -277,10 +312,21 @@ Panel {
         textFormat: Text.PlainText
         visible: text !== ""
         text: Model.badgeText(root.badgeCount)
-        color: root.highlight
+        color: root.stale ? root.barDim : root.highlight
         font.family: root.fontFamily
         font.pixelSize: root.vertical ? Style.font.caption : Style.font.bodySmall
         font.bold: true
+      }
+
+      // Offline, needs attention, or a sign-in not yet saved: visible without
+      // opening the panel, and not by colour alone.
+      Text {
+        textFormat: Text.PlainText
+        visible: text !== ""
+        text: root.statusMark
+        color: root.status === "offline" ? root.barDim : root.highlight
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
       }
     }
   }
@@ -294,7 +340,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(400))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(640))
+    contentHeight: panel.fittedContentHeight(layout.implicitHeight, Style.space(680))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -302,162 +348,183 @@ Panel {
       onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
       onActivateRequested: root.activateCursor()
       onCloseRequested: root.close()
-      onDeleteRequested: root.markRead(root.selectedMessage())
+      onDeleteRequested: root.markSelectedRead()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) { root.handleKey(t) }
 
-      Flickable {
-        id: flick
+      // Header and footer stay put; only the list scrolls.
+      ColumnLayout {
+        id: layout
         anchors.fill: parent
-        contentWidth: width
-        contentHeight: column.implicitHeight
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
-        flickableDirection: Flickable.VerticalFlick
-        interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        spacing: Style.space(12)
 
-        Column {
-          id: column
-          width: flick.width
-          spacing: Style.space(12)
-
-          PanelHero {
-            id: hero
-            width: parent.width
-            title: "Proton Mail"
-            meta: root.signedIn && root.healthy
-              ? Model.headline(root.headerCount, root.headerWindow, root.capped)
-              : Model.statusLine(root.status, root.mail ? root.mail.message : "")
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            iconComponent: Component {
-              ProtonMark {
-                size: Style.font.display
-                color: root.foreground
-                filled: root.headerCount > 0
-              }
-            }
-            trailingControl: Component {
-              Button {
-                visible: root.signedIn
-                iconText: "󰑐"
-                tooltipText: "Refresh (r)"
-                iconSpinning: root.mail ? root.mail.syncing : false
-                foreground: hero.foreground
-                fontFamily: hero.fontFamily
-                horizontalPadding: Style.spacing.sm
-                verticalPadding: Style.spacing.sm
-                onClicked: if (root.mail) root.mail.refresh()
-              }
+        PanelHero {
+          id: hero
+          Layout.fillWidth: true
+          title: "Proton Mail"
+          meta: root.signedIn && root.healthy
+            ? Model.headline(root.headerCount, root.headerWindow, root.capped)
+            : Model.statusLine(root.status, root.mail ? root.mail.message : "")
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          iconComponent: Component {
+            ProtonMark {
+              size: Style.font.display
+              color: root.foreground
+              filled: root.headerCount > 0
             }
           }
+          trailingControl: Component {
+            Button {
+              visible: root.signedIn
+              iconText: "󰑐"
+              tooltipText: "Refresh (r)"
+              iconSpinning: root.mail ? root.mail.syncing : false
+              foreground: hero.foreground
+              fontFamily: hero.fontFamily
+              horizontalPadding: Style.spacing.sm
+              verticalPadding: Style.spacing.sm
+              onClicked: if (root.mail) root.mail.refresh()
+            }
+          }
+        }
 
-          RowLayout {
-            visible: root.signedIn
-            width: parent.width
+        // The count window: what the badge and headline count. The list
+        // below always shows the most recent inbox mail.
+        RowLayout {
+          visible: root.signedIn
+          Layout.fillWidth: true
+          spacing: Style.space(8)
+
+          Text {
+            textFormat: Text.PlainText
+            text: root.countWindow === "off" ? "Badge off" : "Unread from"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          ButtonGroup {
+            options: [
+              { value: "1h", label: "1h", tooltip: "Count unread mail from the last hour (1)" },
+              { value: "24h", label: "24h", tooltip: "Count unread mail from the last 24 hours (2)" },
+              { value: "7d", label: "7d", tooltip: "Count unread mail from the last 7 days (3)" },
+              { value: "all", label: "All", tooltip: "Count all unread mail in the inbox (4)" }
+            ]
+            value: root.countWindow
+            focusable: false
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onChanged: function(v) { root.setWindow(v) }
+          }
+
+          Text {
+            Layout.fillWidth: true
+            textFormat: Text.PlainText
+            horizontalAlignment: Text.AlignRight
+            text: root.accountLabel
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideMiddle
+          }
+        }
+
+        // Sign-in, expired session, offline and error states, plus anything
+        // the backend reported that the user can act on.
+        CursorSurface {
+          id: notice
+          readonly property bool needsSignIn: root.needsSignIn
+          readonly property string text: Model.noticeText(root.status, root.mail ? root.mail.message : "", root.warning)
+          visible: text !== ""
+          Layout.fillWidth: true
+          implicitHeight: noticeColumn.implicitHeight + Style.spacing.rowPaddingX * 2
+          foreground: root.foreground
+          bordered: true
+
+          Column {
+            id: noticeColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.margins: Style.spacing.rowPaddingX
             spacing: Style.space(10)
 
-            ButtonGroup {
-              options: [
-                { value: "1h", label: "1h", tooltip: "Unread from the last hour (1)" },
-                { value: "24h", label: "24h", tooltip: "Unread from the last 24 hours (2)" },
-                { value: "7d", label: "7d", tooltip: "Unread from the last 7 days (3)" },
-                { value: "all", label: "All", tooltip: "All unread in the inbox (4)" }
-              ]
-              value: root.countWindow
-              focusable: false
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              wrapMode: Text.WordWrap
+              lineHeight: 1.1
+              color: root.status === "error" || root.status === "partial" || root.warning !== "" ? root.highlight : root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              text: notice.text
+            }
+
+            Button {
+              visible: notice.needsSignIn || root.status === "error"
+              text: notice.needsSignIn ? "Sign in" : "Retry"
+              iconText: notice.needsSignIn ? "󰍂" : "󰑐"
+              bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              onChanged: function(v) { root.setWindow(v) }
-            }
-
-            Text {
-              Layout.fillWidth: true
-              textFormat: Text.PlainText
-              horizontalAlignment: Text.AlignRight
-              text: !root.mail ? "" : (root.mail.accounts.length === 1 ? root.mail.accounts[0].email
-                : root.mail.accounts.length + " accounts")
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              elide: Text.ElideLeft
-            }
-          }
-
-          // Sign-in, expired session, offline and error states.
-          CursorSurface {
-            id: notice
-            readonly property bool needsSignIn: root.needsSignIn
-            visible: (!root.healthy && root.status !== "starting") || root.status === "partial"
-              || (root.mail ? root.mail.message !== "" && root.healthy : false)
-            width: parent.width
-            implicitHeight: noticeColumn.implicitHeight + Style.spacing.rowPaddingX * 2
-            foreground: root.foreground
-            bordered: true
-
-            Column {
-              id: noticeColumn
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              anchors.margins: Style.spacing.rowPaddingX
-              spacing: Style.space(10)
-
-              Text {
-                textFormat: Text.PlainText
-                width: parent.width
-                wrapMode: Text.WordWrap
-                color: root.status === "error" || root.status === "partial" ? root.highlight : root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                text: {
-                  if (root.status === "signed-out")
-                    return "Sign in to see new mail here. Your password is only used on this machine for Proton's SRP handshake; the session is kept in your keyring."
-                  if (root.status === "auth-expired") return "Your Proton session ended. Sign in again to keep mail flowing."
-                  if (root.status === "offline") return "Offline. Showing the last mail Promarchy saw; it will catch up on its own."
-                  if (root.status === "partial") return "Not every account is working, so totals are incomplete. " + (root.mail ? root.mail.message : "")
-                  return root.mail ? root.mail.message : ""
-                }
-              }
-
-              Button {
-                visible: notice.needsSignIn || root.status === "error"
-                text: notice.needsSignIn ? "Sign in" : "Retry"
-                iconText: notice.needsSignIn ? "󰍂" : "󰑐"
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: {
-                  if (!root.mail) return
-                  if (notice.needsSignIn) {
-                    root.mail.signIn()
-                    root.close()
-                  } else {
-                    root.mail.refresh()
-                  }
+              onClicked: {
+                if (!root.mail) return
+                if (notice.needsSignIn) {
+                  root.mail.signIn()
+                  root.close()
+                } else {
+                  root.mail.refresh()
                 }
               }
             }
           }
+        }
 
-          PanelSeparator {
-            visible: root.signedIn
-            foreground: root.foreground
-          }
+        PanelSeparator {
+          visible: root.signedIn && root.listEnabled
+          Layout.fillWidth: true
+          foreground: root.foreground
+        }
 
-          PanelSectionHeader {
-            visible: root.signedIn
-            text: root.messages.length > 0 ? "RECENT" : "RECENT · NOTHING YET"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-          }
+        PanelSectionHeader {
+          visible: root.signedIn && root.listEnabled
+          Layout.fillWidth: true
+          text: "RECENT INBOX"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        Text {
+          visible: root.signedIn && root.listEnabled && root.messages.length === 0
+          Layout.fillWidth: true
+          textFormat: Text.PlainText
+          wrapMode: Text.WordWrap
+          text: Model.emptyText(root.status, root.daemonConfig.recentLimit)
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Flickable {
+          id: flick
+          visible: root.signedIn && root.listEnabled && root.messages.length > 0
+          Layout.fillWidth: true
+          Layout.fillHeight: true
+          Layout.preferredHeight: rowColumn.implicitHeight
+          Layout.minimumHeight: Math.min(rowColumn.implicitHeight, Style.space(120))
+          contentWidth: width
+          contentHeight: rowColumn.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          flickableDirection: Flickable.VerticalFlick
+          interactive: contentHeight > height
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
           Column {
             id: rowColumn
-            visible: root.signedIn && root.messages.length > 0
-            width: parent.width
+            width: flick.width
             spacing: Style.space(2)
 
             Repeater {
@@ -473,85 +540,216 @@ Panel {
               }
             }
           }
+        }
+
+        // Account maintenance, kept apart from everyday mail actions.
+        Column {
+          id: accountSection
+          visible: root.signedIn && root.accountsOpen
+          Layout.fillWidth: true
+          spacing: Style.space(8)
 
           PanelSeparator {
-            visible: root.signedIn
+            width: parent.width
             foreground: root.foreground
           }
 
+          PanelSectionHeader {
+            width: parent.width
+            text: root.accounts.length > 1 ? "ACCOUNTS" : "ACCOUNT"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          Repeater {
+            model: root.accounts
+
+            RowLayout {
+              required property var modelData
+              width: accountSection.width
+              spacing: Style.space(8)
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: modelData.email
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideMiddle
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: Model.accountState(modelData.status)
+                color: modelData.status === "ok" || modelData.status === "starting" ? root.dim : root.highlight
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          Text {
+            visible: root.demo
+            width: parent.width
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            text: "Demo mode shows sample mail, so account actions are off here."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
           RowLayout {
-            visible: root.signedIn
+            visible: !root.demo && !root.confirmSignOut
             width: parent.width
             spacing: Style.space(6)
 
             Button {
-              text: "Inbox"
-              iconText: "󰚇"
-              tooltipText: "Open Proton Mail (o)"
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              onClicked: root.openInbox()
-            }
-
-            Button {
-              text: "Compose"
-              iconText: "󰏫"
-              tooltipText: "New message (c)"
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              onClicked: root.compose()
-            }
-
-            Item { Layout.fillWidth: true }
-
-            PanelActionButton {
-              visible: root.anyUnreadShown
-              iconText: "󰄭"
-              tooltipText: "Mark these as read (a)"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: root.markAllRead()
-            }
-
-            PanelActionButton {
-              iconText: root.notifyEnabled ? "󰂚" : "󰂛"
-              tooltipText: root.notifyEnabled ? "Notifications on (n)" : "Notifications paused (n)"
-              foreground: root.notifyEnabled ? root.foreground : root.dim
-              fontFamily: root.fontFamily
-              onClicked: root.persist({ notify: !root.notifyEnabled })
-            }
-
-            PanelActionButton {
+              text: "Add account"
               iconText: "󰀔"
-              tooltipText: "Add another Proton account"
+              tooltipText: "Sign in to another Proton account"
+              bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
               onClicked: {
                 if (root.mail) root.mail.signIn()
                 root.close()
               }
             }
 
-            // Signing back in may need a CAPTCHA, so ask for a second click.
-            PanelActionButton {
+            Item { Layout.fillWidth: true }
+
+            Button {
+              text: root.accounts.length > 1 ? "Sign out of all" : "Sign out"
               iconText: "󰍃"
-              tooltipText: root.confirmSignOut ? "Click again to sign out of every account" : "Sign out"
-              foreground: root.confirmSignOut ? root.highlight : root.foreground
+              bordered: true
+              foreground: root.foreground
               fontFamily: root.fontFamily
-              onClicked: {
-                if (!root.confirmSignOut) {
-                  root.confirmSignOut = true
-                  signOutTimer.restart()
-                  return
+              fontSize: Style.font.bodySmall
+              onClicked: root.confirmSignOut = true
+            }
+          }
+
+          // Signing back in may need a CAPTCHA, so the scope is spelled out
+          // and there is a plain way back.
+          Column {
+            visible: !root.demo && root.confirmSignOut
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: Model.signOutQuestion(root.accounts.length)
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: "Signing back in needs your password and 2FA code, and Proton may ask for a browser check."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Row {
+              spacing: Style.space(6)
+
+              Button {
+                text: "Sign out"
+                iconText: "󰍃"
+                bordered: true
+                foreground: root.highlight
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onClicked: {
+                  root.confirmSignOut = false
+                  root.accountsOpen = false
+                  if (root.mail) root.mail.signOut()
                 }
-                root.confirmSignOut = false
-                if (root.mail) root.mail.signOut()
+              }
+
+              Button {
+                text: "Cancel"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onClicked: root.confirmSignOut = false
               }
             }
+          }
+        }
+
+        PanelSeparator {
+          visible: root.signedIn
+          Layout.fillWidth: true
+          foreground: root.foreground
+        }
+
+        RowLayout {
+          visible: root.signedIn
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+
+          Button {
+            text: "Inbox"
+            iconText: "󰚇"
+            tooltipText: "Open Proton Mail (o)"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.openInbox()
+          }
+
+          Button {
+            text: "Compose"
+            iconText: "󰏫"
+            tooltipText: "New message (c)"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.compose()
+          }
+
+          Item { Layout.fillWidth: true }
+
+          PanelActionButton {
+            visible: root.anyUnreadShown
+            iconText: "󰄭"
+            tooltipText: "Mark these as read (a)"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.markAllRead()
+          }
+
+          PanelActionButton {
+            iconText: root.notifyEnabled ? "󰂚" : "󰂛"
+            tooltipText: root.notifyEnabled ? "Notifications on (n)" : "Notifications paused (n)"
+            foreground: root.notifyEnabled ? root.foreground : root.dim
+            fontFamily: root.fontFamily
+            onClicked: root.persist({ notify: !root.notifyEnabled })
+          }
+
+          Button {
+            iconText: "󰀄"
+            tooltipText: root.accountsOpen ? "Hide accounts" : "Accounts: add another, sign out"
+            selected: root.accountsOpen
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            horizontalPadding: Style.spacing.sm
+            verticalPadding: Style.spacing.sm
+            onClicked: root.accountsOpen = !root.accountsOpen
           }
         }
       }
@@ -564,12 +762,19 @@ Panel {
     property var message: ({})
     property int rowIndex: 0
     readonly property bool unread: message.unread === true
+    readonly property string senderLine: {
+      var name = message.senderName || ""
+      var address = message.senderAddress || ""
+      if (name && address && name !== address) return name + " <" + address + ">"
+      return name || address || "Unknown sender"
+    }
 
     hasCursor: root.cursorActive && root.cursorIndex === rowIndex
     foreground: root.foreground
     implicitHeight: rowContent.implicitHeight + Style.space(14)
 
     MouseArea {
+      id: rowMouse
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
@@ -579,6 +784,15 @@ Panel {
         if (mouse.button === Qt.MiddleButton) root.markRead(row.message)
         else root.openMessage(row.message)
       }
+    }
+
+    // The full sender, address and subject, which the row may elide;
+    // wrapped to the panel's width (the shared tooltip does not wrap).
+    PanelToolTip {
+      visible: rowMouse.containsMouse
+      text: Model.wrapLines(row.senderLine + "\n" + (row.message.subject || "(no subject)")
+        + (root.mail && root.mail.multiAccount ? "\n" + String(row.message.account || "") : ""), 46)
+      fontFamily: root.fontFamily
     }
 
     RowLayout {
@@ -664,13 +878,16 @@ Panel {
             font.pixelSize: Style.font.bodySmall
           }
 
+          // Which account, kept short so it never crowds out the subject.
           Text {
             textFormat: Text.PlainText
             visible: root.mail ? root.mail.multiAccount : false
+            Layout.maximumWidth: Style.space(84)
             text: String(row.message.account || "").split("@")[0]
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
           }
         }
       }
@@ -710,13 +927,15 @@ Panel {
     implicitWidth: Style.space(30)
     implicitHeight: Style.space(30)
 
-    // Proton serves brand logos for light backgrounds (as its web app shows
-    // them), so a logo gets a light tile; otherwise a themed initial.
+    // Proton serves brand logos for light backgrounds (many are opaque with
+    // their own white), so a logo sits on a plain white tile; otherwise a
+    // themed initial. Both share the control border, and corners follow the
+    // theme's radius rather than snapping to a circle.
     BorderSurface {
       anchors.fill: parent
-      radius: Style.cornerRadius > 0 ? width / 2 : 0
-      color: logo.status === Image.Ready ? "#f4f4f5" : Style.normalFillFor(root.foreground, Color.accent)
-      borderSpec: logo.status === Image.Ready ? Border.none() : Border.controlSpec("normal", root.foreground, Color.accent)
+      radius: Math.min(Style.cornerRadius, width / 2)
+      color: logo.status === Image.Ready ? "#ffffff" : Style.normalFillFor(root.foreground, Commons.Color.accent)
+      borderSpec: Border.controlSpec("normal", root.foreground, Commons.Color.accent)
     }
 
     Text {
@@ -733,12 +952,13 @@ Panel {
     Image {
       id: logo
       anchors.fill: parent
-      anchors.margins: Style.space(5)
+      anchors.margins: Style.space(4)
       source: avatar.source
       visible: status === Image.Ready
       asynchronous: true
       cache: true
       smooth: true
+      mipmap: true
       fillMode: Image.PreserveAspectFit
       sourceSize.width: 64
       sourceSize.height: 64

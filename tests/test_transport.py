@@ -41,8 +41,9 @@ class FakeConnection:
         self.tunnel = None
         FakeConnection.instances.append(self)
 
-    def set_tunnel(self, host, port):
+    def set_tunnel(self, host, port, headers=None):
         self.tunnel = (host, port)
+        self.tunnel_headers = headers
 
     def request(self, method, path, body=None, headers=None):
         self.sent.append((method, path, body, headers))
@@ -143,6 +144,19 @@ def test_https_proxy_is_tunnelled(monkeypatch):
     HttpTransport().request("GET", "https://mail-api.proton.me/a")
     conn = FakeConnection.instances[0]
     assert (conn.host, conn.port, conn.tunnel) == ("proxy.lan", 3128, ("mail-api.proton.me", 443))
+
+
+def test_proxy_credentials_go_to_the_proxy_only(monkeypatch):
+    import base64
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://me%40corp:p%3Ass@proxy.lan:3128")
+    FakeConnection.script = [FakeResponse()]
+    HttpTransport().request("GET", "https://mail-api.proton.me/a")
+    conn = FakeConnection.instances[0]
+    assert (conn.host, conn.port) == ("proxy.lan", 3128)
+    expected = "Basic " + base64.b64encode(b"me@corp:p:ss").decode()
+    assert conn.tunnel_headers == {"Proxy-Authorization": expected}
+    assert all("Proxy-Authorization" not in (h or {}) for _, _, _, h in conn.sent)
 
 
 def test_no_proxy_is_honoured(monkeypatch):

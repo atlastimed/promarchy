@@ -37,7 +37,7 @@ from . import control, sessions
 from .api import AuthExpired, NetworkError, ProtonClient, ProtonError, RateLimited, Session
 from .auth import REJECTED, REVOKED, UNCONFIRMED, end_session
 from .avatars import Avatars
-from .demo import demo_state
+from .demo import demo_state, variant
 from .log import log_error
 from .mailbox import WEB_BASE, Mailbox, parse_categories
 from .notify import Notifier, Watermarks, select_new
@@ -81,6 +81,7 @@ class Config:
     notify: bool = True
     sender_images: bool = True
     demo: bool = False
+    demo_kind: str = "ok"
 
     @classmethod
     def from_dict(cls, data: dict) -> Config:
@@ -93,6 +94,7 @@ class Config:
             notify=_flag(data.get("notify"), base.notify),
             sender_images=_flag(data.get("senderImages"), base.sender_images),
             demo=_flag(data.get("demo"), False),
+            demo_kind=variant(data.get("demo")),
         )
 
 
@@ -383,12 +385,18 @@ class Daemon:
             for account in self.accounts.values():
                 if account.status != "auth-expired":
                     account.next_poll = max(account.rate_limited_until, account.backoff_until)
+        elif name in ("logout", "markRead") and self.config.demo:
+            # The sample inbox is not the real one: never act on real accounts
+            # from it. (`promarchyctl logout` still works, through its socket.)
+            self._set_notice("Demo mode: nothing was changed. Turn demo off to manage your accounts.")
+            self._force_emit = True
         elif name == "logout":
             # From the bar's own Sign out button: every account.
             self._logout(None, local=command.get("local") is True)
         elif name == "markRead":
             kind = "conversation" if command.get("kind") == "conversation" else "message"
-            self._mark_read(str(command.get("account") or ""), command.get("ids") or [], kind)
+            ids = command.get("ids")
+            self._mark_read(str(command.get("account") or ""), ids if isinstance(ids, list) else [], kind)
 
     def _configure(self, config: Config) -> None:
         old = self.config
@@ -620,6 +628,12 @@ class Daemon:
                 if session.created_at <= self.accounts[twin].client.session.created_at:
                     continue
                 self.accounts.pop(twin).client.close()
+                # Unlike a removed account, the twin is still listed: its own
+                # renewed tokens stay queued for its own keyring entry.
+                try:
+                    self.watermarks.forget(twin)
+                except OSError as exc:
+                    log_error("forgetting a watermark", exc)
             if current:
                 current.client.close()
             self.unsaved.pop(email, None)
@@ -691,7 +705,7 @@ class Daemon:
         force = account.extra.pop("force", False)
         try:
             if force and account.mailbox.synced:
-                account.mailbox.resync()
+                account.mailbox.resync(reload_settings=True)
                 changed = True
             else:
                 changed = account.mailbox.poll()
@@ -709,6 +723,13 @@ class Daemon:
         account.next_poll = self.mono() + self.config.poll_seconds
         if changed:
             self._after_sync(account)
+        elif (
+            self.config.sender_images
+            and account.mailbox.recent
+            and self.avatars.pending(account.mailbox.recent)
+            and self._attach_logos(account)
+        ):
+            self.emit()  # the next batch of logos, without waiting for new mail
 
     def _record_failure(self, account: Account, exc: ProtonError) -> None:
         now = self.mono()
@@ -769,19 +790,30 @@ class Daemon:
             log_error("saving the notification watermark", exc)
         if self.config.sender_images and mailbox.recent:
             self.emit()  # show the list now; logos follow
-            try:
-                self.avatars.attach(mailbox.recent, account.client)
-            except ProtonError:
-                pass
-            except Exception as exc:  # logos are decoration; never let them stop mail
-                log_error("fetching sender logos", exc)
+            self._attach_logos(account)
+
+    def _attach_logos(self, account: Account) -> bool:
+        """Fetch a bounded batch of logos for the shown rows. True if any changed."""
+        try:
+            return self.avatars.attach(account.mailbox.recent, account.client)
+        except (AuthExpired, RateLimited) as exc:
+            # A renewal triggered by a logo request: the account's gate must hear it.
+            self._record_failure(account, exc)
+        except ProtonError:
+            pass
+        except Exception as exc:  # logos are decoration; never let them stop mail
+            log_error("fetching sender logos", exc)
+        return False
 
     # ----------------------------------------------------------------- state
 
     def snapshot(self) -> dict:
         now = int(self.clock())
         if self.config.demo:
-            return demo_state(self.demo_anchor or now, self.config.recent_limit)
+            state = demo_state(self.demo_anchor or now, self.config.recent_limit, self.config.demo_kind)
+            if self.notice and self.mono() < self.notice_until:
+                state["message"] = self.notice
+            return state
         totals = {"1h": 0, "24h": 0, "7d": 0, "all": 0}
         rows: list[dict] = []
         accounts = []
@@ -818,22 +850,23 @@ class Daemon:
         rows.sort(key=lambda r: r["time"], reverse=True)
         rows = rows[: self.config.recent_limit]
         status, message = self._overall_status(accounts, synced_any)
+        warning = ""
         if self.unsaved and self.unsaved_failures:
             # Working, but only in memory: say so whatever else is going on,
-            # until the keyring takes it.
+            # until the keyring takes it. Kept apart from "partial", which
+            # means some accounts are not counted.
             warning = " ".join(
                 f"{email}: renewed sign-in not yet saved to the keyring (is it locked?); retrying."
                 " Until then, restarting Promarchy would sign you out."
                 for email in self.unsaved
             )
-            status = "partial" if status == "ok" else status
-            message = f"{message}; {warning}" if message else warning
         if self.notice and self.mono() < self.notice_until:
             message = f"{self.notice} {message}".strip()
         return {
             "type": "state",
             "status": status,
             "message": message,
+            "warning": warning,
             "accounts": accounts,
             "counts": totals,
             "capped": capped,
@@ -847,7 +880,8 @@ class Daemon:
         if self.store_error and not loaded:
             return "error", self.store_error
         if not accounts:
-            return "signed-out", self._last_login_failure() or "Sign in to see your mail"
+            # The widget says how to sign in; the message carries only specifics.
+            return "signed-out", self._last_login_failure()
         problems = [a for a in accounts if a["status"] not in ("ok", "starting")]
         statuses = {a["status"] for a in accounts}
         if "ok" in statuses and synced_any:
@@ -864,7 +898,7 @@ class Daemon:
                     f"Could not find the saved session for {first['email']}. "
                     "If your keyring is locked, unlock it; otherwise sign in again."
                 )
-            return "auth-expired", "Your Proton session expired. Sign in again."
+            return "auth-expired", ""
         if "offline" in statuses:
             return "offline", next(a["error"] for a in accounts if a["status"] == "offline")
         if "error" in statuses:

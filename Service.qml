@@ -14,6 +14,10 @@ Item {
   // ---- state mirrored from the daemon -----------------------------------
   property string status: "starting"
   property string message: ""
+  // Credentials working only in memory (not yet in the keyring).
+  property string warning: ""
+  // Sample data: account actions must not reach real accounts.
+  property bool demo: false
   property var accounts: []
   property var counts: ({ "1h": 0, "24h": 0, "7d": 0, "all": 0 })
   property bool capped: false
@@ -114,6 +118,8 @@ Item {
     if (!stableTimer.running && _restarts > 0) stableTimer.restart()
     status = String(state.status || "error")
     message = String(state.message || "")
+    warning = String(state.warning || "")
+    demo = state.demo === true
     accounts = Array.isArray(state.accounts) ? state.accounts : []
     counts = state.counts || counts
     capped = state.capped === true

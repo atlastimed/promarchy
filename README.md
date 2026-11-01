@@ -3,20 +3,20 @@
 Proton Mail in the [Omarchy](https://omarchy.org) bar: an unread count for the last hour, day or week, a dropdown of recent mail, and native desktop notifications.
 
 <p>
-  <img src="screenshots/bar.png" alt="Promarchy in the Omarchy bar showing 4 unread" width="330"><br>
-  <img src="screenshots/dropdown.png" alt="The Promarchy dropdown with recent mail" width="403">
+  <img src="screenshots/bar.png" alt="Promarchy in the Omarchy bar showing 4 unread" width="220"><br>
+  <img src="screenshots/dropdown.png" alt="The Promarchy dropdown with recent mail" width="400">
 </p>
 
 *(Screenshots use the built-in demo mode, not a real inbox.)*
 
 ## Features
 
-- **Bar badge.** A Proton-style envelope with the number of unread inbox messages received in the **last hour, 24 hours or 7 days**, or all unread, or no number at all. Switch windows right in the dropdown (or press <kbd>1</kbd>–<kbd>4</kbd>), and the choice is saved to your bar settings.
-- **Recent mail dropdown.** Sender, subject and time; unread dots; sender logos; attachment and star markers; each conversation is one row with its exact message count (`×3`). Click a message to open it in Proton Mail; hover and click ✓ (or press <kbd>m</kbd>) to mark it read.
+- **Bar badge.** A Proton-style envelope with the number of unread inbox messages received in the **last hour, 24 hours or 7 days**, or all unread, or no number at all. Switch windows right in the dropdown (or press <kbd>1</kbd>–<kbd>4</kbd>), and the choice is saved to your bar settings. When Promarchy is offline or needs you (a session to renew, an account not counted, a sign-in not yet saved), a small mark appears beside the envelope and a count from an earlier sync steps back, so an old number never passes for a current one.
+- **Recent mail dropdown.** Sender, subject and time; unread dots; sender logos; attachment and star markers; each conversation is one row with its exact message count (`×3`). Hover a row for the full sender, address and subject. Click a message to open it in Proton Mail; hover and click ✓ (or press <kbd>m</kbd> on the selected row) to mark it read. Secondary text keeps a readable contrast in every theme, light ones included.
 - **Notifications.** New mail shows up as a regular Omarchy toast (theme, Do Not Disturb and history included). Clicking it opens the message. A burst of mail collapses into one summary, and after a long sleep you only catch up on the last hour.
 - **Inbox categories.** Count only *Primary*, or any mix of Proton's categories.
-- **Multiple accounts.** Sign in to more than one (the same Proton account under two addresses counts once); counts and lists merge, and if one account stops working the dropdown says so instead of quietly showing partial totals. Clicking a message opens Proton Mail in whichever account is active in your browser, so with several accounts switch to the right one there first (Proton's web links cannot pick the account).
-- **Keyboard driven.** Like Omarchy's own panels: arrows or <kbd>j</kbd>/<kbd>k</kbd>, <kbd>Enter</kbd> to open, <kbd>←</kbd>/<kbd>→</kbd> to switch window, <kbd>m</kbd>/<kbd>x</kbd> mark read, <kbd>a</kbd> mark all shown read, <kbd>r</kbd> refresh, <kbd>o</kbd> inbox, <kbd>c</kbd> compose, <kbd>n</kbd> toggle notifications, <kbd>Esc</kbd> close, <kbd>Tab</kbd> next panel.
+- **Multiple accounts.** Sign in to more than one (the same Proton account under two addresses counts once); counts and lists merge, and if one account stops working the dropdown says so instead of quietly showing partial totals. The accounts button in the dropdown's footer lists them and holds *Add account* and *Sign out*, which asks before ending every session. Clicking a message opens Proton Mail in whichever account is active in your browser, so with several accounts switch to the right one there first (Proton's web links cannot pick the account).
+- **Keyboard driven.** Like Omarchy's own panels: arrows or <kbd>j</kbd>/<kbd>k</kbd>, <kbd>Enter</kbd> to open, <kbd>←</kbd>/<kbd>→</kbd> to switch window, <kbd>m</kbd>/<kbd>x</kbd> mark the selected row read (the first press only shows which row), <kbd>a</kbd> mark all shown read, <kbd>r</kbd> refresh, <kbd>o</kbd> inbox, <kbd>c</kbd> compose, <kbd>n</kbd> toggle notifications, <kbd>Esc</kbd> close, <kbd>Tab</kbd> next panel.
 - **Light on resources.** About 30 MB of memory and a few milliseconds of CPU a minute. While idle it makes one small request per poll to Proton's event stream, and only re-reads mail when something changed. Window counts age out locally, so "last hour" stays current without extra requests (exact up to 750 unread messages in a week; beyond that the dropdown shows `750+`).
 
 ## How it works
@@ -68,7 +68,7 @@ omarchy bar set atlastimed.promarchy notify false
 | `pollSeconds` | `30` | How often to check Proton's event stream (10–900). |
 | `notify` | `true` | Desktop notifications for new mail. |
 | `categories` | `all` | `all`, or a comma list of `primary`, `social`, `promotions`, `updates`, `forums`, `newsletters`, `transactions`. Applies to the badge, list and notifications. |
-| `groupThreads` | `true` | Collapse a busy conversation into one row with a count. |
+| `groupThreads` | `true` | Collapse a busy conversation into one row with a count, while Proton itself groups by conversation. In Proton's single-message view the rows are messages, so every link opens. |
 | `senderImages` | `true` | Sender logos, fetched through Proton's own logo proxy (as the web app does) and cached. |
 | `openWith` | `browser` | Open mail in your default `browser`, or as a standalone `webapp` window. |
 
@@ -87,9 +87,9 @@ The backend doubles as a small CLI (`~/.config/omarchy/plugins/atlastimed.promar
 | Command | |
 |---|---|
 | `promarchyctl login [user]` | Sign in (another account if you already have one). |
-| `promarchyctl logout [email\|--all] [--local]` | End the session on Proton's side, then forget it here (`--local`: forget it even if Proton is unreachable). |
+| `promarchyctl logout [email\|--all] [--local]` | End the session on Proton's side, then forget it here (`--local`: forget it even if Proton is unreachable). With several accounts, name one or use `--all`. |
 | `promarchyctl accounts` | List signed-in accounts. |
-| `promarchyctl status [--json] [--window 24h]` | Print the bar's current counts, for scripts. |
+| `promarchyctl status [--json] [--window 24h]` | Print the bar's current counts, for scripts (it fails, rather than print old numbers, when the bar's background process is not running). |
 | `promarchyctl notify-test` | Show what a new-mail notification looks like. |
 
 ## Privacy and security
@@ -145,7 +145,7 @@ node --test tests/             # widget model tests
 scripts/check-plugin.sh        # Omarchy plugin contract + QML syntax
 ```
 
-`omarchy bar set atlastimed.promarchy demo true` swaps in sample data (no account or network), handy for screenshots and UI work. CI runs all of the above on Arch Linux.
+`omarchy bar set atlastimed.promarchy demo true` swaps in sample data (no account or network), handy for screenshots and UI work; account actions are off while it is on. Name a state instead of `true` to see it: `offline`, `expired`, `partial`, `warning`, `signed-out`, `empty`, `long` or `multi`. CI runs all of the above on Arch Linux.
 
 `python3 -I scripts/proton_probe.py [--roundtrip]` checks the parsers against the live API through your signed-in session and compares the bar's counts with an independent recount. It prints only shapes, numbers and aliases (never tokens, IDs, senders or subjects) and never renews the session; `--roundtrip` marks one single-message unread conversation read, watches the bar react, and restores it (also after Ctrl+C), exiting with status 3 and instructions if it cannot confirm the restore.
 

@@ -12,9 +12,10 @@ import base64
 import time
 from dataclasses import dataclass
 
-from .api import AuthExpired, ProtonClient, ProtonError, RateLimited, Session, WrongCredentials
+from .api import AuthExpired, ProtonClient, ProtonError, RateLimited, Session, WrongCredentials, checked_token
 from .paths import cache_dir
 
+UNEXPECTED_SIGN_IN = "Proton sent an unexpected sign-in response; try again in a moment"
 TWO_FACTOR_TOTP = 1
 TWO_FACTOR_FIDO2 = 2
 
@@ -90,15 +91,16 @@ def begin_login(
     """Run the SRP exchange. Raises WrongCredentials / HumanVerificationRequired."""
     User, _, _ = _proton_srp()
     info = client.call("POST", "/auth/v4/info", body={"Username": username}, auth=False)
-    modulus = verify_modulus(str(info["Modulus"]))
+    try:
+        modulus = verify_modulus(str(info["Modulus"]))
+        salt, ephemeral = base64.b64decode(info["Salt"]), base64.b64decode(info["ServerEphemeral"])
+        version, srp_session = int(info["Version"]), str(info["SRPSession"])
+    except (KeyError, TypeError, ValueError) as exc:  # binascii.Error is a ValueError
+        raise ProtonError(UNEXPECTED_SIGN_IN) from exc
 
     srp_user = User(password, modulus)
     challenge = srp_user.get_challenge()
-    proof = srp_user.process_challenge(
-        base64.b64decode(info["Salt"]),
-        base64.b64decode(info["ServerEphemeral"]),
-        int(info["Version"]),
-    )
+    proof = srp_user.process_challenge(salt, ephemeral, version)
     if proof is None:
         raise ProtonError("Proton sent an invalid SRP challenge")
 
@@ -106,25 +108,32 @@ def begin_login(
         "Username": username,
         "ClientEphemeral": base64.b64encode(challenge).decode(),
         "ClientProof": base64.b64encode(proof).decode(),
-        "SRPSession": info["SRPSession"],
+        "SRPSession": srp_session,
     }
     resp = client.call("POST", "/auth/v4", body=body, auth=False, headers=hv.headers() if hv else None)
 
+    try:
+        server_proof = base64.b64decode(resp.get("ServerProof") or b"")
+    except (TypeError, ValueError) as exc:
+        raise ProtonError(UNEXPECTED_SIGN_IN) from exc
     # Mutual authentication: make sure we are talking to the real server.
-    srp_user.verify_session(base64.b64decode(resp.get("ServerProof") or b""))
+    srp_user.verify_session(server_proof)
     if not srp_user.authenticated():
         raise ProtonError("Proton's server proof did not verify; refusing the session")
 
-    session = Session(
-        uid=str(resp["UID"]),
-        access_token=str(resp["AccessToken"]),
-        refresh_token=str(resp["RefreshToken"]),
-        user_id=str(resp.get("UserID") or ""),
-        scopes=[str(s) for s in resp.get("Scopes") or []],
-        created_at=time.time(),
-    )
-    two_factor = resp.get("2FA") or {}
-    return PendingLogin(session=session, two_factor=int(two_factor.get("Enabled") or 0))
+    try:
+        session = Session(
+            uid=checked_token(resp["UID"]),
+            access_token=checked_token(resp["AccessToken"]),
+            refresh_token=checked_token(resp["RefreshToken"]),
+            user_id=str(resp.get("UserID") or ""),
+            scopes=[str(s) for s in resp.get("Scopes") or []],
+            created_at=time.time(),
+        )
+        two_factor = int((resp.get("2FA") or {}).get("Enabled") or 0)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ProtonError(UNEXPECTED_SIGN_IN) from exc
+    return PendingLogin(session=session, two_factor=two_factor)
 
 
 def submit_totp(client: ProtonClient, code: str) -> bool:

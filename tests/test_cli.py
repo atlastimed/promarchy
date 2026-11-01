@@ -50,11 +50,36 @@ def test_login_outcome_is_recorded(monkeypatch, tmp_path):
     assert oct((tmp_path / "last-login.json").stat().st_mode & 0o777) == "0o600"
 
 
+def hold_daemon_lock():
+    """What a running bar does for its whole lifetime."""
+    import fcntl
+
+    from promarchy.paths import open_private, runtime_dir
+
+    fd = open_private(runtime_dir() / "daemon.lock")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
 def test_status_window(monkeypatch, tmp_path, capsys):
+    import os
+
     (tmp_path / "state.json").write_text(json.dumps({"status": "ok", "counts": {"24h": 4}}))
     monkeypatch.setattr(cli, "runtime_dir", lambda: tmp_path)
-    assert cli.main(["status", "--window", "24h"]) == 0
+    held = hold_daemon_lock()
+    try:
+        assert cli.main(["status", "--window", "24h"]) == 0
+    finally:
+        os.close(held)
     assert capsys.readouterr().out.strip() == "4"
+
+
+def test_status_never_presents_a_dead_daemons_snapshot_as_live(monkeypatch, tmp_path, capsys):
+    (tmp_path / "state.json").write_text(json.dumps({"status": "ok", "counts": {"24h": 4}}))
+    monkeypatch.setattr(cli, "runtime_dir", lambda: tmp_path)
+    assert cli.main(["status", "--window", "24h"]) == 1  # nobody holds the daemon lock
+    out = capsys.readouterr()
+    assert out.out == "" and "not running" in out.err
 
 
 def test_tests_never_see_the_real_runtime_dir():

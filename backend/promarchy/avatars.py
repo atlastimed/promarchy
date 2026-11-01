@@ -19,7 +19,7 @@ import hashlib
 import time
 from pathlib import Path
 
-from .api import ProtonClient, ProtonError, RateLimited
+from .api import AuthExpired, ProtonClient, ProtonError, RateLimited
 from .paths import cache_dir, ensure_private_dir, write_private
 
 HIT_TTL = 14 * 86400
@@ -63,6 +63,8 @@ class Avatars:
                 try:
                     found = self._fetch(address, client)
                 except RateLimited as exc:
+                    if exc.during_refresh:
+                        raise  # the session is throttled, not just its logos
                     self.paused_until = self.clock() + exc.retry_after
                     budget = 0
                     found = None
@@ -71,6 +73,15 @@ class Avatars:
                 row["avatar"] = path
                 changed = True
         return changed
+
+    def pending(self, rows: list[dict]) -> bool:
+        """True while a shown row still has a logo worth asking for."""
+        if self.clock() < self.paused_until:
+            return False
+        return any(
+            row.get("senderImage") and row.get("senderAddress") and self._cached(row["senderAddress"]) is None
+            for row in rows
+        )
 
     def prune(self) -> int:
         """Delete expired hits and misses, and anything that is not a raster
@@ -123,7 +134,7 @@ class Avatars:
                 params={"Address": address, "Size": 64, "Mode": self.mode, "Format": "png"},
                 max_bytes=MAX_BYTES,
             )
-        except RateLimited:
+        except (RateLimited, AuthExpired):
             raise
         except ProtonError:
             return False  # transient: try again on a later sync

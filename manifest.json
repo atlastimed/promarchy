@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "atlastimed.promarchy",
   "name": "Promarchy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "atlastimed",
   "license": "MIT",
   "description": "Proton Mail in the Omarchy bar: new-mail count, recent-mail dropdown and desktop notifications.",

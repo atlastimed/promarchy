@@ -5,4 +5,4 @@ reads one JSON state snapshot per line from its stdout. Everything that talks
 to Proton lives here; the QML side only renders state and forwards commands.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

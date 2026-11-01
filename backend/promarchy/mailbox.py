@@ -170,7 +170,6 @@ class Mailbox:
         self.event_id: str | None = None
         self.view_mode = 0
         self.unread_times: dict[str, int] = {}
-        self.window_total = 0
         self.window_complete = True
         self.unread_total = 0
         self.recent: list[dict] = []
@@ -197,8 +196,10 @@ class Mailbox:
             self._load_settings()
         self.resync()
 
-    def resync(self) -> None:
+    def resync(self, *, reload_settings: bool = False) -> None:
         self.dirty = True
+        if reload_settings:  # an explicit refresh also picks up Proton's settings
+            self._load_settings()
         now = int(self.clock())
         self._sync_unread_window(now)
         self._sync_recent()
@@ -223,6 +224,12 @@ class Mailbox:
                 self.full_sync()
                 return True
             self.event_id = str(event.get("EventID") or self.event_id)
+            settings = event.get("MailSettings")
+            if isinstance(settings, dict) and self._apply_settings(settings):
+                relevant = True  # rows and links follow Proton's view mode
+                self.dirty = True
+            if event.get("Refresh"):
+                self._load_settings()
             if event.get("Refresh") or self.event_is_relevant(event):
                 relevant = True
                 self.dirty = True
@@ -296,7 +303,9 @@ class Mailbox:
         if not row:
             return f"{WEB_BASE}/inbox"
         if row.get("kind") == "conversation":
-            return f"{WEB_BASE}/inbox/{row['id']}"
+            # Proton opens /inbox/<id> as a conversation only in conversation
+            # view; until the rows are rebuilt for message view, open the inbox.
+            return f"{WEB_BASE}/inbox/{row['id']}" if self.grouped else f"{WEB_BASE}/inbox"
         if self.view_mode == VIEW_MODE_MESSAGES or not row.get("conversationId"):
             return f"{WEB_BASE}/inbox/{row['id']}"
         return f"{WEB_BASE}/inbox/{row['conversationId']}/{row['id']}"
@@ -306,9 +315,27 @@ class Mailbox:
     def _load_settings(self) -> None:
         try:
             settings = self.client.call("GET", "/mail/v4/settings").get("MailSettings") or {}
-            self.view_mode = int(settings.get("ViewMode") or 0)
+        except (NetworkError, RateLimited, AuthExpired):
+            raise  # the account's own scheduling must see these
         except ProtonError:
-            self.view_mode = 0
+            return  # keep what we had; links fall back to the default view
+        self._apply_settings(settings)
+
+    def _apply_settings(self, settings: dict) -> bool:
+        """Take Proton's mail settings; True when the view mode changed."""
+        try:
+            mode = int(settings.get("ViewMode") or 0)
+        except (TypeError, ValueError):
+            return False
+        changed = mode != self.view_mode
+        self.view_mode = mode
+        return changed
+
+    @property
+    def grouped(self) -> bool:
+        """Rows are conversations only while Proton itself groups by
+        conversation: in single-message view its links take message IDs."""
+        return self.threads and self.view_mode != VIEW_MODE_MESSAGES
 
     def _sync_unread_window(self, now: int) -> None:
         base = label_params(self.categories) + [
@@ -342,7 +369,6 @@ class Mailbox:
             last = messages[-1]
             anchor = (int(last.get("Time") or 0), str(last["ID"]))
         self.unread_times = times
-        self.window_total = max(total, len(times))
         self.window_complete = len(times) >= total
         self.fresh = fresh
 
@@ -357,7 +383,7 @@ class Mailbox:
             ("Sort", "Time"),
             ("Desc", "1"),
         ]
-        if self.threads:
+        if self.grouped:
             resp = self.client.call("GET", "/mail/v4/conversations", params=params)
             items, build = resp.get("Conversations"), summarize_conversation
         else:

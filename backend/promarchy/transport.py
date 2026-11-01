@@ -8,6 +8,7 @@ are gzip-compressed on the wire, and every socket operation has a timeout.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json as jsonlib
 import os
@@ -15,7 +16,7 @@ import ssl
 import time
 import zlib
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 
 MAX_BODY = 16 * 1024 * 1024
 # Proton closes idle keep-alive connections; reconnecting before that point is
@@ -120,7 +121,8 @@ class HttpTransport:
                 conn = http.client.HTTPSConnection(
                     proxy[0], proxy[1], context=self._context, timeout=self.timeout
                 )
-                conn.set_tunnel(host, port)
+                # Credentials in the proxy URL go to the proxy only, on CONNECT.
+                conn.set_tunnel(host, port, headers=proxy[2] or None)
             else:
                 conn = http.client.HTTPSConnection(host, port, context=self._context, timeout=self.timeout)
             self._conn = conn
@@ -148,7 +150,7 @@ def gunzip_bounded(data: bytes, limit: int) -> bytes:
     return bytes(out)
 
 
-def _proxy_for(host: str) -> tuple[str, int] | None:
+def _proxy_for(host: str) -> tuple[str, int, dict[str, str]] | None:
     proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY") or ""
     if not proxy:
         return None
@@ -159,7 +161,11 @@ def _proxy_for(host: str) -> tuple[str, int] | None:
     parts = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
     if not parts.hostname:
         return None
-    return parts.hostname, parts.port or 8080
+    headers = {}
+    if parts.username is not None:
+        credentials = f"{unquote(parts.username)}:{unquote(parts.password or '')}"
+        headers["Proxy-Authorization"] = "Basic " + base64.b64encode(credentials.encode()).decode()
+    return parts.hostname, parts.port or 8080, headers
 
 
 def _describe(exc: BaseException) -> str:
