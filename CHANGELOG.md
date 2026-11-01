@@ -16,7 +16,7 @@ Interface:
 - Logo tiles follow the theme's corner radius, share the control border, and use plain white so Proton's opaque logos sit flush.
 - Colours are read through the qualified `Commons.Color`, as the shell's own components do.
 - Demo mode can show other states (`offline`, `throttled`, `expired`, `partial`, `warning`, `signed-out`, `empty`, `long`, `multi`), never signs in or acts on real accounts, and says what it did not do.
-- New marketplace preview and README screenshots, captured natively at 2× scale.
+- A new marketplace cover (1600×900, sample data only), and README screenshots captured natively at 2× scale.
 
 Fixes:
 
