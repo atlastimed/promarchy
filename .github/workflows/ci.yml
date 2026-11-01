@@ -33,5 +33,5 @@ jobs:
       - name: Backend tests
         run: python -m pytest -q
 
-      - name: Widget model tests
-        run: node --test tests/model.test.mjs
+      - name: Widget model and panel tests
+        run: node --test tests/model.test.mjs tests/panel.test.mjs

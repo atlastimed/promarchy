@@ -89,7 +89,7 @@ The backend doubles as a small CLI (`~/.config/omarchy/plugins/atlastimed.promar
 | `promarchyctl login [user]` | Sign in (another account if you already have one). |
 | `promarchyctl logout [email\|--all] [--local]` | End the session on Proton's side, then forget it here (`--local`: forget it even if Proton is unreachable). With several accounts, name one or use `--all`. |
 | `promarchyctl accounts` | List signed-in accounts. |
-| `promarchyctl status [--json] [--window 24h]` | Print the bar's current counts, for scripts (it fails, rather than print old numbers, when the bar's background process is not running). |
+| `promarchyctl status [--json] [--window 24h]` | Print the bar's current counts, for scripts. It fails rather than print old numbers: when the bar's background process is not running, and, with `--window`, whenever the counts are not current and complete (it then says why and exits 1). `--json` always includes the status. |
 | `promarchyctl notify-test` | Show what a new-mail notification looks like. |
 
 ## Privacy and security
@@ -141,7 +141,7 @@ rm -rf ~/.local/state/promarchy ~/.cache/promarchy
 ```bash
 uv venv --system-site-packages .venv && uv pip install --python .venv/bin/python pytest ruff
 .venv/bin/pytest -q            # backend tests (fake Proton API, no network)
-node --test tests/model.test.mjs  # widget model tests
+node --test tests/model.test.mjs tests/panel.test.mjs  # widget model and panel key tests
 scripts/check-plugin.sh        # Omarchy plugin contract + QML syntax
 ```
 

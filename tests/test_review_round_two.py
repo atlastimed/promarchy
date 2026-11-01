@@ -7,6 +7,7 @@ behaviour.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 from fakes import FakeProton, MemorySecrets
@@ -162,8 +163,17 @@ def test_status_trusts_a_snapshot_only_while_a_daemon_answers(tmp_path, monkeypa
 
     store = make_store(tmp_path)
     store.save(session("u1"))
-    (runtime_dir() / "state.json").write_text(json.dumps({"status": "ok", "counts": {"1h": 5}}))
-    with daemon_running(make_daemon(store, tmp_path, shared_api_factory(FakeProton()))):
+    api = FakeProton()
+    for age in (60, 120, 180, 240, 300):
+        api.add(age)
+    daemon = make_daemon(store, tmp_path, shared_api_factory(api))
+    daemon.state_path = None  # the real snapshot file, the one status reads
+    path = runtime_dir() / "state.json"
+    with daemon_running(daemon):
+        for _ in range(100):
+            if path.exists() and json.loads(path.read_text()).get("status") == "ok":
+                break
+            time.sleep(0.05)
         assert cli.main(["status", "--window", "1h"]) == 0
     assert cli.main(["status", "--window", "1h"]) == 1  # the same snapshot, no daemon
     assert "5" in capsys.readouterr().out

@@ -179,6 +179,9 @@ class Daemon:
         self.notice = ""
         self.notice_until = 0.0
         self.demo_anchor: int | None = None
+        # Names this process's snapshots, so `status` can tell them from a
+        # predecessor's file while this one is still starting.
+        self.instance = os.urandom(8).hex()
         self._last_payload = ""
         self._force_emit = False
 
@@ -276,7 +279,8 @@ class Daemon:
                     conn.sendall(json.dumps({"error": str(exc)}).encode() + b"\n")
                     return
                 if request["cmd"] == "ping":
-                    conn.sendall(json.dumps({"alive": True}).encode() + b"\n")
+                    reply = {"alive": True, "instance": self.instance}
+                    conn.sendall(json.dumps(reply).encode() + b"\n")
                     return
                 ticket = control.Ticket()
                 self.commands.put({**request, "ticket": ticket})
@@ -514,6 +518,10 @@ class Daemon:
                 self._record_failure(owned, exc)
                 return UNCONFIRMED
 
+        if session.uid in self.store.retired():
+            # Signed out or replaced here already, even if the keyring kept
+            # its entry: a late retry must not be told it is signed in.
+            return {"saved": False, "superseded": True, "unchanged": True, "error": "replaced or signed out"}
         if any(
             a.client.session is not None and a.client.session.uid == session.uid
             for a in self.accounts.values()
@@ -914,6 +922,10 @@ class Daemon:
                 # Some accounts work and some do not: say so, so partial
                 # totals are never mistaken for the whole picture.
                 return "partial", "; ".join(notes + ([paused] if paused else []))
+            if "starting" in statuses:
+                # Others are still connecting: what is counted so far is not
+                # the whole picture yet either.
+                return "starting", ""
             if "throttled" in statuses:
                 return "throttled", paused
             return "ok", ""
@@ -956,6 +968,7 @@ class Daemon:
         state = self.snapshot()
         if override:
             state.update(override)
+        state["instance"] = self.instance
         payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         if payload == self._last_payload and not force:
             return

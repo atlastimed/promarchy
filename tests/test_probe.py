@@ -85,9 +85,10 @@ class ProbeAPI:
 
     def put(self, path, body):
         self.puts.append(path)
-        if path == "/mail/v4/conversations/read":
-            for m in self.messages:
-                m["unread"] = False
+        if path in ("/mail/v4/conversations/read", "/mail/v4/messages/read"):
+            for index, m in enumerate(self.messages):
+                if path == "/mail/v4/conversations/read" or f"M{index}" in body["IDs"]:
+                    m["unread"] = False
             if self.fail_read_after_commit:
                 from promarchy.api import NetworkError
 
@@ -115,7 +116,7 @@ def test_roundtrip_refuses_conversations_it_could_not_restore(quick):
 def test_roundtrip_restores_even_when_the_read_reply_is_lost(quick):
     api = ProbeAPI([{"labels": {"0"}, "unread": True}], fail_read_after_commit=True)
     result = probe.roundtrip(api, probe.Aliases())
-    assert api.puts == ["/mail/v4/conversations/read", "/mail/v4/messages/unread"]
+    assert api.puts == ["/mail/v4/messages/read", "/mail/v4/messages/unread"]
     assert api.messages[0]["unread"] is True
     assert result["restored"] is True and "readError" in result
 
@@ -150,7 +151,7 @@ def test_roundtrip_restores_after_ctrl_c(monkeypatch):
     monkeypatch.setattr(probe, "wait_for", interrupted)
     api = ProbeAPI([{"labels": {"0"}, "unread": True}])
     result = probe.roundtrip(api, probe.Aliases())
-    assert api.puts == ["/mail/v4/conversations/read", "/mail/v4/messages/unread"]
+    assert api.puts == ["/mail/v4/messages/read", "/mail/v4/messages/unread"]
     assert api.messages[0]["unread"] is True
     assert result["restored"] is True and result["interrupted"] == "KeyboardInterrupt"
 

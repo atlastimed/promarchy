@@ -291,7 +291,10 @@ def roundtrip(probe: Probe, alias: Aliases) -> dict:
     # lost, so from here on the restore always runs and is always reported,
     # whatever happens meanwhile (Ctrl+C included).
     try:
-        probe.put("/mail/v4/conversations/read", {"IDs": [cid]})
+        # Exactly the message that restore() marks unread again: a reply that
+        # lands meanwhile is never touched (the conversation endpoint would
+        # mark it read too).
+        probe.put("/mail/v4/messages/read", {"IDs": [mid]})
         result["barReflectedReadAfterSeconds"] = wait_for(
             lambda: (snapshot().get("counts") or {}).get("all") == (before or 0) - 1
         )

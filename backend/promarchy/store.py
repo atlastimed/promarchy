@@ -156,6 +156,9 @@ class SessionStore:
         self._lock = self.root / "accounts.lock"
         self._stamp = self.root / "accounts.stamp"
         self._retired = self.root / "retired.json"
+        # This process's own retirements, kept even when the file cannot be
+        # written: a guard that lives only on disk vanishes with a full disk.
+        self._retired_here: list[str] = []
         self._held = threading.local()
         self.cleanup_failures: list[str] = []  # keyring items replace() could not delete
         self.index_failed = False  # replace() saved the session but not the account list
@@ -208,12 +211,12 @@ class SessionStore:
 
     # ------------------------------------------------------------- updates
 
-    def save(self, session: Session, *, announce: bool = True) -> None:
-        """Persist a session. Token rotations pass announce=False: the daemon
-        made that change itself and must not treat it as a new sign-in."""
-        self.replace(session, announce=announce)
+    def save(self, session: Session) -> None:
+        """Persist a sign-in (see replace). Renewed tokens go through
+        update_tokens, which writes only onto the same live session."""
+        self.replace(session)
 
-    def replace(self, session: Session, *, announce: bool = True) -> list[Session]:
+    def replace(self, session: Session) -> list[Session]:
         """Store a (new) session and return every session it displaced.
 
         A Proton account is identified by its UserID, not by the address you
@@ -247,10 +250,19 @@ class SessionStore:
                     if stored is not None and stored.user_id == session.user_id:
                         aliases.append((other, stored))
             previous = self.load(session.email)
+            copies = [previous, *(stored for _, stored in aliases)]
+            same = next((s for s in copies if s is not None and s.uid == session.uid), None)
+            if same is not None:
+                # This very session is already saved (a retried hand-over), and
+                # its owner may have renewed it since: tokens only ever move
+                # forward, so keep the saved pair rather than write the
+                # original, already used one over it.
+                session.access_token, session.refresh_token = same.access_token, same.refresh_token
             # Save the new session before removing anything: if this fails,
             # every existing entry is still intact.
             try:
-                self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
+                if previous is None or previous.to_dict() != session.to_dict():
+                    self.secrets.set(_key(session.email), json.dumps(session.to_dict()))
             except SaveIndeterminate:
                 # The helper may have stored it and died before saying so. If
                 # the keyring now holds this very session, finish registering
@@ -275,7 +287,6 @@ class SessionStore:
             try:
                 if session.email not in accounts:
                     accounts.append(session.email)
-                    announce = True
                 for other, _ in aliases:
                     # The new sign-in is authoritative: the old address leaves
                     # the index even if its keyring item cannot be deleted
@@ -285,11 +296,9 @@ class SessionStore:
                     except StoreUnavailable:
                         self.cleanup_failures.append(other)
                     accounts.remove(other)
-                    announce = True
                 if accounts != self.accounts():
                     self._write_index(accounts)
-                if announce:
-                    self._bump()
+                self._bump()  # a sign-in is news to the bar even when re-saved
             except Exception as exc:
                 log_error("updating the account list", exc)
                 self.index_failed = True
@@ -333,6 +342,11 @@ class SessionStore:
         goes first: if that fails, the index is untouched and the error
         propagates, so nothing is half-removed."""
         with self._locked():
+            if expected_uid is not None:
+                # That session is over whatever happens below (a keyring that
+                # will not delete it included): a late retry of its sign-in
+                # must never bring it back.
+                self.retire([expected_uid])
             if expected_uid is not None or require_absent:
                 stored = self.load(email)
                 if stored is not None and (require_absent or stored.uid != expected_uid):
@@ -340,24 +354,26 @@ class SessionStore:
             self.secrets.delete(_key(email))
             self._write_index([a for a in self.accounts() if a != email])
             self._bump()
-            if expected_uid is not None:
-                self.retire([expected_uid])
         return True
 
     def retired(self) -> set[str]:
         """Sessions replaced or signed out here recently: never adopt them again."""
+        here = set(self._retired_here)
         try:
             data = json.loads(self._retired.read_text())
         except (OSError, ValueError):
-            return set()
-        return {u for u in data if isinstance(u, str)} if isinstance(data, list) else set()
+            return here
+        return here | ({u for u in data if isinstance(u, str)} if isinstance(data, list) else set())
 
     def retire(self, uids: Iterable[str]) -> None:
-        """Remember sessions that must not come back (best effort: a failed
-        write only loses this guard, never a session)."""
+        """Remember sessions that must not come back: in this process at once,
+        and on disk for the next owner (best effort: a failed write loses the
+        guard only for other processes, never a session)."""
         fresh = [u for u in uids if u]
         if not fresh:
             return
+        self._retired_here = [u for u in self._retired_here if u not in fresh] + fresh
+        del self._retired_here[:-RETIRED_KEEP]
         with self._locked():
             try:
                 data = json.loads(self._retired.read_text())

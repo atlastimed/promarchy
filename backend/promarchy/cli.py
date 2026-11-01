@@ -523,27 +523,48 @@ def cmd_accounts(_: argparse.Namespace) -> int:
     return 0
 
 
+# Why `status --window` printed no number, when the snapshot does not say.
+NOT_CURRENT = {
+    "starting": "still connecting",
+    "offline": "offline",
+    "throttled": "paused by Proton",
+    "partial": "some accounts are not counted",
+    "auth-expired": "sign in again",
+    "signed-out": "not signed in",
+    "error": "not syncing",
+}
+
+
 def cmd_status(args: argparse.Namespace) -> int:
-    path = runtime_dir() / "state.json"
-    try:
-        state = json.loads(path.read_text())
-    except (OSError, ValueError):
-        state = None
     # The snapshot outlives a process that died, and a standalone login or
     # logout holds the same lock as the bar: only a daemon answering on its
-    # socket makes the snapshot current.
+    # socket makes a snapshot current, and only its own (a new daemon that is
+    # still starting must not vouch for its predecessor's file).
     reply = control.ask({"cmd": "ping"}, timeout=3)
     alive = reply is not None and (reply.get("alive") is True or reply.get("error") == "unsupported request")
-    if not alive:
+    try:
+        state = json.loads((runtime_dir() / "state.json").read_text())
+    except (OSError, ValueError):
         state = None
-    if state is None:
+    if not alive or not isinstance(state, dict):
         print("The Promarchy daemon is not running (is the bar widget enabled?).", file=sys.stderr)
+        return 1
+    instance = reply.get("instance")
+    if instance is not None and state.get("instance") != instance:
+        print("Promarchy is starting and has no current counts yet; try again in a moment.", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(state, indent=2, ensure_ascii=False))
         return 0
     counts = state.get("counts") or {}
     if args.window:
+        # A bare number only when it is current and complete; otherwise the
+        # reason, and an exit status a script can act on (--json has both).
+        status = str(state.get("status") or "")
+        if status != "ok":
+            reason = state.get("message") or NOT_CURRENT.get(status, status)
+            print(f"No current count ({status}): {reason}", file=sys.stderr)
+            return 1
         print(counts.get(args.window, 0))
         return 0
     print(f"status: {state.get('status')}" + (f" ({state['message']})" if state.get("message") else ""))

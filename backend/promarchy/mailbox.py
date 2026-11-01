@@ -175,6 +175,9 @@ class Mailbox:
         # cursor so a failed read is retried instead of forgotten.
         self.settings_pending = True
         self.settings_retry_at = 0.0
+        # Whether Proton ever told us its view mode. Until then a row link
+        # could open the wrong thing, so rows link to the inbox.
+        self.settings_known = False
         self.unread_times: dict[str, int] = {}
         self.window_complete = True
         self.unread_total = 0
@@ -198,6 +201,9 @@ class Mailbox:
     def full_sync(self) -> None:
         # Take the event cursor *before* reading data so nothing slips between.
         if self.event_id is None:
+            # A fresh cursor skips every event before it, settings changes
+            # among them: read the settings again too.
+            self._owe_settings()
             self.event_id = str(self.client.call("GET", "/core/v4/events/latest")["EventID"])
         self.resync()
 
@@ -313,7 +319,7 @@ class Mailbox:
         return best
 
     def web_url(self, row: dict | None = None) -> str:
-        if not row:
+        if not row or not self.settings_known:
             return f"{WEB_BASE}/inbox"
         if row.get("kind") == "conversation":
             # Proton opens /inbox/<id> as a conversation only in conversation
@@ -353,8 +359,10 @@ class Mailbox:
         except (TypeError, ValueError):
             return False
         changed = mode != self.view_mode
+        first = not self.settings_known
         self.view_mode = mode
-        if changed:
+        self.settings_known = True
+        if changed or first:
             # Until the rows are rebuilt for the new mode, give the ones shown
             # links that are right in it (web_url falls back to the inbox).
             for row in self.recent:

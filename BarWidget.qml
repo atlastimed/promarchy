@@ -54,10 +54,10 @@ Panel {
   readonly property int headerCount: Model.countFor(counts, headerWindow)
   // "partial": some accounts work and some do not; counts are still shown.
   readonly property bool healthy: status === "ok" || status === "partial"
-  // Counts from an earlier sync (or paused by Proton): shown, but not as if
-  // they were current.
+  // Counts from an earlier sync, paused by Proton, or still missing accounts
+  // that are connecting: shown, but not as if they were current.
   readonly property bool stale: status === "offline" || status === "error" || status === "auth-expired"
-    || status === "throttled"
+    || status === "throttled" || status === "starting"
   readonly property bool listEnabled: daemonConfig.recentLimit > 0
   readonly property bool needsSignIn: {
     if (status === "signed-out" || status === "auth-expired") return true
@@ -186,7 +186,7 @@ Panel {
   Timer {
     id: revealTimer
     interval: 40
-    onTriggered: root.revealItem(accountSection)
+    onTriggered: root.revealAccounts()
   }
 
   // Likewise the notice when it says something new: it scrolls with the list,
@@ -245,14 +245,18 @@ Panel {
       mail.markRead(message.account, message.unreadIds, message.kind)
   }
 
+  // Whether an item in the scrolling part of the panel is wholly in sight.
+  function inView(item) {
+    if (!item || !item.visible || !flick || !flick.visible) return false
+    var top = item.mapToItem(flick, 0, 0).y
+    return top >= -0.5 && top + item.height <= flick.height + 0.5
+  }
+
   // A row action needs a row the user can see: if none is selected, or the
   // selected one has scrolled out of view, the key first shows it.
   function showsSelectedRow() {
     if (!cursorActive || cursorZone !== "rows" || messages.length === 0) return false
-    var item = rows.itemAt(cursorIndex)
-    if (!item || !flick || !flick.visible) return false
-    var top = item.mapToItem(flick, 0, 0).y
-    return top >= -0.5 && top + item.height <= flick.height + 0.5
+    return inView(rows.itemAt(cursorIndex))
   }
 
   function revealSelectedRow() {
@@ -304,6 +308,23 @@ Panel {
     cursorZone = "accounts"
     cursorActive = true
     accountCursor = index
+  }
+
+  // The action the keyboard cursor is on, or else the whole section (which
+  // can be taller than the list: then its top would show, not the action).
+  function revealAccounts() {
+    revealItem(cursorActive && cursorZone === "accounts" ? accountActionItem() || accountSection : accountSection)
+  }
+
+  // The control the accounts cursor is on.
+  function accountActionItem() {
+    switch (accountActions()[accountCursor]) {
+    case "add": return addAccountButton
+    case "signout": return signOutButton
+    case "confirm": return confirmSignOutButton
+    case "cancel": return cancelSignOutButton
+    }
+    return null
   }
 
   function runAccountAction(action) {
@@ -365,6 +386,13 @@ Panel {
     }
     var actions = accountActions()
     if (cursorZone === "accounts" && cursorActive && accountCursor < actions.length) {
+      // Like a row, an action out of sight (scrolled away, or pushed down by
+      // a new notice) is shown first, never run unseen.
+      var control = accountActionItem()
+      if (!inView(control)) {
+        revealItem(control || accountSection)
+        return
+      }
       runAccountAction(actions[accountCursor])
       return
     }
@@ -770,6 +798,7 @@ Panel {
                 spacing: Style.space(6)
 
                 Button {
+                  id: addAccountButton
                   text: "Add account"
                   iconText: "󰀔"
                   tooltipText: "Sign in to another Proton account"
@@ -785,6 +814,7 @@ Panel {
                 Item { Layout.fillWidth: true }
 
                 Button {
+                  id: signOutButton
                   text: root.accounts.length > 1 ? "Sign out of all" : "Sign out"
                   iconText: "󰍃"
                   bordered: true
@@ -829,6 +859,7 @@ Panel {
                   spacing: Style.space(6)
 
                   Button {
+                    id: confirmSignOutButton
                     text: "Sign out"
                     iconText: "󰍃"
                     bordered: true
@@ -841,6 +872,7 @@ Panel {
                   }
 
                   Button {
+                    id: cancelSignOutButton
                     text: "Cancel"
                     bordered: true
                     hasCursor: root.cursorActive && root.cursorZone === "accounts" && root.accountCursor === 1

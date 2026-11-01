@@ -36,7 +36,7 @@ def test_generation_bumps_on_sign_in_not_on_rotation(tmp_path):
     g1 = store.generation()
     assert g1 != g0
     session.refresh_token = "r2"
-    store.save(session, announce=False)
+    assert store.update_tokens(session)
     assert store.generation() == g1
     assert store.load("me@proton.me").refresh_token == "r2"
 
