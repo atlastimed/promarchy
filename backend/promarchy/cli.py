@@ -437,21 +437,25 @@ def cmd_logout(args: argparse.Namespace) -> int:
     """
     store = SessionStore()
     accounts = store.accounts()
-    if args.email and args.email.lower() not in accounts:
-        print(f"✗ {args.email.lower()} is not signed in.", file=sys.stderr)
-        return 1
-    if not accounts:
-        print("Not signed in.")
-        return 0
-    if not args.all and not args.email and len(accounts) > 1:
-        print(
-            "✗ Several accounts are signed in: " + ", ".join(accounts) + ".\n"
-            "  Name the one to sign out, or add --all.",
-            file=sys.stderr,
-        )
-        return 1
-    targets = accounts if args.all else [args.email.lower()] if args.email else accounts[:1]
-    target = None if args.all else targets[0]
+    if not args.all and not args.email:
+        # Which one: what the list on disk says, and what the running bar shows
+        # (it may hold a sign-in the list could not record). Never all on a guess.
+        state, _ = _published_state()
+        shown = [a.get("email") for a in (state or {}).get("accounts") or [] if isinstance(a, dict)]
+        accounts = list(dict.fromkeys([*accounts, *(e for e in shown if isinstance(e, str) and e)]))
+        if not accounts:
+            print("Not signed in.")
+            return 0
+        if len(accounts) > 1:
+            print(
+                "✗ Several accounts are signed in: " + ", ".join(accounts) + ".\n"
+                "  Name the one to sign out, or add --all.",
+                file=sys.stderr,
+            )
+            return 1
+    target = None if args.all else args.email.lower() if args.email else accounts[0]
+    # The running bar owns the sessions and knows best what is signed in: ask
+    # it first, whatever the list on disk says.
     reply = control.ask({"cmd": "logout", "account": target, "local": args.local})
     if reply is not None:
         results = reply.get("results")
@@ -473,6 +477,15 @@ def cmd_logout(args: argparse.Namespace) -> int:
         else:
             print(f"✗ The bar's background process could not sign out ({error}).", file=sys.stderr)
         return 1
+    # No bar: this command owns the sessions for this step, and the list is
+    # all there is to go on.
+    if target is not None and target not in accounts:
+        print(f"✗ {target} is not signed in.", file=sys.stderr)
+        return 1
+    if not accounts:
+        print("Not signed in.")
+        return 0
+    targets = accounts if target is None else [target]
     lock = control.take_lock()
     if lock is None:
         print(
@@ -629,6 +642,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         if status != "ok":
             reason = state.get("message") or NOT_CURRENT.get(status, status)
             print(f"No current count ({status}): {reason}", file=sys.stderr)
+            return 1
+        if args.window != "all" and state.get("capped"):
+            # More unread mail than Promarchy pages through: only a lower bound.
+            print(
+                "No complete count: there is more unread mail than Promarchy counts; see --json.",
+                file=sys.stderr,
+            )
             return 1
         print(counts.get(args.window, 0))
         return 0

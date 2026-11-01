@@ -64,7 +64,10 @@ Panel {
     for (var i = 0; i < accounts.length; i++) if (accounts[i].status === "auth-expired") return true
     return false
   }
+  // Only rows the list shows: turning it off hides the bulk action at once,
+  // although the old rows stay in memory until the backend's next snapshot.
   readonly property bool anyUnreadShown: {
+    if (!listEnabled) return false
     for (var i = 0; i < messages.length; i++) if (messages[i].unread) return true
     return false
   }
@@ -275,7 +278,7 @@ Panel {
   }
 
   function markAllRead() {
-    if (!mail) return
+    if (!mail || !listEnabled) return  // only rows the list shows (see anyUnreadShown)
     var groups = {}
     for (var i = 0; i < messages.length; i++) {
       var m = messages[i]

@@ -71,6 +71,21 @@ test("moving through a section taller than the list shows the action, not the se
   assert.ok(panel.inView(panel.accountActionItem()))
 })
 
+test("a marks nothing read once the list is turned off", () => {
+  // The old rows stay in memory until the backend's next snapshot.
+  const marked = []
+  const panel = load(["markAllRead", "handleKey"], {
+    listEnabled: false,
+    messages: [{ account: "me@proton.me", id: "m1", unread: true, unreadIds: ["m1"], kind: "message" }],
+    mail: { markRead: (_account, ids) => marked.push(...ids) },
+  })
+  panel.handleKey("a")
+  assert.deepEqual(marked, [])
+  panel.listEnabled = true
+  panel.handleKey("a")
+  assert.deepEqual(marked, ["m1"])
+})
+
 test("m on a row out of sight only brings it into view", () => {
   const { flick, item } = list(300, 1500)
   const marked = []

@@ -193,6 +193,8 @@ class ProtonClient:
         if resp.status_code == 401 and self.session:
             self.refresh()
             resp = self._send("GET", path, params=params, body=None, auth=True, headers=None, **extra)
+        if resp.status_code == 401:  # even renewed: the session itself is rejected, not the logo
+            raise AuthExpired("Your Proton session expired. Sign in again.")
         if resp.status_code in (429, 503):
             raise RateLimited("Proton asked us to slow down", _retry_after(resp))
         ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()

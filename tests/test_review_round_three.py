@@ -10,6 +10,8 @@ import json
 import os
 import sys
 import threading
+import time
+from urllib.parse import urlsplit
 
 import pytest
 from fakes import Clock, FakeProton, MemorySecrets
@@ -31,7 +33,7 @@ from promarchy import daemon as daemon_module
 from promarchy import store as store_module
 from promarchy.api import AuthExpired, NetworkError, ProtonClient, ProtonError, RateLimited, Session
 from promarchy.auth import REVOKED, TWO_FACTOR_TOTP, PendingLogin
-from promarchy.mailbox import Mailbox
+from promarchy.mailbox import MAX_PAGES, PAGE_LIMIT, Mailbox
 from promarchy.paths import runtime_dir
 from promarchy.store import RETIRED_KEEP, SaveIndeterminate, SessionStore, StoreUnavailable
 
@@ -1115,3 +1117,176 @@ def test_a_rejected_sign_in_is_not_confirmed_by_rolling_back_to_used_tokens(tmp_
     code = cli.cmd_login(argparse.Namespace(username=incoming.email, wait=False))
     assert len(calls) == 2 and revoked == []
     assert code != 0 and "Signed in as" not in capsys.readouterr().out
+
+
+# ================================== fresh review of c6807b1 (AB01 to AB05; AB05 in panel.test.mjs)
+
+
+class RejectedDuringAddressLookup(AuthServer):
+    def __init__(self):
+        super().__init__(uid="new")
+        self.requests = []
+
+    def request(self, method, url, **kw):
+        self.requests.append((method, url.rsplit("/", 1)[-1]))
+        if url.endswith("/core/v4/addresses"):
+            self.revoked = True
+            return Resp(401, {"Code": 401, "Error": "Session rejected"})
+        return super().request(method, url, **kw)
+
+
+@pytest.mark.parametrize("owner", ["local", "bar", "lost-answer"])
+def test_a_rejected_address_lookup_never_replaces_a_working_sign_in(tmp_path, monkeypatch, capsys, owner):
+    """AB01: signing in with a bare username, the address lookup was rejected;
+    the sign-in went ahead under the username, replaced the working session
+    of the same account, ended it, and said it had signed in."""
+    store = make_store(tmp_path)
+    old_server = AuthServer(uid="old")
+    previous = stored_session(old_server)
+    previous.user_id = "U"
+    store.save(previous)
+    new_server = RejectedDuringAddressLookup()
+    incoming = stored_session(new_server, email="")
+    incoming.user_id = "U"
+
+    def client_factory(session=None, **kw):
+        server = old_server if session is not None and session.uid == "old" else new_server
+        return ProtonClient(session, http=server, **kw)
+
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", client_factory)
+    monkeypatch.setattr(cli, "begin_login", lambda *a: PendingLogin(incoming, 0))
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "pw")
+    if owner == "local":
+        monkeypatch.setattr(control, "ask", lambda request, **kw: None)
+    else:
+        bar = make_daemon(store, tmp_path, client_factory)
+        bar._sync_accounts()
+        calls = []
+
+        def ask(request, **kw):
+            calls.append(request)
+            reply = answering(bar)(request)
+            return {"error": "no answer"} if owner == "lost-answer" and len(calls) == 1 else reply
+
+        monkeypatch.setattr(control, "ask", ask)
+    code = cli.cmd_login(argparse.Namespace(username="me", wait=False))
+    assert new_server.requests[:2] == [("GET", "addresses"), ("POST", "refresh")]
+    assert (code, old_server.revoked, store.accounts()) == (1, False, [previous.email])
+    assert store.load(previous.email).uid == previous.uid
+    assert "Signed in as" not in capsys.readouterr().out
+
+
+class RejectedLogoAfterRenewal(AuthServer):
+    """Mail works; the sender-logo request is rejected, renewal works, and by
+    the repeat the session has been revoked."""
+
+    def __init__(self):
+        super().__init__(uid="fresh")
+        self.mail = FakeProton(clock=time.time)
+        self.mail.add(10, logo=True)
+        self.logo_tokens = []
+
+    def request(self, method, url, **kw):
+        path = urlsplit(url).path
+        if path == "/core/v4/images/logo":
+            token = kw["headers"].get("Authorization")
+            self.logo_tokens.append(token)
+            if token == "Bearer acc1":
+                self.revoked = True
+            return Resp(401, {"Code": 401, "Error": "Session rejected"})
+        if path.startswith("/auth/"):
+            return super().request(method, url, **kw)
+        return Resp(200, self.mail.call(method, path, params=kw.get("params"), body=kw.get("json")))
+
+
+def test_a_rejected_logo_request_never_lets_a_retry_confirm_the_sign_in(tmp_path, monkeypatch, capsys):
+    """AB02: a logo request still rejected after renewal was taken for a
+    missing logo, not for a rejected session, so the bar kept its word."""
+    store = make_store(tmp_path)
+    server = RejectedLogoAfterRenewal()
+    incoming = stored_session(server)
+    bar = auth_daemon(store, tmp_path, server)
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", FakeProton)
+    monkeypatch.setattr(cli, "begin_login", lambda *a: PendingLogin(incoming, 0))
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "pw")
+    revoked = []
+    monkeypatch.setattr(cli, "logout", lambda client: revoked.append(client.session.uid) or True)
+    calls = []
+
+    def ask(request, **kw):
+        calls.append(request)
+        reply = answering(bar)(request)
+        if len(calls) == 1:
+            assert reply["saved"]
+            bar.tick()
+            assert server.logo_tokens == ["Bearer acc0", "Bearer acc1"] and server.revoked
+            return {"error": "no answer"}
+        return reply
+
+    monkeypatch.setattr(control, "ask", ask)
+    code = cli.cmd_login(argparse.Namespace(username=incoming.email, wait=False))
+    assert len(calls) == 2 and revoked == []
+    assert code != 0 and "Signed in as" not in capsys.readouterr().out
+
+
+def bar_whose_list_lost_a_sign_in(tmp_path, monkeypatch):
+    """A bar holding a sign-in that the account list could not record."""
+    store = make_store(tmp_path)
+    server = AuthServer(uid="new")
+    bar = auth_daemon(store, tmp_path, server)
+    bar._sync_accounts()
+
+    def disk_full(accounts):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(store, "_write_index", disk_full)
+        reply = bar._adopt(stored_session(server))
+    assert reply["saved"] and reply["indexFailed"] and store.accounts() == []
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    return bar, server
+
+
+def test_logout_all_asks_the_bar_before_trusting_an_empty_account_list(tmp_path, monkeypatch, capsys):
+    """AB03: the list on disk was empty, so logout --all said "Not signed
+    in" without asking the bar, which still held a live session."""
+    bar, server = bar_whose_list_lost_a_sign_in(tmp_path, monkeypatch)
+    monkeypatch.setattr(control, "ask", answering(bar))
+    assert cli.cmd_logout(argparse.Namespace(email=None, all=True, local=False)) == 0
+    assert server.revoked, capsys.readouterr().out
+
+
+def test_a_plain_logout_counts_the_sign_ins_the_bar_shows(tmp_path, monkeypatch, capsys):
+    """AB03, unqualified: which account to sign out comes from the list on
+    disk and from what the running bar shows."""
+    bar, server = bar_whose_list_lost_a_sign_in(tmp_path, monkeypatch)
+    bar.state_path = None
+    bar.emit(force=True)
+
+    def ask(request, **kw):
+        if request["cmd"] == "ping":
+            return {"alive": True, "snapshot": bar._published}
+        return answering(bar)(request)
+
+    monkeypatch.setattr(control, "ask", ask)
+    assert cli.cmd_logout(argparse.Namespace(email=None, all=False, local=False)) == 0
+    assert server.revoked, capsys.readouterr().out
+
+
+@pytest.mark.parametrize("window", ["1h", "24h", "7d"])
+def test_status_window_refuses_a_count_that_is_only_a_lower_bound(daemon_env, monkeypatch, capsys, window):  # noqa: F811
+    """AB04: more unread mail than Promarchy pages through; the window counts
+    are lower bounds (the snapshot says capped), not current counts."""
+    daemon, api, store, _, _ = daemon_env
+    daemon.state_path = None
+    for index in range(PAGE_LIMIT * MAX_PAGES + 1):
+        api.add(60 + index)
+    store.save(session("u"))
+    daemon.tick()
+    state = daemon.snapshot()
+    assert state["status"] == "ok" and state["capped"] is True and state["counts"]["all"] == 751
+    monkeypatch.setattr(control, "ask", lambda request, **kw: {"alive": True, "snapshot": daemon._published})
+    assert cli.main(["status", "--window", window]) == 1 and capsys.readouterr().out == ""
+    assert cli.main(["status", "--window", "all"]) == 0  # the total is counted exactly

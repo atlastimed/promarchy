@@ -177,6 +177,8 @@ def primary_address(client: ProtonClient, username: str) -> str:
         return username.lower()
     try:
         addresses = client.call("GET", "/core/v4/addresses").get("Addresses") or []
+    except AuthExpired:
+        raise  # a rejected session is never handed over under a guessed name
     except ProtonError:
         addresses = []
     enabled = [a for a in addresses if isinstance(a, dict) and a.get("Status") == 1]

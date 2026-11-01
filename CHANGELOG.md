@@ -12,7 +12,7 @@ Interface:
 - "Unread from" labels the count controls and "Recent inbox" the list; a hidden badge reads "Badge off". Empty lists say why (loading, offline, paused, empty inbox), and a list turned off is hidden.
 - The header and footer stay in place while a long list scrolls; notices scroll with the list, so a long one never pushes a confirmation out of reach, and new feedback scrolls into view. Hovering a row shows the full sender, address and subject; account labels on rows stay short.
 - *Add account* and *Sign out* moved into an accounts section that lists each account's state, also reachable from the keyboard (<kbd>s</kbd>, then arrows and <kbd>Enter</kbd>). Signing out asks in words, with the cursor on Cancel, instead of a second click within four seconds.
-- Keys act only on what is in sight: with no row selected, or the selected row or account action scrolled out of view (or pushed down by a new notice), <kbd>Enter</kbd>, <kbd>m</kbd> or <kbd>x</kbd> first brings it into view.
+- Keys act only on what is in sight: with no row selected, or the selected row or account action scrolled out of view (or pushed down by a new notice), <kbd>Enter</kbd>, <kbd>m</kbd> or <kbd>x</kbd> first brings it into view; with the recent list turned off, <kbd>a</kbd> marks nothing read.
 - Logo tiles follow the theme's corner radius, share the control border, and use plain white so Proton's opaque logos sit flush.
 - Colours are read through the qualified `Commons.Color`, as the shell's own components do.
 - Demo mode can show other states (`offline`, `throttled`, `expired`, `partial`, `warning`, `signed-out`, `empty`, `long`, `multi`), never signs in or acts on real accounts, and says what it did not do.
@@ -33,6 +33,8 @@ Fixes:
 - `promarchyctl status` asks the running bar whether it is alive and trusts only the snapshot that bar published last, so neither a stopped daemon's, a predecessor's, nor one left behind by a failed write is presented as current. With `--window` it prints a number only when the counts are current and complete, and otherwise says why and exits 1; `promarchyctl logout` with several accounts asks which one (or `--all`).
 - Credentials in an `http://` proxy URL in `https_proxy` are sent to the proxy on CONNECT. `https://` and SOCKS proxy URLs, to which they would have gone in the clear, are refused with an error.
 - The unsaved-credentials warning has its own field, so `partial` means only that some accounts are not counted. Mark-as-read ignores IDs that are not a list; an evicted duplicate account forgets its notification watermark.
+- Signing in with a bare username fails if Proton rejects the session while its address is looked up, instead of going ahead under the username and replacing the account's working session. A logo request Proton still rejects after renewal counts as a rejected session, not a missing logo.
+- `promarchyctl logout` asks the running bar before trusting the account list on disk, so a sign-in the list could not record is signed out too, and `status --window` also refuses a count that is only a lower bound (more unread mail than Promarchy pages through).
 - `scripts/proton_probe.py --roundtrip` marks and restores exactly one message, so a reply arriving during the run is never touched.
 
 ## 0.1.0 (2026-10-16)
