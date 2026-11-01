@@ -217,7 +217,13 @@ class SessionStore:
         self.replace(session)
 
     def replace(
-        self, session: Session, *, retry: bool = False, expect: list[str] | None = None
+        self,
+        session: Session,
+        *,
+        retry: bool = False,
+        expect: list[str] | None = None,
+        held: Iterable[str] = (),
+        seen_first: bool = False,
     ) -> list[Session]:
         """Store a (new) session and return every session it displaced.
 
@@ -227,13 +233,10 @@ class SessionStore:
         happen under one lock, so racing sign-ins each get back exactly what
         they displaced, and the caller revokes it on Proton's side.
 
-        `retry`: a repeat of a hand-over whose answer was lost, made with
-        `expect`, what account_uids() said before the first attempt. It goes
-        ahead only if this session is what is saved now (the first attempt
-        landed) or nothing changed since (it did not): anything else is a
-        later sign-in or sign-out, never to be undone. An account that is
-        empty now and was before proves nothing (a sign-out would have
-        emptied it too), so that, like an unknown `expect`, is indeterminate.
+        `retry`: a repeat of a hand-over whose answer was lost (see
+        _check_retry), with `expect` (what account_uids() said before the
+        first attempt), `held` (the account's sessions the owner holds) and
+        `seen_first` (whether this owner handled the first attempt).
 
         Outcomes: StoreUnavailable means nothing changed; SaveIndeterminate
         means the new session may or may not be stored; Superseded means it
@@ -262,12 +265,8 @@ class SessionStore:
                         aliases.append((other, stored))
             previous = self.load(session.email)
             copies = [previous, *(stored for _, stored in aliases)]
-            saved = _uids(copies)
-            if retry and session.uid not in saved:
-                if expect is None or not (saved or expect):
-                    raise SaveIndeterminate("could not tell what became of this sign-in")
-                if saved != sorted(expect):
-                    raise Superseded("a newer sign-in or a sign-out replaced this one")
+            if retry:
+                _check_retry(session.uid, _uids(copies), held, expect, seen_first)
             same = next((s for s in copies if s is not None and s.uid == session.uid), None)
             if same is not None:
                 # This very session is already saved (a retried hand-over), and
@@ -457,6 +456,32 @@ class SessionStore:
         # repeat even after the stamp was deleted or written by an older version.
         with self._locked():
             write_private(self._stamp, str(max(self.generation() + 1, time.time_ns())))
+
+
+def _check_retry(
+    uid: str, saved: list[str], held: Iterable[str], expect: list[str] | None, seen_first: bool
+) -> None:
+    """Whether a retry of a lost hand-over may go ahead; SaveIndeterminate if
+    not. Only positive evidence counts, because a keyring that is locked can
+    answer "nothing saved", and a sign-out after a restart leaves no record:
+
+    - this session is saved now: its first attempt landed. Only the owner
+      that handled that attempt knows no sign-out happened since, and the
+      only others it may end are the ones the sign-in meant to replace;
+    - it is not saved, and exactly what was saved before still is (not
+      nothing: an emptied account may be a sign-out): it never landed.
+
+    Anything else may be a later sign-in or sign-out, never to be undone on
+    a guess: the sign-in is kept and reported as unconfirmed.
+    """
+    others = (set(saved) | set(held)) - {uid}
+    known = set(expect) if expect is not None else None
+    if uid in saved:
+        if seen_first and (not others if known is None else others <= known):
+            return
+    elif known and set(saved) == known and others <= known:
+        return
+    raise SaveIndeterminate("could not tell what became of this sign-in")
 
 
 def _uids(sessions: Iterable[Session | None]) -> list[str]:

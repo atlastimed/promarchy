@@ -172,19 +172,18 @@ def _hand_over(store: SessionStore, session: Session) -> dict:
     has just taken, so the owner is asked once more instead, even if the
     keyring already lists it (only the owner switching over completes a
     sign-in). The retry carries what was saved for this account before the
-    first attempt: the owner repeats the hand-over only if this session is
-    what is saved now (finishing its registration, with any tokens renewed
-    since) or nothing changed meanwhile. Anything else is a later sign-in or
-    sign-out, which it refuses to undo; and if it cannot tell, the sign-in
-    is kept and reported as unconfirmed.
+    first attempt, and goes ahead only on positive evidence (see
+    store._check_retry): its own session saved by an owner that saw the first
+    attempt, or nothing changed at all. Otherwise the sign-in is kept and
+    reported as unconfirmed, and a sign-out the owner knows of is reported.
     """
     expect = store.account_uids(session)
-    outcome, reply = _attempt(store, session)
+    outcome, reply, here = _attempt(store, session)
     if outcome == "saved":
         return reply
     if outcome in ("refused", "superseded"):
         raise LoginFailed(reply)
-    outcome, reply = _attempt(store, session, retry=True, expect=expect)
+    outcome, reply, _ = _attempt(store, session, retry=True, expect=expect, seen_first=here)
     if outcome == "saved":
         # The lost first attempt may already have ended older sessions, and
         # its report is gone: do not vouch for them either way.
@@ -201,11 +200,16 @@ def _hand_over(store: SessionStore, session: Session) -> dict:
 
 
 def _attempt(
-    store: SessionStore, session: Session, retry: bool = False, expect: list[str] | None = None
-) -> tuple[str, Any]:
+    store: SessionStore,
+    session: Session,
+    retry: bool = False,
+    expect: list[str] | None = None,
+    seen_first: bool = False,
+) -> tuple[str, Any, bool]:
     """One hand-over: ("saved", reply), ("refused", why) when nothing was
     saved, ("superseded", why) when a newer sign-in or a sign-out already
-    replaced it, or ("unknown", None). `retry`, `expect`: see _hand_over."""
+    replaced it, or ("unknown", None); and whether this process was the owner
+    for it. `retry`, `expect`, `seen_first`: see _hand_over."""
     request: dict[str, Any] = {"cmd": "adopt", "session": session.to_dict()}
     if retry:
         request["retry"] = True
@@ -215,7 +219,7 @@ def _attempt(
     if reply is None:  # no bar running: become the owner for this step
         lock = control.take_lock()
         if lock is None:
-            return "refused", BAR_NOT_ANSWERING
+            return "refused", BAR_NOT_ANSWERING, False
         try:
             reply = sessions.adopt(
                 store,
@@ -223,26 +227,27 @@ def _attempt(
                 lambda old: sessions.end_displaced(ProtonClient(old)),
                 retry=retry,
                 expect=expect,
+                seen_first=seen_first,
             )
-            return "saved", reply
+            return "saved", reply, True
         except Superseded:
-            return "superseded", SUPERSEDED
+            return "superseded", SUPERSEDED, True
         except SaveIndeterminate:
-            return "unknown", None
+            return "unknown", None, True
         except Exception as exc:  # nothing was written
-            return "refused", f"Signed in, but could not save the session to your keyring: {exc}"
+            return "refused", f"Signed in, but could not save the session to your keyring: {exc}", True
         finally:
             os.close(lock)
     if reply.get("saved") is True:
-        return "saved", reply
+        return "saved", reply, False
     if reply.get("superseded") is True:
-        return "superseded", SUPERSEDED
+        return "superseded", SUPERSEDED, False
     error = reply.get("error")
     if error == "busy":  # it never ran, and never will
-        return "refused", BAR_NOT_ANSWERING
+        return "refused", BAR_NOT_ANSWERING, False
     if error in ("invalid request", "unsupported request") or reply.get("unchanged") is True:
-        return "refused", f"Signed in, but could not save the session to your keyring: {error}"
-    return "unknown", None  # a lost answer, or a save that may have landed
+        return "refused", f"Signed in, but could not save the session to your keyring: {error}", False
+    return "unknown", None, False  # a lost answer, or a save that may have landed
 
 
 def _registered(store: SessionStore, session: Session) -> bool:
@@ -270,8 +275,9 @@ def _report_replacement(handed: dict, email: str) -> None:
     if handed.get("unconfirmed"):
         if handed.get("registered"):
             raise LoginFailed(
-                "Signed in and saved, but the bar did not confirm it switched to this sign-in.\n"
-                "  If it still asks you to sign in, restart it with: omarchy restart shell"
+                "The sign-in is saved, but the bar did not confirm it took it over.\n"
+                "  If the bar still asks you to sign in, restart it (omarchy restart shell), and sign in\n"
+                "  again if it still asks."
             )
         raise LoginFailed(
             "Signed in, but Promarchy could not confirm the keyring saved the session (is it locked?).\n"

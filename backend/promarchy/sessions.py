@@ -85,18 +85,22 @@ def adopt(
     also: Iterable[Session] = (),
     retry: bool = False,
     expect: list[str] | None = None,
+    seen_first: bool = False,
 ) -> dict:
     """Save a fresh sign-in and end every session it replaces.
 
     `end` ends one displaced session with the owner's current tokens for it
     (the saved copy may be older than what the owner holds). `also`: sessions
     the owner holds that this sign-in replaces, in case their saved copies
-    could not be read. `retry`, `expect`: see SessionStore.replace. Raises
+    could not be read. `retry`, `expect`, `seen_first`: see SessionStore.replace. Raises
     StoreUnavailable if nothing changed, SaveIndeterminate if the new session
     may or may not have been saved, and Superseded if it was already replaced
     or signed out (nothing changed).
     """
-    displaced = [old for old in store.replace(session, retry=retry, expect=expect) if old.uid != session.uid]
+    also = list(also)
+    held = [h.uid for h in also]
+    saved = store.replace(session, retry=retry, expect=expect, held=held, seen_first=seen_first)
+    displaced = [old for old in saved if old.uid != session.uid]
     known = {old.uid for old in displaced}
     for held in also:
         if held.uid != session.uid and held.uid not in known:

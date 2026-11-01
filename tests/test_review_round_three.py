@@ -9,7 +9,7 @@ import json
 import threading
 
 import pytest
-from fakes import Clock, FakeProton
+from fakes import Clock, FakeProton, MemorySecrets
 from test_hardening import daemon_env  # noqa: F401  (fixture)
 from test_ownership import daemon_running, make_daemon, make_store, pending_sign_in, shared_api_factory
 from test_probe import ProbeAPI, probe
@@ -23,7 +23,7 @@ from promarchy.api import ProtonClient, ProtonError, RateLimited, Session
 from promarchy.auth import REVOKED, TWO_FACTOR_TOTP, PendingLogin
 from promarchy.mailbox import Mailbox
 from promarchy.paths import runtime_dir
-from promarchy.store import SessionStore, StoreUnavailable
+from promarchy.store import SaveIndeterminate, SessionStore, StoreUnavailable
 
 INBOX = "https://mail.proton.me/inbox"
 
@@ -44,7 +44,7 @@ def test_a_retried_hand_over_keeps_the_tokens_renewed_since(tmp_path, monkeypatc
     assert store.load(original.email).refresh_token == server.refresh
 
     monkeypatch.setattr(control, "ask", lambda request, **kw: None)  # that owner has exited
-    outcome, _ = cli._attempt(store, original)
+    outcome, _, _ = cli._attempt(store, original)
     assert outcome == "saved"
     assert store.load(original.email).refresh_token == server.refresh
     assert store.accounts() == [original.email]
@@ -58,7 +58,7 @@ def test_a_retried_hand_over_still_finishes_registering(tmp_path, monkeypatch):
     store.secrets.set(store_module._key(fresh.email), json.dumps(fresh.to_dict()))
     assert store.accounts() == []
     monkeypatch.setattr(control, "ask", lambda request, **kw: None)
-    outcome, _ = cli._attempt(store, fresh)
+    outcome, _, _ = cli._attempt(store, fresh)
     assert outcome == "saved" and store.accounts() == [fresh.email]
 
 
@@ -414,9 +414,8 @@ def test_a_retry_after_the_owner_restarted_never_undoes_a_later_sign_in(tmp_path
         return owner["now"]._answer(parsed)
 
     monkeypatch.setattr(control, "ask", lost_answer_then_restart)
-    with pytest.raises(cli.LoginFailed, match="newer sign-in"):
-        cli._hand_over(store, a)
-    assert calls == [("a", False), ("a", True)]
+    result = cli._hand_over(store, a)
+    assert calls == [("a", False), ("a", True)] and result.get("unconfirmed") is True
     assert ended == ["a"] and owner["now"].store.load(b.email).uid == "b"
 
 
@@ -504,7 +503,7 @@ def test_a_retry_never_ends_a_newer_sign_in_the_bar_holds(tmp_path):
     reply = answering(daemon)({"cmd": "adopt", "session": a.to_dict(), "retry": True})
     assert reply.get("saved") is not True and ended == []  # it cannot tell: nothing is replaced
     reply = answering(daemon)({"cmd": "adopt", "session": a.to_dict(), "retry": True, "expect": ["b"]})
-    assert reply.get("superseded") is True and ended == []  # B is gone since: a sign-out, never undone
+    assert reply.get("saved") is not True and ended == []  # B is held, and its entry gone: no proof
 
 
 def test_a_later_retirement_write_carries_the_ones_that_failed(tmp_path, monkeypatch):
@@ -589,3 +588,197 @@ def test_status_keeps_the_instance_check_of_a_daemon_from_e07cc75(monkeypatch, c
     assert cli.main(["status", "--window", "1h"]) == 1 and capsys.readouterr().out == ""
     monkeypatch.setattr(control, "ask", lambda request, **kw: {"alive": True, "instance": "old-owner"})
     assert cli.main(["status", "--window", "1h"]) == 0 and capsys.readouterr().out.strip() == "999"
+
+
+# ======================================== fourth pass, on 4e725fd (X01, X02, W02)
+
+
+class QuietAfterWrite(MemorySecrets):
+    """The armed write lands but reports failure, and the next reads find
+    nothing: what a locked keyring whose unlock prompt was dismissed answers."""
+
+    def __init__(self):
+        super().__init__()
+        self.arm = False
+        self.empty_reads = 0
+
+    def set(self, key, value):
+        super().set(key, value)
+        if self.arm:
+            self.arm = False
+            self.empty_reads = 2
+            raise SaveIndeterminate("helper outcome unknown")
+
+    def get(self, key):
+        if self.empty_reads:
+            self.empty_reads -= 1
+            return None
+        return super().get(key)
+
+
+def test_a_keyring_that_answers_nothing_never_gets_a_saved_sign_in_revoked(tmp_path, monkeypatch):
+    """X01: the save landed, then every lookup came back empty. Nothing found
+    is no proof of a sign-out: the sign-in is kept, not revoked."""
+    secrets = QuietAfterWrite()
+    store = SessionStore(secrets=secrets, root=make_store(tmp_path).root)
+    daemon = make_daemon(store, tmp_path, recording_factory([]))
+    assert daemon._adopt(session("old"))["saved"]
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", FakeProton)
+    monkeypatch.setattr(control, "ask", answering(daemon))
+    revoked = pending_sign_in(monkeypatch, uid="new", user_id="U")
+    secrets.arm = True
+    with pytest.raises(cli.LoginFailed):
+        cli._login("me@proton.me")
+    assert store.load("me@proton.me").uid == "new" and revoked == []
+
+
+def test_a_retry_never_ends_a_sign_in_it_did_not_expect(tmp_path, monkeypatch):
+    """X02: A's save landed but stayed unlisted (its read-back failed); B then
+    signed in through another address of the same account, unaware of A. A's
+    retry finds itself saved, but B is not one it meant to replace."""
+    store = SessionStore(secrets=FlakyKeyring(), root=make_store(tmp_path).root)
+    ended, requests = [], []
+    daemon = make_daemon(store, tmp_path, recording_factory(ended))
+    a = session("a", email="old@proton.me", created_at=10.0)
+    b = session("b", email="new@proton.me", created_at=20.0)
+
+    def b_signs_in_meanwhile(request, **kw):
+        parsed = control.parse(json.dumps(request).encode())
+        requests.append(parsed)
+        if len(requests) == 1:
+            store.secrets.arm = True
+            reply = daemon._answer(parsed)
+            assert reply.get("indeterminate") is True and store.accounts() == []
+            assert daemon._adopt(b)["saved"] and store.accounts() == [b.email]
+            return reply
+        return daemon._answer(parsed)
+
+    monkeypatch.setattr(control, "ask", b_signs_in_meanwhile)
+    result = cli._hand_over(store, a)
+    assert requests[1]["retry"] is True and requests[1]["expect"] == []
+    assert result.get("unconfirmed") is True
+    assert ended == [] and daemon.accounts[b.email].client.session.uid == "b"
+
+
+def test_a_retry_never_ends_a_session_only_the_bar_holds(tmp_path, monkeypatch):
+    """X02, held: B was adopted through another address while the keyring kept
+    the old alias and the account list could not be written, so B is held
+    where no lookup finds it. A's retry sees exactly what it expected saved."""
+    store = make_store(tmp_path)
+    ended, requests = [], []
+    daemon = make_daemon(store, tmp_path, recording_factory(ended))
+    predecessor = session("old", email="old@proton.me", created_at=1.0)
+    attempted = session("a", email="old@proton.me", created_at=2.0)
+    later = session("b", email="new@proton.me", created_at=3.0)
+    assert daemon._adopt(predecessor)["saved"]
+    real_write = store_module.write_private
+
+    def never_lands(key, value):
+        raise SaveIndeterminate("helper died before it wrote")
+
+    def cannot_delete(key):
+        raise StoreUnavailable("keyring refused")
+
+    def no_index(path, value):
+        if path == store._index:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(path, value)
+
+    def b_signs_in_meanwhile(request, **kw):
+        parsed = control.parse(json.dumps(request).encode())
+        requests.append(parsed)
+        if len(requests) == 1:
+            with monkeypatch.context() as fault:
+                fault.setattr(store.secrets, "set", never_lands)
+                reply = daemon._answer(parsed)
+            assert reply.get("indeterminate") is True
+            with monkeypatch.context() as fault:
+                fault.setattr(store.secrets, "delete", cannot_delete)
+                fault.setattr(store_module, "write_private", no_index)
+                adopted = daemon._adopt(later)
+            assert adopted["saved"] and adopted["indexFailed"]
+            assert store.accounts() == [predecessor.email]
+            return reply
+        return daemon._answer(parsed)
+
+    monkeypatch.setattr(control, "ask", b_signs_in_meanwhile)
+    result = cli._hand_over(store, attempted)
+    assert requests[1]["expect"] == ["old"] and result.get("unconfirmed") is True
+    assert "b" not in ended and daemon.accounts[later.email].client.session.uid == "b"
+
+
+def test_a_restarted_bar_never_vouches_for_a_sign_in_it_did_not_take_over(tmp_path, monkeypatch):
+    """W02, the rest: the sign-out's keyring delete failed too, so the
+    restarted bar loads the revoked copy. Only the bar that handled the first
+    attempt can tell that no sign-out happened since."""
+    store = make_store(tmp_path)
+    ended, retries = [], []
+    first = make_daemon(store, tmp_path, recording_factory(ended))
+    a = session("signed-out")
+    owner = {"now": first}
+
+    def cannot_delete(key):
+        raise StoreUnavailable("keyring locked")
+
+    def lost_answer_then_restart(request, **kw):
+        parsed = control.parse(json.dumps(request).encode())
+        retries.append(parsed["retry"])
+        reply = owner["now"]._answer(parsed)
+        if len(retries) == 1:
+            assert reply["saved"]
+            with monkeypatch.context() as fault:
+                fault.setattr(store_module, "write_private", disk_full)
+                fault.setattr(store.secrets, "delete", cannot_delete)
+                result = first._logout(a.email)[0]
+            assert result["outcome"] == REVOKED and result["removeFailed"]
+            reopened = SessionStore(secrets=store.secrets, root=store.root)
+            owner["now"] = make_daemon(reopened, tmp_path, recording_factory(ended))
+            owner["now"]._sync_accounts()
+            assert owner["now"].accounts[a.email].client.session.uid == a.uid  # the revoked copy
+            return {"error": "no answer"}
+        return reply
+
+    monkeypatch.setattr(control, "ask", lost_answer_then_restart)
+    result = cli._hand_over(store, a)
+    assert retries == [False, True] and result.get("unconfirmed") is True
+
+
+def test_a_cli_taking_over_never_vouches_for_a_sign_in_it_did_not_handle(tmp_path, monkeypatch):
+    """W02, standalone: the bar handled the first attempt, then exited; the
+    CLI, owner for the retry, cannot know of the sign-out in between."""
+    store = make_store(tmp_path)
+    cli_store = SessionStore(secrets=store.secrets, root=store.root)
+    ended, calls = [], []
+    bar = make_daemon(store, tmp_path, recording_factory(ended))
+    a = session("a")
+
+    def cannot_delete(key):
+        raise StoreUnavailable("keyring locked")
+
+    def ask(request, **kw):
+        parsed = control.parse(json.dumps(request).encode())
+        calls.append(parsed["retry"])
+        if len(calls) == 1:
+            assert bar._answer(parsed)["saved"]
+            with monkeypatch.context() as fault:
+                fault.setattr(store_module, "write_private", disk_full)
+                fault.setattr(store.secrets, "delete", cannot_delete)
+                assert bar._logout(a.email)[0]["removeFailed"]
+            return {"error": "no answer"}
+        return None  # the bar has exited: the CLI is the owner now
+
+    monkeypatch.setattr(control, "ask", ask)
+    result = cli._hand_over(cli_store, a)
+    assert calls == [False, True] and ended == [a.uid] and result.get("unconfirmed") is True
+
+
+def test_a_retry_to_the_bar_that_took_the_first_attempt_is_confirmed_before_any_poll(tmp_path):
+    """The common case those rules keep: the bar adopted the sign-in, its
+    answer was lost, and the retry reaches the same bar before it polled."""
+    store = make_store(tmp_path)
+    bar = make_daemon(store, tmp_path, recording_factory([]))
+    a = session("a")
+    assert bar._adopt(a)["saved"]
+    assert not bar.accounts[a.email].mailbox.synced
+    assert bar._adopt(a, retry=True, expect=[])["saved"]

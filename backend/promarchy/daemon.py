@@ -180,6 +180,7 @@ class Daemon:
         self.notice_until = 0.0
         self.demo_anchor: int | None = None
         self._last_payload = ""
+        self.attempted: list[str] = []  # sign-ins handed over here: a retry's first attempt was ours
         self._published: str | None = None  # digest of _last_payload, for `status`
         self._mirrored = True  # whether state.json holds _last_payload
         self._force_emit = False
@@ -522,6 +523,8 @@ class Daemon:
                 self._record_failure(owned, exc)
                 return UNCONFIRMED
 
+        seen_first = session.uid in self.attempted
+        self.attempted = [u for u in self.attempted if u != session.uid][-63:] + [session.uid]
         if session.uid in self.store.retired():
             # Signed out or replaced here already, even if the keyring kept
             # its entry: a late retry must not be told it is signed in.
@@ -530,6 +533,10 @@ class Daemon:
             a.client.session is not None and a.client.session.uid == session.uid
             for a in self.accounts.values()
         ):
+            if retry and not seen_first:
+                # Loaded from the keyring after a restart: it may have been
+                # signed out since, which only the previous process knew.
+                return {"saved": False, "indeterminate": True, "error": "could not tell"}
             # A repeat of a session we already hold: our tokens are the newer.
             return {"saved": True, "displaced": [], "cleanupFailures": []}
         replaced = [
@@ -539,7 +546,9 @@ class Daemon:
             and (email == session.email or (session.user_id and a.client.session.user_id == session.user_id))
         ]
         try:
-            result = sessions.adopt(self.store, session, end, also=replaced, retry=retry, expect=expect)
+            result = sessions.adopt(
+                self.store, session, end, also=replaced, retry=retry, expect=expect, seen_first=seen_first
+            )
         except Superseded as exc:
             # A late retry of a sign-in that a newer one (or a sign-out) has
             # already replaced: bringing it back would undo the newer one.
