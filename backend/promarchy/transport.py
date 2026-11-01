@@ -80,6 +80,11 @@ class HttpTransport:
         attempts = 2 if method.upper() in IDEMPOTENT else 1
         for attempt in range(attempts):
             conn = self._connection(origin)
+            # Per request: a reused connection keeps whatever the last caller set.
+            limit = float(timeout) if timeout else self.timeout
+            conn.timeout = limit
+            if getattr(conn, "sock", None) is not None:
+                conn.sock.settimeout(limit)
             try:
                 try:
                     conn.request(method, path, body=body, headers=merged)
@@ -159,6 +164,13 @@ def _proxy_for(host: str) -> tuple[str, int, dict[str, str]] | None:
         if entry == "*" or (entry and (host == entry or host.endswith("." + entry))):
             return None
     parts = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+    if parts.scheme.lower() != "http":
+        # TLS to the proxy itself (https://) and SOCKS are not implemented. A
+        # plain CONNECT to such a proxy would hand any credentials in its URL
+        # to the network in the clear, so refuse instead of guessing.
+        raise TransportError(
+            f"{parts.scheme}:// proxies are not supported; point https_proxy at an http:// proxy"
+        )
     if not parts.hostname:
         return None
     headers = {}

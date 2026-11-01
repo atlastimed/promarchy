@@ -262,8 +262,9 @@ def test_logo_downloads_have_a_small_cap(daemon_env):
     d, api, store, clock, states = daemon_env
     seen = {}
 
-    def spy(path, *, params=None, max_bytes):
+    def spy(path, *, params=None, max_bytes, timeout=None):
         seen["max"] = max_bytes
+        seen["timeout"] = timeout
         return 200, "image/png", b"png"
 
     api.fetch_bytes = spy
@@ -271,6 +272,7 @@ def test_logo_downloads_have_a_small_cap(daemon_env):
     store.save(session())
     d.tick()
     assert seen["max"] <= 512 * 1024
+    assert seen["timeout"] is not None and seen["timeout"] <= 10  # logos never wait like mail
 
 
 # --------------------------------------------------------- F07 retry deadlines
@@ -396,7 +398,7 @@ def test_svg_logos_with_external_references_are_discarded(tmp_path):
     avatars = Avatars(root=tmp_path / "logos")
 
     class Client:
-        def fetch_bytes(self, path, *, params=None, max_bytes):
+        def fetch_bytes(self, path, *, params=None, max_bytes, timeout=None):
             return 200, "image/svg+xml", b'<svg><image href="file:///etc/passwd"/></svg>'
 
     row = {"senderImage": True, "senderAddress": "x@example.com"}

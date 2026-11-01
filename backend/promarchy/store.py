@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Protocol
 
@@ -35,6 +35,14 @@ class StoreUnavailable(RuntimeError):
 class SaveIndeterminate(StoreUnavailable):
     """A write was attempted and may or may not have landed (the helper
     timed out or crashed). Never treat this as "nothing changed"."""
+
+
+class Superseded(Exception):
+    """The session was already replaced or signed out: saving it now would
+    bring back an old sign-in over a newer one."""
+
+
+RETIRED_KEEP = 64  # recently replaced or signed-out session UIDs remembered
 
 
 class SecretBackend(Protocol):
@@ -117,10 +125,12 @@ class SecretToolBackend:
             )
         except StoreUnavailable as exc:  # timed out or crashed mid-write
             raise SaveIndeterminate(str(exc)) from exc
-        if result.returncode > 0 and result.stderr.strip():  # the helper refused: nothing was stored
-            raise self._failure("Could not save to the keyring", result)
-        if result.returncode != 0:  # killed by a signal, or failed without saying why
-            raise SaveIndeterminate(f"secret-tool ended with status {result.returncode}")
+        if result.returncode != 0:
+            # Even a reported error (a timeout while the keyring waited on an
+            # unlock prompt, say) does not prove the item was not written, so
+            # the caller reads it back rather than assuming nothing changed.
+            detail = result.stderr.strip()[:200] or f"secret-tool ended with status {result.returncode}"
+            raise SaveIndeterminate(f"Could not confirm the keyring saved it: {detail}")
         # Tidying up after older versions must not turn a save into a failure;
         # a leftover cannot shadow the new item (see get()).
         try:
@@ -145,6 +155,7 @@ class SessionStore:
         self._index = self.root / "accounts.json"
         self._lock = self.root / "accounts.lock"
         self._stamp = self.root / "accounts.stamp"
+        self._retired = self.root / "retired.json"
         self._held = threading.local()
         self.cleanup_failures: list[str] = []  # keyring items replace() could not delete
         self.index_failed = False  # replace() saved the session but not the account list
@@ -171,8 +182,10 @@ class SessionStore:
         if not raw:
             return None
         try:
-            return Session.from_dict(json.loads(raw))
-        except (ValueError, KeyError, TypeError):
+            data = json.loads(raw)
+            # A damaged entry is that account's problem, never every account's.
+            return Session.from_dict(data) if isinstance(data, dict) else None
+        except (ValueError, KeyError, TypeError, AttributeError):
             return None
 
     def generation(self) -> int:
@@ -222,6 +235,8 @@ class SessionStore:
         self.cleanup_failures = []
         self.index_failed = False
         with self._locked():
+            if session.uid in self.retired():
+                raise Superseded("a newer sign-in or a sign-out replaced this session")
             accounts = list(
                 dict.fromkeys(session.email if a.lower() == session.email else a for a in self.accounts())
             )
@@ -256,6 +271,7 @@ class SessionStore:
             for _, stored in aliases:
                 if stored.uid != session.uid:  # the same session merely re-keyed: keep it alive
                     displaced.append(stored)
+            self.retire(s.uid for s in displaced)
             try:
                 if session.email not in accounts:
                     accounts.append(session.email)
@@ -324,7 +340,38 @@ class SessionStore:
             self.secrets.delete(_key(email))
             self._write_index([a for a in self.accounts() if a != email])
             self._bump()
+            if expected_uid is not None:
+                self.retire([expected_uid])
         return True
+
+    def retired(self) -> set[str]:
+        """Sessions replaced or signed out here recently: never adopt them again."""
+        try:
+            data = json.loads(self._retired.read_text())
+        except (OSError, ValueError):
+            return set()
+        return {u for u in data if isinstance(u, str)} if isinstance(data, list) else set()
+
+    def retire(self, uids: Iterable[str]) -> None:
+        """Remember sessions that must not come back (best effort: a failed
+        write only loses this guard, never a session)."""
+        fresh = [u for u in uids if u]
+        if not fresh:
+            return
+        with self._locked():
+            try:
+                data = json.loads(self._retired.read_text())
+                kept = (
+                    [u for u in data if isinstance(u, str) and u not in fresh]
+                    if isinstance(data, list)
+                    else []
+                )
+            except (OSError, ValueError):
+                kept = []
+            try:
+                write_private(self._retired, json.dumps((kept + fresh)[-RETIRED_KEEP:]))
+            except OSError as exc:
+                log_error("remembering replaced sessions", exc)
 
     # ------------------------------------------------------------ internals
 

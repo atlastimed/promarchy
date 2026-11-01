@@ -42,6 +42,7 @@ FRESH_KEEP = 50
 
 WEB_BASE = "https://mail.proton.me"
 VIEW_MODE_MESSAGES = 1
+SETTINGS_RETRY = 300  # seconds before asking again after an odd settings reply
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f​-‏‪-‮⁦-⁩]")
 
@@ -169,6 +170,11 @@ class Mailbox:
 
         self.event_id: str | None = None
         self.view_mode = 0
+        # Proton's mail settings are owed until read once, and again after a
+        # server Refresh or an explicit refresh; kept apart from the event
+        # cursor so a failed read is retried instead of forgotten.
+        self.settings_pending = True
+        self.settings_retry_at = 0.0
         self.unread_times: dict[str, int] = {}
         self.window_complete = True
         self.unread_total = 0
@@ -193,13 +199,13 @@ class Mailbox:
         # Take the event cursor *before* reading data so nothing slips between.
         if self.event_id is None:
             self.event_id = str(self.client.call("GET", "/core/v4/events/latest")["EventID"])
-            self._load_settings()
         self.resync()
 
     def resync(self, *, reload_settings: bool = False) -> None:
         self.dirty = True
         if reload_settings:  # an explicit refresh also picks up Proton's settings
-            self._load_settings()
+            self._owe_settings()
+        self._settle_settings()
         now = int(self.clock())
         self._sync_unread_window(now)
         self._sync_recent()
@@ -213,6 +219,9 @@ class Mailbox:
             self.full_sync()
             return True
         relevant = self.dirty
+        if self.settings_pending and self.clock() >= self.settings_retry_at:
+            relevant = True  # settled inside the rebuild, which then follows them
+            self.dirty = True
         for _ in range(MAX_EVENT_PAGES):
             try:
                 event = self.client.call("GET", f"/core/v4/events/{self.event_id}")
@@ -224,13 +233,17 @@ class Mailbox:
                 self.full_sync()
                 return True
             self.event_id = str(event.get("EventID") or self.event_id)
+            if event.get("Refresh"):
+                # The cursor has moved on: owe the rebuild and a fresh look at
+                # the settings now, before anything that can fail.
+                self.dirty = True
+                self._owe_settings()
+                relevant = True
             settings = event.get("MailSettings")
             if isinstance(settings, dict) and self._apply_settings(settings):
                 relevant = True  # rows and links follow Proton's view mode
                 self.dirty = True
-            if event.get("Refresh"):
-                self._load_settings()
-            if event.get("Refresh") or self.event_is_relevant(event):
+            if self.event_is_relevant(event):
                 relevant = True
                 self.dirty = True
             if not event.get("More"):
@@ -312,13 +325,25 @@ class Mailbox:
 
     # ----------------------------------------------------------- internals
 
-    def _load_settings(self) -> None:
+    def _owe_settings(self) -> None:
+        self.settings_pending = True
+        self.settings_retry_at = 0.0
+
+    def _settle_settings(self) -> None:
+        """Read Proton's mail settings while they are owed. Network, rate-limit
+        and session errors propagate (the account's scheduling must see them)
+        and leave the debt in place; an odd reply keeps the last known mode
+        and is retried a little later."""
+        if not self.settings_pending or self.clock() < self.settings_retry_at:
+            return
         try:
             settings = self.client.call("GET", "/mail/v4/settings").get("MailSettings") or {}
         except (NetworkError, RateLimited, AuthExpired):
-            raise  # the account's own scheduling must see these
+            raise
         except ProtonError:
-            return  # keep what we had; links fall back to the default view
+            self.settings_retry_at = self.clock() + SETTINGS_RETRY
+            return
+        self.settings_pending = False
         self._apply_settings(settings)
 
     def _apply_settings(self, settings: dict) -> bool:
@@ -329,6 +354,11 @@ class Mailbox:
             return False
         changed = mode != self.view_mode
         self.view_mode = mode
+        if changed:
+            # Until the rows are rebuilt for the new mode, give the ones shown
+            # links that are right in it (web_url falls back to the inbox).
+            for row in self.recent:
+                row["url"] = self.web_url(row)
         return changed
 
     @property

@@ -89,8 +89,9 @@ def adopt(
     `end` ends one displaced session with the owner's current tokens for it
     (the saved copy may be older than what the owner holds). `also`: sessions
     the owner holds that this sign-in replaces, in case their saved copies
-    could not be read. Raises StoreUnavailable if nothing changed, and
-    SaveIndeterminate if the new session may or may not have been saved.
+    could not be read. Raises StoreUnavailable if nothing changed,
+    SaveIndeterminate if the new session may or may not have been saved, and
+    Superseded if it was already replaced or signed out (nothing changed).
     """
     displaced = [old for old in store.replace(session) if old.uid != session.uid]
     known = {old.uid for old in displaced}
@@ -98,6 +99,7 @@ def adopt(
         if held.uid != session.uid and held.uid not in known:
             displaced.append(held)
             known.add(held.uid)
+    store.retire(known)  # including held sessions whose saved copies could not be read
     outcomes = []
     for old in displaced:
         try:

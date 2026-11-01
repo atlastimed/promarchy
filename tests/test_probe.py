@@ -77,18 +77,25 @@ class ProbeAPI:
     def get(self, path, params=None):
         if path == "/mail/v4/conversations":
             return {"Conversations": [self.conversation()]}
-        return {"Conversation": self.conversation()}
+        if path.startswith("/mail/v4/messages/"):
+            index = int(path.rsplit("/", 1)[1][1:])
+            return {"Message": {"ID": f"M{index}", "Unread": int(self.messages[index]["unread"])}}
+        messages = [{"ID": f"M{i}", "Unread": int(m["unread"])} for i, m in enumerate(self.messages)]
+        return {"Conversation": self.conversation(), "Messages": messages}
 
     def put(self, path, body):
         self.puts.append(path)
-        if path.endswith("/read"):
+        if path == "/mail/v4/conversations/read":
             for m in self.messages:
                 m["unread"] = False
             if self.fail_read_after_commit:
                 from promarchy.api import NetworkError
 
                 raise NetworkError("reply lost")
-        else:  # Proton marks the newest message in the label unread
+        elif path == "/mail/v4/messages/unread":
+            for mid in body["IDs"]:
+                self.messages[int(mid[1:])]["unread"] = True
+        else:  # conversation-level unread: Proton marks the newest message in the label
             [m for m in self.messages if body["LabelID"] in m["labels"]][-1]["unread"] = True
         return {"Code": 1000}
 
@@ -108,7 +115,7 @@ def test_roundtrip_refuses_conversations_it_could_not_restore(quick):
 def test_roundtrip_restores_even_when_the_read_reply_is_lost(quick):
     api = ProbeAPI([{"labels": {"0"}, "unread": True}], fail_read_after_commit=True)
     result = probe.roundtrip(api, probe.Aliases())
-    assert api.puts == ["/mail/v4/conversations/read", "/mail/v4/conversations/unread"]
+    assert api.puts == ["/mail/v4/conversations/read", "/mail/v4/messages/unread"]
     assert api.messages[0]["unread"] is True
     assert result["restored"] is True and "readError" in result
 
@@ -143,6 +150,23 @@ def test_roundtrip_restores_after_ctrl_c(monkeypatch):
     monkeypatch.setattr(probe, "wait_for", interrupted)
     api = ProbeAPI([{"labels": {"0"}, "unread": True}])
     result = probe.roundtrip(api, probe.Aliases())
-    assert api.puts == ["/mail/v4/conversations/read", "/mail/v4/conversations/unread"]
+    assert api.puts == ["/mail/v4/conversations/read", "/mail/v4/messages/unread"]
     assert api.messages[0]["unread"] is True
     assert result["restored"] is True and result["interrupted"] == "KeyboardInterrupt"
+
+
+def test_roundtrip_restores_the_original_message_when_a_reply_arrives(monkeypatch):
+    """Review B F06: restoring "the conversation" marked the reply unread
+    and left the original message read."""
+    monkeypatch.setattr(probe, "snapshot", lambda: {"counts": {"all": 1}})
+    api = ProbeAPI([{"labels": {"0"}, "unread": True}])
+
+    def reply_arrives(predicate, timeout=0):
+        if len(api.messages) == 1:
+            api.messages.append({"labels": {"0"}, "unread": True})  # a reply lands mid-test
+        return 1.0
+
+    monkeypatch.setattr(probe, "wait_for", reply_arrives)
+    result = probe.roundtrip(api, probe.Aliases())
+    assert result["restored"] is True
+    assert [m["unread"] for m in api.messages] == [True, True]  # original restored, reply untouched

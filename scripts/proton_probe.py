@@ -259,14 +259,15 @@ def is_single_unread(conversation: dict) -> bool:
     )
 
 
-def restore(probe: Probe, cid: str, result: dict) -> None:
-    probe.put("/mail/v4/conversations/unread", {"IDs": [cid], "LabelID": INBOX})
+def restore(probe: Probe, mid: str, result: dict) -> None:
+    # The original message itself, so a reply that arrived meanwhile keeps
+    # its own state (restoring "the conversation" would pick the newest).
+    probe.put("/mail/v4/messages/unread", {"IDs": [mid]})
 
 
-def verify(probe: Probe, cid: str, result: dict) -> None:
-    after = probe.get(f"/mail/v4/conversations/{cid}").get("Conversation") or {}
-    result["unreadAfterRestore"] = after.get("NumUnread")
-    result["restored"] = is_single_unread(after)
+def verify(probe: Probe, mid: str, result: dict) -> None:
+    message = probe.get(f"/mail/v4/messages/{mid}").get("Message") or {}
+    result["restored"] = bool(message.get("Unread"))
 
 
 def roundtrip(probe: Probe, alias: Aliases) -> dict:
@@ -277,8 +278,13 @@ def roundtrip(probe: Probe, alias: Aliases) -> dict:
         return {"skipped": "no unread single-message conversation in the newest 50"}
     cid = str(target["ID"])
     # Re-check just before writing: the list may be seconds old.
-    if not is_single_unread(probe.get(f"/mail/v4/conversations/{cid}").get("Conversation") or {}):
+    detail = probe.get(f"/mail/v4/conversations/{cid}")
+    if not is_single_unread(detail.get("Conversation") or {}):
         return {"skipped": "the chosen conversation changed before the test; nothing was modified"}
+    unread = [str(m["ID"]) for m in detail.get("Messages") or [] if isinstance(m, dict) and m.get("Unread")]
+    if len(unread) != 1:
+        return {"skipped": "could not identify the unread message; nothing was modified"}
+    mid = unread[0]
     before = (snapshot().get("counts") or {}).get("all")
     result: dict = {"conversation": alias(cid, "c"), "barAllBefore": before, "restored": False}
     # Once the read request is sent it may have landed even if its reply is
@@ -295,15 +301,16 @@ def roundtrip(probe: Probe, alias: Aliases) -> dict:
         result["interrupted"] = type(exc).__name__
     for step, action in (("restoreError", restore), ("verifyError", verify)):
         try:
-            action(probe, cid, result)
+            action(probe, mid, result)
         except ProtonError as exc:
             result[step] = f"{type(exc).__name__} (HTTP {exc.status})"
         except (Exception, KeyboardInterrupt) as exc:
             result[step] = type(exc).__name__
     if not result["restored"]:
         result["action"] = (
-            "Restore not confirmed: in Proton Mail, find your newest unread conversation from before this run"
-            f" ({result['conversation']} here) and mark it unread again if it is now read."
+            "Restore not confirmed: in Proton Mail, open the conversation that was your newest unread mail"
+            f" before this run ({result['conversation']} here) and mark its original message unread again"
+            " (not a reply that arrived during the run)."
         )
     elif "interrupted" not in result:
         try:

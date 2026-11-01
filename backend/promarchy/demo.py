@@ -2,8 +2,8 @@
 
 Enabled with the widget setting ``demo``: ``true`` for a healthy inbox, or a
 variant name to see another state (``omarchy bar set atlastimed.promarchy
-demo offline``): offline, expired, partial, warning, signed-out, empty, long,
-multi. Everything is example data; account actions stay off.
+demo offline``): offline, throttled, expired, partial, warning, signed-out,
+empty, long, multi. Everything is example data; account actions stay off.
 """
 
 from __future__ import annotations
@@ -82,7 +82,18 @@ SAMPLES = [
 
 COUNTS = {"1h": 3, "24h": 4, "7d": 27, "all": 112}
 ZERO = {"1h": 0, "24h": 0, "7d": 0, "all": 0}
-VARIANTS = ("ok", "offline", "expired", "partial", "warning", "signed-out", "empty", "long", "multi")
+VARIANTS = (
+    "ok",
+    "offline",
+    "throttled",
+    "expired",
+    "partial",
+    "warning",
+    "signed-out",
+    "empty",
+    "long",
+    "multi",
+)
 YOU = "you@example.com"
 WORK = "dana.okonkwo-lindqvist@research-division.example.org"
 
@@ -122,6 +133,9 @@ def demo_state(now: int, limit: int, kind: str = "ok") -> dict:
     if kind == "offline":
         status, message = "offline", "Cannot reach Proton (offline?)"
         accounts[0].update(status="offline", error=message)
+    elif kind == "throttled":
+        status, message = "throttled", "Next check at 14:05."
+        accounts[0].update(status="throttled")
     elif kind == "expired":
         status = "auth-expired"
         accounts[0].update(status="auth-expired", error="Your Proton session expired. Sign in again.")

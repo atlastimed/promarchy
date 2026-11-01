@@ -54,8 +54,10 @@ Panel {
   readonly property int headerCount: Model.countFor(counts, headerWindow)
   // "partial": some accounts work and some do not; counts are still shown.
   readonly property bool healthy: status === "ok" || status === "partial"
-  // Counts from an earlier sync: shown, but not as if they were current.
+  // Counts from an earlier sync (or paused by Proton): shown, but not as if
+  // they were current.
   readonly property bool stale: status === "offline" || status === "error" || status === "auth-expired"
+    || status === "throttled"
   readonly property bool listEnabled: daemonConfig.recentLimit > 0
   readonly property bool needsSignIn: {
     if (status === "signed-out" || status === "auth-expired") return true
@@ -90,8 +92,15 @@ Panel {
   readonly property string statusMark: Model.statusMark(status, warning)
 
   // ---- cursor ------------------------------------------------------------------
+  // One highlight for pointer and keyboard, in one of two places: a mail row
+  // ("rows") or an action in the accounts section ("accounts").
   property int cursorIndex: 0
   property bool cursorActive: false
+  property string cursorZone: "rows"
+  property int accountCursor: 0
+  // Which message the row cursor is on, so it follows that message (or
+  // lets go) when new mail moves the rows.
+  property string cursorKey: ""
   property real now: Date.now()
   property bool accountsOpen: false
   property bool confirmSignOut: false
@@ -109,21 +118,53 @@ Panel {
     if (mail) mail.configure(daemonConfig)
   }
 
+  function messageKey(message) {
+    return message ? String(message.account || "") + "\n" + String(message.id || "") : ""
+  }
+
   onBarChanged: resolveService()
   onMailChanged: pushConfig()
   onDaemonConfigChanged: pushConfig()
-  onMessagesChanged: if (cursorIndex >= messages.length) cursorIndex = Math.max(0, messages.length - 1)
+  onMessagesChanged: {
+    if (cursorActive && cursorZone === "rows" && cursorKey !== "") {
+      for (var i = 0; i < messages.length; i++) {
+        if (messageKey(messages[i]) === cursorKey) {
+          cursorIndex = i
+          return
+        }
+      }
+      cursorActive = false  // the selected message left the list: select nothing
+    }
+    if (cursorIndex >= messages.length) cursorIndex = Math.max(0, messages.length - 1)
+  }
   onOpenedChanged: if (opened) {
     now = Date.now()
     cursorActive = false
+    cursorZone = "rows"
     cursorIndex = 0
+    cursorKey = ""
     accountsOpen = false
     confirmSignOut = false
     if (flick) flick.contentY = 0
     if (mail) mail.poll()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
-  onAccountsOpenChanged: if (!accountsOpen) confirmSignOut = false
+  onAccountsOpenChanged: {
+    if (!accountsOpen) {
+      confirmSignOut = false
+      if (cursorZone === "accounts") {
+        cursorZone = "rows"
+        cursorActive = false
+      }
+    } else {
+      revealTimer.restart()
+    }
+  }
+  onConfirmSignOutChanged: {
+    // A destructive confirmation starts on its safe choice.
+    accountCursor = confirmSignOut ? 1 : 0
+    if (accountsOpen) revealTimer.restart()
+  }
 
   // The service can appear after the widget (plugin rescans, hot reloads).
   Timer {
@@ -139,6 +180,21 @@ Panel {
     repeat: true
     running: root.opened
     onTriggered: root.now = Date.now()
+  }
+
+  // Scroll the accounts section into view once its new height is laid out.
+  Timer {
+    id: revealTimer
+    interval: 40
+    onTriggered: root.revealItem(accountSection)
+  }
+
+  // Likewise the notice when it says something new: it scrolls with the list,
+  // and feedback scrolled out of sight would be lost.
+  Timer {
+    id: noticeRevealTimer
+    interval: 40
+    onTriggered: root.revealItem(notice)
   }
 
   // ---- actions -----------------------------------------------------------------
@@ -177,18 +233,38 @@ Panel {
     close()
   }
 
+  // Sign-in opens a real terminal: never from the sample data of demo mode.
+  function signIn() {
+    if (!mail || demo) return
+    mail.signIn()
+    close()
+  }
+
   function markRead(message) {
     if (mail && message && message.unreadIds && message.unreadIds.length)
       mail.markRead(message.account, message.unreadIds, message.kind)
   }
 
-  // A row action needs a row the user can see: the first press only shows
-  // the cursor, the next one acts on it.
+  // A row action needs a row the user can see: if none is selected, or the
+  // selected one has scrolled out of view, the key first shows it.
+  function showsSelectedRow() {
+    if (!cursorActive || cursorZone !== "rows" || messages.length === 0) return false
+    var item = rows.itemAt(cursorIndex)
+    if (!item || !flick || !flick.visible) return false
+    var top = item.mapToItem(flick, 0, 0).y
+    return top >= -0.5 && top + item.height <= flick.height + 0.5
+  }
+
+  function revealSelectedRow() {
+    if (messages.length === 0) return
+    if (cursorZone !== "rows" || !cursorActive) setCursor(Math.min(cursorIndex, messages.length - 1))
+    scrollCursorIntoView()
+  }
+
   function markSelectedRead() {
     if (messages.length === 0) return
-    if (!cursorActive) {
-      cursorActive = true
-      scrollCursorIntoView()
+    if (!showsSelectedRow()) {
+      revealSelectedRow()
       return
     }
     markRead(selectedMessage())
@@ -212,33 +288,95 @@ Panel {
   }
 
   function setCursor(index) {
+    cursorZone = "rows"
     cursorActive = true
     cursorIndex = index
+    cursorKey = messageKey(messages[index])
+  }
+
+  // The accounts section's actions, in order, for the keyboard cursor.
+  function accountActions() {
+    if (!accountsOpen || demo) return []
+    return confirmSignOut ? ["confirm", "cancel"] : ["add", "signout"]
+  }
+
+  function setAccountCursor(index) {
+    cursorZone = "accounts"
+    cursorActive = true
+    accountCursor = index
+  }
+
+  function runAccountAction(action) {
+    if (action === "add") signIn()
+    else if (action === "signout") confirmSignOut = true
+    else if (action === "cancel") confirmSignOut = false
+    else if (action === "confirm") {
+      confirmSignOut = false
+      accountsOpen = false
+      if (mail && !demo) mail.signOut()
+    }
+  }
+
+  // From the keyboard the cursor moves into the section; a click leaves the
+  // highlight with the pointer (one highlight at a time).
+  function toggleAccounts(fromKeyboard) {
+    accountsOpen = !accountsOpen
+    if (fromKeyboard && accountsOpen && accountActions().length > 0) setAccountCursor(0)
   }
 
   function moveCursor(dx, dy) {
+    var actions = accountActions()
+    if (cursorZone === "accounts" && cursorActive && actions.length > 0) {
+      var step = dx !== 0 ? dx : dy
+      if (step < 0 && accountCursor === 0 && dx === 0) {
+        if (messages.length > 0) setCursor(messages.length - 1)  // back up into the list
+        scrollCursorIntoView()
+        return
+      }
+      setAccountCursor(Math.max(0, Math.min(actions.length - 1, accountCursor + step)))
+      revealTimer.restart()
+      return
+    }
     if (dx !== 0) {
       stepWindow(dx)
       return
     }
-    if (messages.length === 0) return
-    if (!cursorActive) {
-      cursorActive = true
-      scrollCursorIntoView()
+    if (messages.length === 0) {
+      if (dy > 0 && actions.length > 0) setAccountCursor(0)
       return
     }
-    cursorIndex = Math.max(0, Math.min(messages.length - 1, cursorIndex + dy))
+    if (!cursorActive) {
+      revealSelectedRow()
+      return
+    }
+    if (dy > 0 && cursorIndex === messages.length - 1 && actions.length > 0) {
+      setAccountCursor(0)  // down from the last row into the accounts section
+      revealTimer.restart()
+      return
+    }
+    setCursor(Math.max(0, Math.min(messages.length - 1, cursorIndex + dy)))
     scrollCursorIntoView()
   }
 
   function activateCursor() {
     if (!signedIn) {
-      if (mail) mail.signIn()
-      close()
+      signIn()
       return
     }
-    if (cursorActive) openMessage(selectedMessage())
-    else openInbox()
+    var actions = accountActions()
+    if (cursorZone === "accounts" && cursorActive && accountCursor < actions.length) {
+      runAccountAction(actions[accountCursor])
+      return
+    }
+    if (!cursorActive) {
+      openInbox()
+      return
+    }
+    if (!showsSelectedRow()) {
+      revealSelectedRow()
+      return
+    }
+    openMessage(selectedMessage())
   }
 
   function handleKey(text) {
@@ -249,11 +387,21 @@ Panel {
     case "o": openInbox(); break
     case "c": compose(); break
     case "n": persist({ notify: !notifyEnabled }); break
+    case "s": if (signedIn) toggleAccounts(true); break
     case "1": setWindow("1h"); break
     case "2": setWindow("24h"); break
     case "3": setWindow("7d"); break
     case "4": setWindow("all"); break
     }
+  }
+
+  function revealItem(item) {
+    if (!item || !flick || !item.visible) return
+    var top = item.mapToItem(flick.contentItem, 0, 0).y
+    var bottom = top + item.height
+    var maxY = Math.max(0, flick.contentHeight - flick.height)
+    if (bottom > flick.contentY + flick.height) flick.contentY = Math.min(maxY, bottom - flick.height)
+    if (top < flick.contentY) flick.contentY = Math.max(0, top)
   }
 
   function scrollCursorIntoView() {
@@ -318,13 +466,13 @@ Panel {
         font.bold: true
       }
 
-      // Offline, needs attention, or a sign-in not yet saved: visible without
-      // opening the panel, and not by colour alone.
+      // Offline, paused by Proton, needs attention, or a sign-in not yet
+      // saved: visible without opening the panel, and not by colour alone.
       Text {
         textFormat: Text.PlainText
         visible: text !== ""
         text: root.statusMark
-        color: root.status === "offline" ? root.barDim : root.highlight
+        color: root.status === "offline" || root.status === "throttled" ? root.barDim : root.highlight
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
       }
@@ -352,7 +500,9 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) { root.handleKey(t) }
 
-      // Header and footer stay put; only the list scrolls.
+      // The title and count row and the footer stay put; everything of
+      // variable height (notices, the list, the accounts section) scrolls in
+      // between, so no control can end up below the screen.
       ColumnLayout {
         id: layout
         anchors.fill: parent
@@ -362,7 +512,7 @@ Panel {
           id: hero
           Layout.fillWidth: true
           title: "Proton Mail"
-          meta: root.signedIn && root.healthy
+          meta: root.signedIn && (root.healthy || root.status === "throttled")
             ? Model.headline(root.headerCount, root.headerWindow, root.capped)
             : Model.statusLine(root.status, root.mail ? root.mail.message : "")
           foreground: root.foreground
@@ -431,91 +581,17 @@ Panel {
           }
         }
 
-        // Sign-in, expired session, offline and error states, plus anything
-        // the backend reported that the user can act on.
-        CursorSurface {
-          id: notice
-          readonly property bool needsSignIn: root.needsSignIn
-          readonly property string text: Model.noticeText(root.status, root.mail ? root.mail.message : "", root.warning)
-          visible: text !== ""
-          Layout.fillWidth: true
-          implicitHeight: noticeColumn.implicitHeight + Style.spacing.rowPaddingX * 2
-          foreground: root.foreground
-          bordered: true
-
-          Column {
-            id: noticeColumn
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            anchors.margins: Style.spacing.rowPaddingX
-            spacing: Style.space(10)
-
-            Text {
-              textFormat: Text.PlainText
-              width: parent.width
-              wrapMode: Text.WordWrap
-              lineHeight: 1.1
-              color: root.status === "error" || root.status === "partial" || root.warning !== "" ? root.highlight : root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              text: notice.text
-            }
-
-            Button {
-              visible: notice.needsSignIn || root.status === "error"
-              text: notice.needsSignIn ? "Sign in" : "Retry"
-              iconText: notice.needsSignIn ? "󰍂" : "󰑐"
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: {
-                if (!root.mail) return
-                if (notice.needsSignIn) {
-                  root.mail.signIn()
-                  root.close()
-                } else {
-                  root.mail.refresh()
-                }
-              }
-            }
-          }
-        }
-
-        PanelSeparator {
-          visible: root.signedIn && root.listEnabled
-          Layout.fillWidth: true
-          foreground: root.foreground
-        }
-
-        PanelSectionHeader {
-          visible: root.signedIn && root.listEnabled
-          Layout.fillWidth: true
-          text: "RECENT INBOX"
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-        }
-
-        Text {
-          visible: root.signedIn && root.listEnabled && root.messages.length === 0
-          Layout.fillWidth: true
-          textFormat: Text.PlainText
-          wrapMode: Text.WordWrap
-          text: Model.emptyText(root.status, root.daemonConfig.recentLimit)
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-        }
-
         Flickable {
           id: flick
-          visible: root.signedIn && root.listEnabled && root.messages.length > 0
+          // From the state, never from the content's own height: hidden
+          // children measure zero, so that would never show again.
+          visible: notice.text !== "" || (root.signedIn && (root.listEnabled || root.accountsOpen))
           Layout.fillWidth: true
           Layout.fillHeight: true
-          Layout.preferredHeight: rowColumn.implicitHeight
-          Layout.minimumHeight: Math.min(rowColumn.implicitHeight, Style.space(120))
+          Layout.preferredHeight: scrollColumn.implicitHeight
+          Layout.minimumHeight: Math.min(scrollColumn.implicitHeight, Style.space(80))
           contentWidth: width
-          contentHeight: rowColumn.implicitHeight
+          contentHeight: scrollColumn.implicitHeight
           clip: true
           boundsBehavior: Flickable.StopAtBounds
           flickableDirection: Flickable.VerticalFlick
@@ -523,167 +599,258 @@ Panel {
           ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
           Column {
-            id: rowColumn
+            id: scrollColumn
             width: flick.width
-            spacing: Style.space(2)
+            spacing: Style.space(12)
 
-            Repeater {
-              id: rows
-              model: root.messages
-
-              MessageRow {
-                required property var modelData
-                required property int index
-                width: rowColumn.width
-                message: modelData
-                rowIndex: index
-              }
-            }
-          }
-        }
-
-        // Account maintenance, kept apart from everyday mail actions.
-        Column {
-          id: accountSection
-          visible: root.signedIn && root.accountsOpen
-          Layout.fillWidth: true
-          spacing: Style.space(8)
-
-          PanelSeparator {
-            width: parent.width
-            foreground: root.foreground
-          }
-
-          PanelSectionHeader {
-            width: parent.width
-            text: root.accounts.length > 1 ? "ACCOUNTS" : "ACCOUNT"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-          }
-
-          Repeater {
-            model: root.accounts
-
-            RowLayout {
-              required property var modelData
-              width: accountSection.width
-              spacing: Style.space(8)
-
-              Text {
-                Layout.fillWidth: true
-                textFormat: Text.PlainText
-                text: modelData.email
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                elide: Text.ElideMiddle
-              }
-
-              Text {
-                textFormat: Text.PlainText
-                text: Model.accountState(modelData.status)
-                color: modelData.status === "ok" || modelData.status === "starting" ? root.dim : root.highlight
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-          }
-
-          Text {
-            visible: root.demo
-            width: parent.width
-            textFormat: Text.PlainText
-            wrapMode: Text.WordWrap
-            text: "Demo mode shows sample mail, so account actions are off here."
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-          }
-
-          RowLayout {
-            visible: !root.demo && !root.confirmSignOut
-            width: parent.width
-            spacing: Style.space(6)
-
-            Button {
-              text: "Add account"
-              iconText: "󰀔"
-              tooltipText: "Sign in to another Proton account"
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              onClicked: {
-                if (root.mail) root.mail.signIn()
-                root.close()
-              }
-            }
-
-            Item { Layout.fillWidth: true }
-
-            Button {
-              text: root.accounts.length > 1 ? "Sign out of all" : "Sign out"
-              iconText: "󰍃"
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              onClicked: root.confirmSignOut = true
-            }
-          }
-
-          // Signing back in may need a CAPTCHA, so the scope is spelled out
-          // and there is a plain way back.
-          Column {
-            visible: !root.demo && root.confirmSignOut
-            width: parent.width
-            spacing: Style.space(8)
-
-            Text {
+            // Sign-in, expired session, offline and error states, plus
+            // anything the backend reported that the user can act on.
+            CursorSurface {
+              id: notice
+              readonly property bool needsSignIn: root.needsSignIn
+              readonly property string text: Model.noticeText(root.status, root.mail ? root.mail.message : "", root.warning)
+              visible: text !== ""
+              onTextChanged: if (text !== "" && root.opened) noticeRevealTimer.restart()
               width: parent.width
-              textFormat: Text.PlainText
-              wrapMode: Text.WordWrap
-              text: Model.signOutQuestion(root.accounts.length)
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
+              implicitHeight: noticeColumn.implicitHeight + Style.spacing.rowPaddingX * 2
+              foreground: root.foreground
+              bordered: true
+
+              Column {
+                id: noticeColumn
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.margins: Style.spacing.rowPaddingX
+                spacing: Style.space(10)
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  lineHeight: 1.1
+                  color: root.status === "error" || root.status === "partial" || root.warning !== "" ? root.highlight : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  text: notice.text
+                }
+
+                Text {
+                  visible: root.demo && notice.needsSignIn
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  wrapMode: Text.WordWrap
+                  text: "Demo mode shows sample data, so sign-in is off here."
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Button {
+                  visible: !root.demo && (notice.needsSignIn || root.status === "error")
+                  text: notice.needsSignIn ? "Sign in" : "Retry"
+                  iconText: notice.needsSignIn ? "󰍂" : "󰑐"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: {
+                    if (notice.needsSignIn) root.signIn()
+                    else if (root.mail) root.mail.refresh()
+                  }
+                }
+              }
+            }
+
+            PanelSeparator {
+              visible: root.signedIn && root.listEnabled
+              width: parent.width
+              foreground: root.foreground
+            }
+
+            PanelSectionHeader {
+              visible: root.signedIn && root.listEnabled
+              width: parent.width
+              text: "RECENT INBOX"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
             }
 
             Text {
+              visible: root.signedIn && root.listEnabled && root.messages.length === 0
               width: parent.width
               textFormat: Text.PlainText
               wrapMode: Text.WordWrap
-              text: "Signing back in needs your password and 2FA code, and Proton may ask for a browser check."
+              text: Model.emptyText(root.status, root.daemonConfig.recentLimit)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
             }
 
-            Row {
-              spacing: Style.space(6)
+            Column {
+              id: rowColumn
+              visible: root.signedIn && root.listEnabled && root.messages.length > 0
+              width: parent.width
+              spacing: Style.space(2)
 
-              Button {
-                text: "Sign out"
-                iconText: "󰍃"
-                bordered: true
-                foreground: root.highlight
+              Repeater {
+                id: rows
+                model: root.messages
+
+                MessageRow {
+                  required property var modelData
+                  required property int index
+                  width: rowColumn.width
+                  message: modelData
+                  rowIndex: index
+                }
+              }
+            }
+
+            // Account maintenance, kept apart from everyday mail actions.
+            Column {
+              id: accountSection
+              visible: root.signedIn && root.accountsOpen
+              width: parent.width
+              spacing: Style.space(8)
+
+              PanelSeparator {
+                width: parent.width
+                foreground: root.foreground
+              }
+
+              PanelSectionHeader {
+                width: parent.width
+                text: root.accounts.length > 1 ? "ACCOUNTS" : "ACCOUNT"
+                foreground: root.foreground
                 fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                onClicked: {
-                  root.confirmSignOut = false
-                  root.accountsOpen = false
-                  if (root.mail) root.mail.signOut()
+              }
+
+              Repeater {
+                model: root.accounts
+
+                RowLayout {
+                  required property var modelData
+                  width: accountSection.width
+                  spacing: Style.space(8)
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: modelData.email
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideMiddle
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: Model.accountState(modelData.status)
+                    color: modelData.status === "ok" || modelData.status === "starting" ? root.dim : root.highlight
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
               }
 
-              Button {
-                text: "Cancel"
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                onClicked: root.confirmSignOut = false
+              Text {
+                visible: root.demo
+                width: parent.width
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                text: "Demo mode shows sample mail, so account actions are off here."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              RowLayout {
+                visible: !root.demo && !root.confirmSignOut
+                width: parent.width
+                spacing: Style.space(6)
+
+                Button {
+                  text: "Add account"
+                  iconText: "󰀔"
+                  tooltipText: "Sign in to another Proton account"
+                  bordered: true
+                  hasCursor: root.cursorActive && root.cursorZone === "accounts" && root.accountCursor === 0
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  onHovered: function(on) { if (on) root.setAccountCursor(0) }
+                  onClicked: root.runAccountAction("add")
+                }
+
+                Item { Layout.fillWidth: true }
+
+                Button {
+                  text: root.accounts.length > 1 ? "Sign out of all" : "Sign out"
+                  iconText: "󰍃"
+                  bordered: true
+                  hasCursor: root.cursorActive && root.cursorZone === "accounts" && root.accountCursor === 1
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  onHovered: function(on) { if (on) root.setAccountCursor(1) }
+                  onClicked: root.runAccountAction("signout")
+                }
+              }
+
+              // Signing back in may need a CAPTCHA, so the scope is spelled
+              // out and there is a plain way back (where the cursor starts).
+              Column {
+                visible: !root.demo && root.confirmSignOut
+                width: parent.width
+                spacing: Style.space(8)
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  wrapMode: Text.WordWrap
+                  text: Model.signOutQuestion(root.accounts.length)
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  wrapMode: Text.WordWrap
+                  text: "Signing back in needs your password and 2FA code, and Proton may ask for a browser check."
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Row {
+                  spacing: Style.space(6)
+
+                  Button {
+                    text: "Sign out"
+                    iconText: "󰍃"
+                    bordered: true
+                    hasCursor: root.cursorActive && root.cursorZone === "accounts" && root.accountCursor === 0
+                    foreground: root.highlight
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.bodySmall
+                    onHovered: function(on) { if (on) root.setAccountCursor(0) }
+                    onClicked: root.runAccountAction("confirm")
+                  }
+
+                  Button {
+                    text: "Cancel"
+                    bordered: true
+                    hasCursor: root.cursorActive && root.cursorZone === "accounts" && root.accountCursor === 1
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.bodySmall
+                    onHovered: function(on) { if (on) root.setAccountCursor(1) }
+                    onClicked: root.runAccountAction("cancel")
+                  }
+                }
               }
             }
           }
@@ -743,13 +910,13 @@ Panel {
 
           Button {
             iconText: "󰀄"
-            tooltipText: root.accountsOpen ? "Hide accounts" : "Accounts: add another, sign out"
+            tooltipText: root.accountsOpen ? "Hide accounts (s)" : "Accounts: add another, sign out (s)"
             selected: root.accountsOpen
             foreground: root.foreground
             fontFamily: root.fontFamily
             horizontalPadding: Style.spacing.sm
             verticalPadding: Style.spacing.sm
-            onClicked: root.accountsOpen = !root.accountsOpen
+            onClicked: root.toggleAccounts(false)
           }
         }
       }
@@ -769,7 +936,7 @@ Panel {
       return name || address || "Unknown sender"
     }
 
-    hasCursor: root.cursorActive && root.cursorIndex === rowIndex
+    hasCursor: root.cursorActive && root.cursorZone === "rows" && root.cursorIndex === rowIndex
     foreground: root.foreground
     implicitHeight: rowContent.implicitHeight + Style.space(14)
 

@@ -390,17 +390,39 @@ def test_the_new_session_is_revoked_only_when_it_was_certainly_not_saved(tmp_pat
         cli._login("me@proton.me")
     assert revoked == ([] if kept else ["u2"])
     if kept:
-        assert "did not confirm" in str(failure.value)
+        assert "could not confirm" in str(failure.value) or "did not confirm" in str(failure.value)
 
 
-def test_a_lost_answer_after_the_bar_saved_is_a_success(tmp_path, monkeypatch, capsys):
+def test_a_saved_but_unconfirmed_sign_in_is_kept_and_reported(tmp_path, monkeypatch, capsys):
+    """The keyring and account list hold the session, but the owner never
+    confirmed switching to it: kept (never revoked on a guess), and the user
+    is told what is unconfirmed rather than shown a plain success."""
     store = make_store(tmp_path)
     monkeypatch.setattr(cli, "SessionStore", lambda: store)
     revoked = pending_sign_in(monkeypatch)
+    asks = []
 
     def ask(request):
+        asks.append(request["cmd"])
         store.replace(Session.from_dict(request["session"]))  # it ran, then the connection broke
         return {"error": "no answer"}
+
+    monkeypatch.setattr(control, "ask", ask)
+    with pytest.raises(cli.LoginFailed, match="saved, but the bar did not confirm"):
+        cli._login("me@proton.me")
+    assert asks == ["adopt", "adopt"]  # asked the owner again, despite the listed address
+    assert revoked == []
+
+
+def test_a_lost_answer_then_a_confirmed_retry_is_a_success(tmp_path, monkeypatch, capsys):
+    store = make_store(tmp_path)
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    revoked = pending_sign_in(monkeypatch)
+    replies = iter([{"error": "no answer"}, {"saved": True, "displaced": [], "cleanupFailures": []}])
+
+    def ask(request):
+        store.replace(Session.from_dict(request["session"]))
+        return next(replies)
 
     monkeypatch.setattr(control, "ask", ask)
     assert cli._login("me@proton.me") == "me@proton.me"
@@ -721,10 +743,11 @@ def test_a_helper_killed_after_writing_is_indeterminate_not_a_refusal(monkeypatc
         backend = tool_backend(monkeypatch, lambda *a, secret=None, r=result: r)
         with pytest.raises(SaveIndeterminate):
             backend.set("session:x", "{}")
-    refused = tool_backend(monkeypatch, lambda *a, secret=None: completed(1, stderr="Cannot create an item"))
-    with pytest.raises(StoreUnavailable) as failure:
-        refused.set("session:x", "{}")
-    assert not isinstance(failure.value, SaveIndeterminate)
+    # Even a stated error does not prove nothing was written (a timeout while
+    # the keyring waited on an unlock prompt, say): the store reads it back.
+    stated = tool_backend(monkeypatch, lambda *a, secret=None: completed(1, stderr="Timeout was reached"))
+    with pytest.raises(SaveIndeterminate):
+        stated.set("session:x", "{}")
 
 
 def test_a_leftover_from_an_older_version_never_shadows_the_current_item(monkeypatch):

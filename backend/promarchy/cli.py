@@ -33,7 +33,7 @@ from .auth import (
     submit_totp,
 )
 from .paths import runtime_dir, state_dir, write_private
-from .store import SaveIndeterminate, SessionStore, StoreUnavailable
+from .store import SaveIndeterminate, SessionStore, StoreUnavailable, Superseded
 
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -154,6 +154,8 @@ def _login(username: str | None) -> str:
     return email
 
 
+SUPERSEDED = "A newer sign-in or a sign-out replaced this one before it was saved, so it was not kept."
+
 BAR_NOT_ANSWERING = (
     "Promarchy's background process is running but did not answer, so nothing was saved.\n"
     "  Try again in a moment."
@@ -167,28 +169,37 @@ def _hand_over(store: SessionStore, session: Session) -> dict:
 
     The new session is revoked (by the caller) only when it was certainly not
     saved. When the outcome is unknown, revoking could end a session the bar
-    has just taken, so the owner is asked once more instead: adopting the
-    same session again is harmless, and either finishes registering it or
-    finds it already held.
+    has just taken, so the owner is asked once more instead, even if the
+    keyring already lists it (only the owner switching over completes a
+    sign-in). Adopting the same session again is harmless: the owner either
+    finishes registering it, finds it already held, or, if a newer sign-in or
+    a sign-out has replaced it meanwhile, refuses to bring it back.
     """
     outcome, reply = _attempt(store, session)
     if outcome == "saved":
         return reply
-    if outcome == "refused":
+    if outcome in ("refused", "superseded"):
         raise LoginFailed(reply)
-    if not _registered(store, session):
-        outcome, reply = _attempt(store, session)
-        if outcome == "saved":
-            # The lost first attempt may already have ended older sessions,
-            # and its report is gone: do not vouch for them either way.
-            return {**reply, "displaced": None}
-    unconfirmed = not _registered(store, session)
-    return {"saved": True, "displaced": None, "cleanupFailures": [], "unconfirmed": unconfirmed}
+    outcome, reply = _attempt(store, session)
+    if outcome == "saved":
+        # The lost first attempt may already have ended older sessions, and
+        # its report is gone: do not vouch for them either way.
+        return {**reply, "displaced": None}
+    if outcome == "superseded":
+        raise LoginFailed(reply)
+    return {
+        "saved": True,
+        "displaced": None,
+        "cleanupFailures": [],
+        "unconfirmed": True,
+        "registered": _registered(store, session),
+    }
 
 
 def _attempt(store: SessionStore, session: Session) -> tuple[str, Any]:
     """One hand-over: ("saved", reply), ("refused", why) when nothing was
-    saved, or ("unknown", None)."""
+    saved, ("superseded", why) when a newer sign-in or a sign-out already
+    replaced it, or ("unknown", None)."""
     reply = control.ask({"cmd": "adopt", "session": session.to_dict()})
     if reply is None:  # no bar running: become the owner for this step
         lock = control.take_lock()
@@ -197,6 +208,8 @@ def _attempt(store: SessionStore, session: Session) -> tuple[str, Any]:
         try:
             reply = sessions.adopt(store, session, lambda old: sessions.end_displaced(ProtonClient(old)))
             return "saved", reply
+        except Superseded:
+            return "superseded", SUPERSEDED
         except SaveIndeterminate:
             return "unknown", None
         except Exception as exc:  # nothing was written
@@ -205,6 +218,8 @@ def _attempt(store: SessionStore, session: Session) -> tuple[str, Any]:
             os.close(lock)
     if reply.get("saved") is True:
         return "saved", reply
+    if reply.get("superseded") is True:
+        return "superseded", SUPERSEDED
     error = reply.get("error")
     if error == "busy":  # it never ran, and never will
         return "refused", BAR_NOT_ANSWERING
@@ -236,10 +251,15 @@ def _uninterruptible():
 
 def _report_replacement(handed: dict, email: str) -> None:
     if handed.get("unconfirmed"):
+        if handed.get("registered"):
+            raise LoginFailed(
+                "Signed in and saved, but the bar did not confirm it switched to this sign-in.\n"
+                "  If it still asks you to sign in, restart it with: omarchy restart shell"
+            )
         raise LoginFailed(
-            "Signed in, but Promarchy's background process did not confirm that it saved the session.\n"
-            "  If the bar does not show your mail within a minute, sign in again. Any session left\n"
-            "  behind can be ended under Proton's Settings → Security → Session management."
+            "Signed in, but Promarchy could not confirm the keyring saved the session (is it locked?).\n"
+            "  Unlock the keyring and sign in again. The session from this attempt can be ended under\n"
+            "  Proton's Settings → Security → Session management."
         )
     for leftover in handed.get("cleanupFailures") or []:
         print(
@@ -509,11 +529,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         state = json.loads(path.read_text())
     except (OSError, ValueError):
         state = None
-    # The snapshot outlives a process that died: only trust it while the bar's
-    # background process still holds its lock.
-    lock = control.take_lock()
-    if lock is not None:
-        os.close(lock)
+    # The snapshot outlives a process that died, and a standalone login or
+    # logout holds the same lock as the bar: only a daemon answering on its
+    # socket makes the snapshot current.
+    reply = control.ask({"cmd": "ping"}, timeout=3)
+    alive = reply is not None and (reply.get("alive") is True or reply.get("error") == "unsupported request")
+    if not alive:
         state = None
     if state is None:
         print("The Promarchy daemon is not running (is the bar widget enabled?).", file=sys.stderr)

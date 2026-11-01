@@ -62,16 +62,28 @@ def hold_daemon_lock():
 
 
 def test_status_window(monkeypatch, tmp_path, capsys):
-    import os
+    from promarchy import control
 
     (tmp_path / "state.json").write_text(json.dumps({"status": "ok", "counts": {"24h": 4}}))
     monkeypatch.setattr(cli, "runtime_dir", lambda: tmp_path)
+    monkeypatch.setattr(control, "ask", lambda request, timeout=None: {"alive": True})  # a daemon answers
+    assert cli.main(["status", "--window", "24h"]) == 0
+    assert capsys.readouterr().out.strip() == "4"
+
+
+def test_status_is_not_fooled_by_a_standalone_command_holding_the_lock(monkeypatch, tmp_path, capsys):
+    """A standalone login or logout holds the same lock as the bar."""
+    import os
+
+    (tmp_path / "state.json").write_text(json.dumps({"status": "ok", "counts": {"24h": 123}}))
+    monkeypatch.setattr(cli, "runtime_dir", lambda: tmp_path)
     held = hold_daemon_lock()
     try:
-        assert cli.main(["status", "--window", "24h"]) == 0
+        assert cli.main(["status", "--window", "24h"]) == 1  # no daemon socket answers
     finally:
         os.close(held)
-    assert capsys.readouterr().out.strip() == "4"
+    out = capsys.readouterr()
+    assert out.out == "" and "not running" in out.err
 
 
 def test_status_never_presents_a_dead_daemons_snapshot_as_live(monkeypatch, tmp_path, capsys):

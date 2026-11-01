@@ -9,6 +9,8 @@ import pytest
 from promarchy import transport
 from promarchy.transport import HttpTransport, TransportError
 
+REAL_HTTPS_CONNECTION = http.client.HTTPSConnection
+
 
 class FakeResponse:
     def __init__(self, status=200, body=b"{}", headers=None, will_close=False):
@@ -64,8 +66,9 @@ def fake_connections(monkeypatch):
     FakeConnection.instances = []
     FakeConnection.script = []
     monkeypatch.setattr(http.client, "HTTPSConnection", FakeConnection)
-    monkeypatch.delenv("https_proxy", raising=False)
-    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    # An inherited proxy setting (lowercase wins) must never steer these tests.
+    for name in ("https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
     yield
 
 
@@ -171,3 +174,42 @@ def test_corrupt_gzip_is_a_transport_error():
     FakeConnection.script = [FakeResponse(body=b"not gzip", headers=[("Content-Encoding", "gzip")])] * 2
     with pytest.raises(TransportError, match="corrupt"):
         HttpTransport().request("GET", "https://mail-api.proton.me/a")
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://me:secret@proxy.lan:3128", "https://proxy.lan:3128", "socks5://me:secret@proxy.lan:1080"],
+)
+def test_unsupported_proxy_schemes_are_refused_before_connecting(monkeypatch, url):
+    monkeypatch.setenv("HTTPS_PROXY", url)
+    FakeConnection.script = [FakeResponse()]
+    with pytest.raises(TransportError, match="not supported"):
+        HttpTransport().request("GET", "https://mail-api.proton.me/a")
+    assert FakeConnection.instances == []  # nothing was opened, let alone sent
+
+
+def test_an_https_proxy_url_never_puts_credentials_on_the_wire(monkeypatch):
+    """Real sockets: a loopback listener posing as the proxy must receive nothing."""
+    import socket as socketlib
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", REAL_HTTPS_CONNECTION)
+    with socketlib.socket(socketlib.AF_INET, socketlib.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(0.5)
+        port = listener.getsockname()[1]
+        monkeypatch.setenv("HTTPS_PROXY", f"https://me:secret@127.0.0.1:{port}")
+        with pytest.raises(TransportError):
+            HttpTransport(timeout=2).request("GET", "https://mail-api.proton.me/a")
+        with pytest.raises(TimeoutError):
+            listener.accept()
+
+
+def test_each_request_gets_its_own_timeout():
+    """A reused connection must not keep the previous caller's timeout."""
+    FakeConnection.script = [FakeResponse(), FakeResponse()]
+    t = HttpTransport(timeout=20)
+    t.request("GET", "https://mail-api.proton.me/a", timeout=8)
+    assert FakeConnection.instances[0].timeout == 8
+    t.request("GET", "https://mail-api.proton.me/b")
+    assert len(FakeConnection.instances) == 1 and FakeConnection.instances[0].timeout == 20

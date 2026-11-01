@@ -172,7 +172,7 @@ class LogoClient:
     def __init__(self, ctype, body):
         self.ctype, self.body, self.params = ctype, body, None
 
-    def fetch_bytes(self, path, *, params=None, max_bytes):
+    def fetch_bytes(self, path, *, params=None, max_bytes, timeout=None):
         self.params = params
         return 200, self.ctype, self.body
 

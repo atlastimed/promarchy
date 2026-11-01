@@ -93,6 +93,7 @@ Item {
   // Omarchy's floating terminal and waits for Enter so the result stays
   // readable. argv only: nothing here passes through a shell.
   function signIn() {
+    if (demo) return  // the sample inbox must never start a real sign-in
     Quickshell.execDetached([
       "uwsm-app", "--", "xdg-terminal-exec",
       "--app-id=org.omarchy.terminal", "--title=Promarchy sign-in",

@@ -57,6 +57,8 @@ def parse(line: bytes) -> dict:
     if not isinstance(request, dict):
         raise BadRequest("invalid request")
     cmd = request.get("cmd")
+    if cmd == "ping":  # liveness for `promarchyctl status`; answered at once
+        return {"cmd": "ping"}
     if cmd == "logout":
         account = request.get("account")
         local = request.get("local", False)

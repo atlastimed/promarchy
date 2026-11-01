@@ -34,4 +34,4 @@ jobs:
         run: python -m pytest -q
 
       - name: Widget model tests
-        run: node --test tests/
+        run: node --test tests/model.test.mjs

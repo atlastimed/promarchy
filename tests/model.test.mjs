@@ -81,7 +81,9 @@ test("the notice keeps what the backend said (review: dropdown hid backend warni
   const locked = M.noticeText("auth-expired", "Could not find the saved session for me@proton.me. If your keyring is locked, unlock it; otherwise sign in again.", "")
   assert.match(locked, /unlock it/)
   assert.equal(M.noticeText("ok", "", ""), "")
-  assert.equal(M.noticeText("starting", "Connecting to Proton…", ""), "")
+  assert.equal(M.noticeText("starting", "", ""), "")
+  // A real notice during start-up (a sign-out Proton could not confirm) is no longer hidden.
+  assert.match(M.noticeText("starting", "me@proton.me: Proton could not be reached.", ""), /could not be reached/)
 })
 
 test("empty lists say why", () => {
@@ -142,4 +144,12 @@ test("tooltips wrap to the panel instead of running off it", () => {
   assert.equal(M.wrapLines("short", 30), "short")
   assert.equal(M.wrapLines("two\nlines", 30), "two\nlines")
   assert.equal(M.wrapLines("abcdefghij", 8), "abcdefgh\nij")
+})
+
+test("a throttled account reads as paused, not broken and not current", () => {
+  assert.equal(M.statusMark("throttled", ""), String.fromCodePoint(0xf051f))
+  assert.equal(M.tooltip("throttled", 4, "24h", false, ""), "Proton Mail · paused by Proton, counts from the last sync")
+  assert.equal(M.noticeText("throttled", "Next check at 14:05.", ""), "Proton asked Promarchy to slow down, so these counts are paused for now.\nNext check at 14:05.")
+  assert.equal(M.accountState("throttled"), "Paused")
+  assert.equal(M.statusLine("throttled", ""), "Paused by Proton")
 })

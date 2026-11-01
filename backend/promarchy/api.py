@@ -184,14 +184,15 @@ class ProtonClient:
             )
         return self._parse(resp)
 
-    def fetch_bytes(self, path: str, *, params: Any = None, max_bytes: int) -> tuple[int, str, bytes]:
+    def fetch_bytes(
+        self, path: str, *, params: Any = None, max_bytes: int, timeout: float | None = None
+    ) -> tuple[int, str, bytes]:
         """GET a small binary resource (sender logos). Returns (status, type, body)."""
-        resp = self._send("GET", path, params=params, body=None, auth=True, headers=None, max_bytes=max_bytes)
+        extra = {"max_bytes": max_bytes, "timeout": timeout}
+        resp = self._send("GET", path, params=params, body=None, auth=True, headers=None, **extra)
         if resp.status_code == 401 and self.session:
             self.refresh()
-            resp = self._send(
-                "GET", path, params=params, body=None, auth=True, headers=None, max_bytes=max_bytes
-            )
+            resp = self._send("GET", path, params=params, body=None, auth=True, headers=None, **extra)
         if resp.status_code in (429, 503):
             raise RateLimited("Proton asked us to slow down", _retry_after(resp))
         ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
@@ -248,7 +249,7 @@ class ProtonClient:
 
     # --------------------------------------------------------------- helpers
 
-    def _send(self, method, path, *, params, body, auth, headers, max_bytes=None) -> Response:
+    def _send(self, method, path, *, params, body, auth, headers, max_bytes=None, timeout=None) -> Response:
         request_headers: dict[str, str] = {}
         if auth and self.session:
             request_headers["x-pm-uid"] = self.session.uid
@@ -263,7 +264,7 @@ class ProtonClient:
                 params=params,
                 json=body,
                 headers=request_headers,
-                timeout=TIMEOUT,
+                timeout=timeout or TIMEOUT,
                 **extra,
             )
         except (TransportError, OSError) as exc:

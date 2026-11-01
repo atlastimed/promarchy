@@ -109,7 +109,7 @@ class FakeProton:
     logo_status = 200
     logo_error: Exception | None = None
 
-    def fetch_bytes(self, path, *, params=None, max_bytes):
+    def fetch_bytes(self, path, *, params=None, max_bytes, timeout=None):
         self.calls.append(("GET", path, params, None))
         if self.logo_error is not None:
             raise self.logo_error

@@ -272,7 +272,7 @@ def test_a_write_that_never_confirms_keeps_the_session_and_says_so(tmp_path, mon
     store = store_with(tmp_path, DiesFirst(failures=99))
     monkeypatch.setattr(cli, "SessionStore", lambda: store)
     revoked = pending_sign_in(monkeypatch, uid="u2")
-    with pytest.raises(cli.LoginFailed, match="did not confirm"):
+    with pytest.raises(cli.LoginFailed, match="could not confirm the keyring saved"):
         cli._login("me@proton.me")
     assert revoked == []  # never revoked on a guess
 
@@ -410,12 +410,13 @@ def test_demo_mode_never_touches_real_accounts(daemon_env):  # noqa: F811
     d.tick()
     d.handle({"cmd": "configure", "settings": {"demo": True}})
     d.handle({"cmd": "logout"})
+    assert "Demo mode: nothing was changed" in d.snapshot()["message"]
     d.handle({"cmd": "markRead", "account": "me@proton.me", "ids": ["m1"]})
     assert store.accounts() == ["me@proton.me"]
     assert not getattr(api, "revoked", False)
     assert [c for c in api.calls if c[0] in ("PUT", "DELETE")] == []
     state = d.snapshot()
-    assert state["demo"] is True and "Demo mode: nothing was changed" in state["message"]
+    assert state["demo"] is True and "Demo mode: nothing was marked read" in state["message"]
 
 
 # ------------------------------------------- logos finish loading on idle polls
@@ -435,7 +436,8 @@ def test_logos_keep_loading_on_idle_polls(daemon_env):  # noqa: F811
 
 
 @pytest.mark.parametrize(
-    "kind", ["ok", "offline", "expired", "partial", "warning", "signed-out", "empty", "long", "multi"]
+    "kind",
+    ["ok", "offline", "throttled", "expired", "partial", "warning", "signed-out", "empty", "long", "multi"],
 )
 def test_every_demo_state_is_example_data(kind):
     from promarchy.demo import demo_state, variant

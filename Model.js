@@ -81,6 +81,7 @@ function statusLine(status, message) {
   case "offline": return "Offline"
   case "error": return message || "Something went wrong"
   case "starting": return "Connecting…"
+  case "throttled": return "Paused by Proton"
   default: return ""
   }
 }
@@ -92,7 +93,8 @@ function tooltip(status, count, windowKey, capped, warning) {
   if (status === "error") return "Proton Mail · error"
   var parts = ["Proton Mail"]
   if (status === "offline") parts.push(count > 0 ? "offline, counts from the last sync" : "offline")
-  if (windowKey !== "off" && status !== "offline") parts.push(headline(count, windowKey, capped))
+  if (status === "throttled") parts.push(count > 0 ? "paused by Proton, counts from the last sync" : "paused by Proton")
+  if (windowKey !== "off" && status !== "offline" && status !== "throttled") parts.push(headline(count, windowKey, capped))
   if (status === "partial") parts.push("some accounts not counted")
   if (warning) parts.push("sign-in not yet saved")
   return parts.join(" · ")
@@ -105,7 +107,8 @@ var GUIDANCE = {
   "signed-out": "Connect your Proton account to see new mail here. Sign-in opens a terminal; you may need your 2FA code and a quick check in the browser.",
   "auth-expired": "Proton needs you to sign in again.",
   "offline": "Offline. Showing the last mail Promarchy saw; it catches up on its own.",
-  "partial": "Some accounts are not counted right now."
+  "partial": "Some accounts are not counted right now.",
+  "throttled": "Proton asked Promarchy to slow down, so these counts are paused for now."
 }
 
 function noticeText(status, message, warning) {
@@ -113,7 +116,7 @@ function noticeText(status, message, warning) {
   var guidance = GUIDANCE[status] || ""
   if (guidance) parts.push(guidance)
   var detail = String(message || "").trim()
-  if (detail && detail !== guidance && status !== "starting") parts.push(detail)
+  if (detail && detail !== guidance) parts.push(detail)
   var extra = String(warning || "").trim()
   if (extra) parts.push(extra)
   return parts.join("\n")
@@ -125,6 +128,7 @@ function emptyText(status, recentLimit) {
   if (status === "starting") return "Loading recent mail…"
   if (status === "offline") return "Recent mail is unavailable while offline."
   if (status === "error") return "Recent mail could not be loaded."
+  if (status === "throttled") return "Recent mail is paused until Proton's next check."
   if (status === "partial") return "No mail from the accounts that are working."
   return "No mail in your inbox."
 }
@@ -133,6 +137,7 @@ function emptyText(status, recentLimit) {
 // panel and without relying on colour alone.
 function statusMark(status, warning) {
   if (status === "offline") return String.fromCodePoint(0xf092e)  // nf-md-wifi_off, as the network widget
+  if (status === "throttled") return String.fromCodePoint(0xf051f)  // nf-md-timer_sand: paused, not broken
   if (status === "auth-expired" || status === "error" || status === "partial" || warning)
     return String.fromCodePoint(0xf0026)  // nf-md-alert
   return ""
@@ -197,6 +202,7 @@ function accountState(status) {
   case "auth-expired": return "Sign in again"
   case "offline": return "Offline"
   case "error": return "Not syncing"
+  case "throttled": return "Paused"
   default: return ""
   }
 }

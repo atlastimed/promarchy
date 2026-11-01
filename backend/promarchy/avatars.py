@@ -26,6 +26,16 @@ HIT_TTL = 14 * 86400
 MISS_TTL = 2 * 86400
 FETCH_BUDGET = 6
 MAX_BYTES = 512 * 1024
+FETCH_TIMEOUT = 8  # seconds: logos are decoration and must not hold up mail
+PAUSE_MAX = 3600
+# Answers that settle the question: there is no usable logo for this sender.
+DEFINITE = (200, 204, 400, 404, 410, 422)
+
+
+class LogoUnavailable(Exception):
+    """The logo service is struggling (timeout, server error): try later."""
+
+
 EXTENSIONS = (".png", ".jpg", ".webp")
 
 
@@ -48,6 +58,7 @@ class Avatars:
         # on a light tile in every theme.
         self.mode = "light"
         self.paused_until = 0.0
+        self.failures = 0
 
     def attach(self, rows: list[dict], client: ProtonClient) -> bool:
         """Set row["avatar"] where a logo is known. True if anything changed."""
@@ -62,10 +73,18 @@ class Avatars:
                 budget -= 1
                 try:
                     found = self._fetch(address, client)
+                    self.failures = 0
                 except RateLimited as exc:
                     if exc.during_refresh:
                         raise  # the session is throttled, not just its logos
                     self.paused_until = self.clock() + exc.retry_after
+                    budget = 0
+                    found = None
+                except LogoUnavailable:
+                    # Stop this pass and back off, instead of queueing more
+                    # slow requests ahead of the mail itself.
+                    self.failures += 1
+                    self.paused_until = self.clock() + min(PAUSE_MAX, 60 * 2 ** min(self.failures, 6))
                     budget = 0
                     found = None
             path = str(found) if found else ""
@@ -133,13 +152,16 @@ class Avatars:
                 "/core/v4/images/logo",
                 params={"Address": address, "Size": 64, "Mode": self.mode, "Format": "png"},
                 max_bytes=MAX_BYTES,
+                timeout=FETCH_TIMEOUT,
             )
         except (RateLimited, AuthExpired):
             raise
-        except ProtonError:
-            return False  # transient: try again on a later sync
+        except ProtonError as exc:  # a timeout or a dropped connection
+            raise LogoUnavailable(exc.__class__.__name__) from exc
         ext = raster_extension(body) if status == 200 and ctype.startswith("image/") else None
         if ext is None:
+            if status not in DEFINITE:  # a server error says nothing about the logo
+                raise LogoUnavailable(f"HTTP {status}")
             write_private(self.root / f"{stem}.miss", b"")
             return False
         path = self.root / f"{stem}{ext}"

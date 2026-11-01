@@ -42,7 +42,7 @@ from .log import log_error
 from .mailbox import WEB_BASE, Mailbox, parse_categories
 from .notify import Notifier, Watermarks, select_new
 from .paths import open_private, runtime_dir, write_private
-from .store import SaveIndeterminate, SessionStore, StoreUnavailable
+from .store import SaveIndeterminate, SessionStore, StoreUnavailable, Superseded
 
 STAMP_CHECK_SECONDS = 5
 LOCK_WAIT_SECONDS = 15
@@ -51,7 +51,13 @@ STORE_RETRY_MAX = 120
 AUTH_RECHECK_SECONDS = 120
 SHUTDOWN_GRACE = 10  # seconds a SIGTERM waits for the current step
 CONTROL_TIMEOUT = 150  # a socket request still queued after this never runs
+USABLE = ("ok", "throttled")  # account states whose counts are current or merely paused
 DEMO_INTERVAL = 30.0
+# What a demo-mode request would have changed, and why it did not.
+DEMO_REFUSALS = {
+    "logout": "Demo mode: nothing was changed. Turn demo off to manage your accounts.",
+    "markRead": "Demo mode: nothing was marked read. Turn demo off to use your own mail.",
+}
 NOTICE_SECONDS = 120
 
 
@@ -269,6 +275,9 @@ class Daemon:
                 except control.BadRequest as exc:
                     conn.sendall(json.dumps({"error": str(exc)}).encode() + b"\n")
                     return
+                if request["cmd"] == "ping":
+                    conn.sendall(json.dumps({"alive": True}).encode() + b"\n")
+                    return
                 ticket = control.Ticket()
                 self.commands.put({**request, "ticket": ticket})
                 result = ticket.wait(CONTROL_TIMEOUT)
@@ -385,10 +394,10 @@ class Daemon:
             for account in self.accounts.values():
                 if account.status != "auth-expired":
                     account.next_poll = max(account.rate_limited_until, account.backoff_until)
-        elif name in ("logout", "markRead") and self.config.demo:
+        elif name in DEMO_REFUSALS and self.config.demo:
             # The sample inbox is not the real one: never act on real accounts
             # from it. (`promarchyctl logout` still works, through its socket.)
-            self._set_notice("Demo mode: nothing was changed. Turn demo off to manage your accounts.")
+            self._set_notice(DEMO_REFUSALS[name])
             self._force_emit = True
         elif name == "logout":
             # From the bar's own Sign out button: every account.
@@ -519,6 +528,11 @@ class Daemon:
         ]
         try:
             result = sessions.adopt(self.store, session, end, also=replaced)
+        except Superseded as exc:
+            # A late retry of a sign-in that a newer one (or a sign-out) has
+            # already replaced: bringing it back would undo the newer one.
+            log_error("adopting a sign-in", exc)
+            return {"saved": False, "superseded": True, "unchanged": True, "error": str(exc)}
         except SaveIndeterminate as exc:
             log_error("saving a new sign-in", exc)
             return {"saved": False, "indeterminate": True, "error": str(exc)}
@@ -747,7 +761,9 @@ class Daemon:
         if isinstance(exc, RateLimited):
             account.rate_limited_until = now + exc.retry_after
             account.next_poll = account.rate_limited_until
-            account.status = "ok" if account.mailbox.synced else "error"
+            # Synced data stays useful but stops moving: say so, rather than
+            # look healthy while frozen until Proton's deadline.
+            account.status = "throttled" if account.mailbox.synced else "error"
             return
         account.status = "offline" if isinstance(exc, NetworkError) else "error"
         account.backoff_until = now + min(MAX_BACKOFF, 5 * 2 ** min(account.failures, 6))
@@ -819,10 +835,15 @@ class Daemon:
         accounts = []
         capped = False
         synced_any = False
+        # Count accounts whose data is current (or only paused by Proton).
+        # When none is, show what the others last saw; the status says it is
+        # not current. Never mix stale accounts into a current total.
+        current = {e for e, a in self.accounts.items() if a.mailbox.synced and a.status in USABLE}
+        counted = current or {e for e, a in self.accounts.items() if a.mailbox.synced}
         for email, account in self.accounts.items():
             mailbox = account.mailbox
             counts = mailbox.counts(now) if mailbox.synced else {k: 0 for k in totals}
-            if mailbox.synced:
+            if email in counted:
                 synced_any = True
                 capped = capped or mailbox.capped()
                 for key in totals:
@@ -882,15 +903,20 @@ class Daemon:
         if not accounts:
             # The widget says how to sign in; the message carries only specifics.
             return "signed-out", self._last_login_failure()
-        problems = [a for a in accounts if a["status"] not in ("ok", "starting")]
+        problems = [a for a in accounts if a["status"] not in (*USABLE, "starting")]
         statuses = {a["status"] for a in accounts}
-        if "ok" in statuses and synced_any:
+        if statuses & set(USABLE) and synced_any:
             notes = [f"{a['email']}: {a['error'] or a['status']}" for a in problems]
             if self.store_error:
                 notes.append(self.store_error)
-            # Some accounts work and some do not: say so, so partial totals
-            # are never mistaken for the whole picture.
-            return ("partial" if notes else "ok"), "; ".join(notes)
+            paused = self._paused_note()
+            if notes:
+                # Some accounts work and some do not: say so, so partial
+                # totals are never mistaken for the whole picture.
+                return "partial", "; ".join(notes + ([paused] if paused else []))
+            if "throttled" in statuses:
+                return "throttled", paused
+            return "ok", ""
         if statuses == {"auth-expired"}:
             first = accounts[0]
             if first["email"] in self.missing:
@@ -903,7 +929,18 @@ class Daemon:
             return "offline", next(a["error"] for a in accounts if a["status"] == "offline")
         if "error" in statuses:
             return "error", next(a["error"] for a in accounts if a["status"] == "error")
-        return "starting", "Connecting to Proton…"
+        return "starting", ""  # the widget says it is connecting; keep room for real notices
+
+    def _paused_note(self) -> str:
+        """When Proton lets throttled accounts check again, in local time."""
+        held = [a for a in self.accounts.values() if a.status == "throttled"]
+        if not held:
+            return ""
+        until = max(a.rate_limited_until for a in held)
+        when = time.strftime("%H:%M", time.localtime(self.clock() + max(0.0, until - self.mono())))
+        if len(self.accounts) > 1:
+            return f"{', '.join(a.email for a in held)}: paused by Proton until {when}."
+        return f"Next check at {when}."
 
     def _last_login_failure(self) -> str:
         """A recent failed sign-in, so the dropdown can say what went wrong."""
