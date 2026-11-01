@@ -22,6 +22,7 @@ Protocol: one JSON request line, one JSON reply line.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import socket
@@ -48,6 +49,12 @@ def socket_path() -> Path:
     return runtime_dir() / SOCKET_NAME
 
 
+def snapshot_digest(payload: str) -> str:
+    """Names one published snapshot, so `status` can tell whether the file it
+    reads is the one the running bar published last."""
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
 def parse(line: bytes) -> dict:
     """Validate a request completely before anything acts on it."""
     try:
@@ -68,13 +75,14 @@ def parse(line: bytes) -> dict:
             raise BadRequest("invalid request")
         return {"cmd": "logout", "account": account.strip().lower() if account else None, "local": local}
     if cmd == "adopt":
+        retry = request.get("retry", False)  # a repeat after a lost answer
         try:
             session = Session.from_dict(request["session"])
         except (KeyError, TypeError, ValueError):
             raise BadRequest("invalid request") from None
-        if not session.email:
+        if not session.email or not isinstance(retry, bool):
             raise BadRequest("invalid request")
-        return {"cmd": "adopt", "session": session}  # from_dict lowercased the address
+        return {"cmd": "adopt", "session": session, "retry": retry}  # from_dict lowercased the address
     raise BadRequest("unsupported request")
 
 

@@ -216,7 +216,7 @@ class SessionStore:
         update_tokens, which writes only onto the same live session."""
         self.replace(session)
 
-    def replace(self, session: Session) -> list[Session]:
+    def replace(self, session: Session, *, retry: bool = False) -> list[Session]:
         """Store a (new) session and return every session it displaced.
 
         A Proton account is identified by its UserID, not by the address you
@@ -225,9 +225,14 @@ class SessionStore:
         happen under one lock, so racing sign-ins each get back exactly what
         they displaced, and the caller revokes it on Proton's side.
 
+        `retry`: a repeat of a hand-over whose answer was lost. By then a
+        newer sign-in to this account may be saved (whatever happened to this
+        one meanwhile), and a retry never replaces a newer one.
+
         Outcomes: StoreUnavailable means nothing changed; SaveIndeterminate
-        means the new session may or may not be stored; a return means it is
-        stored, with any leftovers in `cleanup_failures` / `index_failed`.
+        means the new session may or may not be stored; Superseded means it
+        was replaced or signed out already (nothing changed); a return means
+        it is stored, with any leftovers in `cleanup_failures` / `index_failed`.
         """
         # One spelling per address: the keyring key is case-insensitive, so
         # "Me@x" and "me@x" must never be treated as two accounts.
@@ -251,6 +256,10 @@ class SessionStore:
                         aliases.append((other, stored))
             previous = self.load(session.email)
             copies = [previous, *(stored for _, stored in aliases)]
+            if retry and any(
+                s is not None and s.uid != session.uid and s.created_at > session.created_at for s in copies
+            ):
+                raise Superseded("a newer sign-in replaced this one")
             same = next((s for s in copies if s is not None and s.uid == session.uid), None)
             if same is not None:
                 # This very session is already saved (a retried hand-over), and
@@ -341,12 +350,12 @@ class SessionStore:
         still be no stored session (the caller found none). The keyring entry
         goes first: if that fails, the index is untouched and the error
         propagates, so nothing is half-removed."""
+        if expected_uid is not None:
+            # That session is over whatever happens below (a keyring that will
+            # not delete it, a state directory that cannot even be locked): a
+            # late retry of its sign-in must never bring it back.
+            self.retire([expected_uid])
         with self._locked():
-            if expected_uid is not None:
-                # That session is over whatever happens below (a keyring that
-                # will not delete it included): a late retry of its sign-in
-                # must never bring it back.
-                self.retire([expected_uid])
             if expected_uid is not None or require_absent:
                 stored = self.load(email)
                 if stored is not None and (require_absent or stored.uid != expected_uid):
@@ -367,27 +376,27 @@ class SessionStore:
 
     def retire(self, uids: Iterable[str]) -> None:
         """Remember sessions that must not come back: in this process at once,
-        and on disk for the next owner (best effort: a failed write loses the
-        guard only for other processes, never a session)."""
+        and on disk for the next owner. Never raises (callers may already have
+        saved a new sign-in): a state directory that cannot be written loses
+        the guard only for other processes, and the next write that succeeds
+        carries everything this process remembers."""
         fresh = [u for u in uids if u]
         if not fresh:
             return
         self._retired_here = [u for u in self._retired_here if u not in fresh] + fresh
         del self._retired_here[:-RETIRED_KEEP]
-        with self._locked():
-            try:
-                data = json.loads(self._retired.read_text())
-                kept = (
-                    [u for u in data if isinstance(u, str) and u not in fresh]
-                    if isinstance(data, list)
-                    else []
-                )
-            except (OSError, ValueError):
-                kept = []
-            try:
-                write_private(self._retired, json.dumps((kept + fresh)[-RETIRED_KEEP:]))
-            except OSError as exc:
-                log_error("remembering replaced sessions", exc)
+        try:
+            with self._locked():
+                try:
+                    data = json.loads(self._retired.read_text())
+                except (OSError, ValueError):
+                    data = None
+                here = set(self._retired_here)
+                older = data if isinstance(data, list) else []
+                kept = [u for u in older if isinstance(u, str) and u not in here]
+                write_private(self._retired, json.dumps((kept + self._retired_here)[-RETIRED_KEEP:]))
+        except OSError as exc:
+            log_error("remembering replaced sessions", exc)
 
     # ------------------------------------------------------------ internals
 

@@ -89,7 +89,7 @@ The backend doubles as a small CLI (`~/.config/omarchy/plugins/atlastimed.promar
 | `promarchyctl login [user]` | Sign in (another account if you already have one). |
 | `promarchyctl logout [email\|--all] [--local]` | End the session on Proton's side, then forget it here (`--local`: forget it even if Proton is unreachable). With several accounts, name one or use `--all`. |
 | `promarchyctl accounts` | List signed-in accounts. |
-| `promarchyctl status [--json] [--window 24h]` | Print the bar's current counts, for scripts. It fails rather than print old numbers: when the bar's background process is not running, and, with `--window`, whenever the counts are not current and complete (it then says why and exits 1). `--json` always includes the status. |
+| `promarchyctl status [--json] [--window 24h]` | Print the bar's current counts, for scripts. It fails rather than print old numbers: when the bar's background process is not running or has no current snapshot, and, with `--window`, whenever the counts are not current and complete (it then says why and exits 1). `--json` always includes the status. |
 | `promarchyctl notify-test` | Show what a new-mail notification looks like. |
 
 ## Privacy and security
@@ -107,6 +107,7 @@ What Promarchy does, stated precisely:
   | `~/.local/state/promarchy/accounts.json` | signed-in addresses |
   | `~/.local/state/promarchy/notified.json` | per-account notification progress (times and recent message IDs) |
   | `~/.local/state/promarchy/last-login.json` | time and outcome of the last sign-in |
+  | `~/.local/state/promarchy/retired.json` | IDs (no tokens) of sessions replaced or signed out here, so a late retry of a sign-in cannot bring one back |
   | `$XDG_RUNTIME_DIR/promarchy/state.json` | the bar's current snapshot: senders, subjects, times, counts (in memory-backed storage, gone at logout/reboot) |
   | `~/.cache/promarchy/logos/` | sender logos, named by a hash of the address, expired after 14 days |
 

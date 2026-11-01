@@ -179,10 +179,9 @@ class Daemon:
         self.notice = ""
         self.notice_until = 0.0
         self.demo_anchor: int | None = None
-        # Names this process's snapshots, so `status` can tell them from a
-        # predecessor's file while this one is still starting.
-        self.instance = os.urandom(8).hex()
         self._last_payload = ""
+        self._published: str | None = None  # digest of _last_payload, for `status`
+        self._mirrored = True  # whether state.json holds _last_payload
         self._force_emit = False
 
     # ------------------------------------------------------------ lifecycle
@@ -279,7 +278,9 @@ class Daemon:
                     conn.sendall(json.dumps({"error": str(exc)}).encode() + b"\n")
                     return
                 if request["cmd"] == "ping":
-                    reply = {"alive": True, "instance": self.instance}
+                    # Which snapshot is current (None before the first): the
+                    # file may be a predecessor's, or a write may have failed.
+                    reply = {"alive": True, "snapshot": self._published}
                     conn.sendall(json.dumps(reply).encode() + b"\n")
                     return
                 ticket = control.Ticket()
@@ -432,7 +433,7 @@ class Daemon:
         if request["cmd"] == "logout":
             return {"results": self._logout(request["account"], local=request["local"])}
         if request["cmd"] == "adopt":
-            return self._adopt(request["session"])
+            return self._adopt(request["session"], retry=request.get("retry") is True)
         return {"error": "unsupported request"}
 
     def _logout(self, target: str | None, local: bool = False) -> list[dict]:
@@ -490,10 +491,11 @@ class Daemon:
             sessions.forget(self.store, result, expected_uid=uid)
         return result
 
-    def _adopt(self, session: Session) -> dict:
+    def _adopt(self, session: Session, retry: bool = False) -> dict:
         """Take over a fresh sign-in from `promarchyctl login`: save it, and
         end the sessions it replaces with the tokens this process holds for
-        them (the saved copies may be older)."""
+        them (the saved copies may be older). `retry`: the CLI's repeat after
+        a lost answer, which never replaces a newer sign-in."""
 
         def end(old: Session) -> str:
             owned = next(
@@ -535,7 +537,7 @@ class Daemon:
             and (email == session.email or (session.user_id and a.client.session.user_id == session.user_id))
         ]
         try:
-            result = sessions.adopt(self.store, session, end, also=replaced)
+            result = sessions.adopt(self.store, session, end, also=replaced, retry=retry)
         except Superseded as exc:
             # A late retry of a sign-in that a newer one (or a sign-out) has
             # already replaced: bringing it back would undo the newer one.
@@ -968,11 +970,13 @@ class Daemon:
         state = self.snapshot()
         if override:
             state.update(override)
-        state["instance"] = self.instance
         payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         if payload == self._last_payload and not force:
+            if not self._mirrored:
+                self._mirror(payload)  # the last write failed; storage may be back
             return
         self._last_payload = payload
+        self._published = control.snapshot_digest(payload)
         try:
             self.out.write(payload + "\n")
             self.out.flush()
@@ -983,8 +987,11 @@ class Daemon:
 
     def _mirror(self, payload: str) -> None:
         path = Path(self.state_path) if self.state_path else runtime_dir() / "state.json"
-        with contextlib.suppress(OSError):
+        try:
             write_private(path, payload + "\n")
+            self._mirrored = True
+        except OSError:
+            self._mirrored = False
 
     # ------------------------------------------------------------------ lock
 

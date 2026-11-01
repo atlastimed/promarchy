@@ -334,6 +334,12 @@ class Mailbox:
     def _owe_settings(self) -> None:
         self.settings_pending = True
         self.settings_retry_at = 0.0
+        if self.settings_known:
+            # The view mode may have changed meanwhile: until it is read
+            # again, links stop relying on it.
+            self.settings_known = False
+            for row in self.recent:
+                row["url"] = self.web_url(row)
 
     def _settle_settings(self) -> None:
         """Read Proton's mail settings while they are owed. Network, rate-limit

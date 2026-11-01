@@ -314,7 +314,10 @@ def test_sign_in_replacement_ends_the_old_session_with_the_owners_tokens(tmp_pat
 
 
 def pending_sign_in(monkeypatch, uid="u2", user_id=""):
-    session = Session(uid=uid, access_token="n1", refresh_token="n2", email="", user_id=user_id)
+    # Stamped like a real sign-in (auth.begin_login): newer than anything saved.
+    session = Session(
+        uid=uid, access_token="n1", refresh_token="n2", email="", user_id=user_id, created_at=time.time()
+    )
     monkeypatch.setattr(cli, "begin_login", lambda c, u, p, hv: PendingLogin(session, 0))
     monkeypatch.setattr("getpass.getpass", lambda prompt="": "pw")
     revoked = []

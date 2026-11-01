@@ -172,15 +172,17 @@ def _hand_over(store: SessionStore, session: Session) -> dict:
     has just taken, so the owner is asked once more instead, even if the
     keyring already lists it (only the owner switching over completes a
     sign-in). Adopting the same session again is harmless: the owner either
-    finishes registering it, finds it already held, or, if a newer sign-in or
-    a sign-out has replaced it meanwhile, refuses to bring it back.
+    finishes registering it (keeping any tokens renewed since), finds it
+    already held, or, if a sign-out or a newer sign-in has replaced it
+    meanwhile, refuses to bring it back. As a retry it never replaces a
+    sign-in newer than this one, however that one got there.
     """
     outcome, reply = _attempt(store, session)
     if outcome == "saved":
         return reply
     if outcome in ("refused", "superseded"):
         raise LoginFailed(reply)
-    outcome, reply = _attempt(store, session)
+    outcome, reply = _attempt(store, session, retry=True)
     if outcome == "saved":
         # The lost first attempt may already have ended older sessions, and
         # its report is gone: do not vouch for them either way.
@@ -196,17 +198,22 @@ def _hand_over(store: SessionStore, session: Session) -> dict:
     }
 
 
-def _attempt(store: SessionStore, session: Session) -> tuple[str, Any]:
+def _attempt(store: SessionStore, session: Session, retry: bool = False) -> tuple[str, Any]:
     """One hand-over: ("saved", reply), ("refused", why) when nothing was
     saved, ("superseded", why) when a newer sign-in or a sign-out already
-    replaced it, or ("unknown", None)."""
-    reply = control.ask({"cmd": "adopt", "session": session.to_dict()})
+    replaced it, or ("unknown", None). `retry`: see _hand_over."""
+    request = {"cmd": "adopt", "session": session.to_dict()}
+    if retry:
+        request["retry"] = True
+    reply = control.ask(request)
     if reply is None:  # no bar running: become the owner for this step
         lock = control.take_lock()
         if lock is None:
             return "refused", BAR_NOT_ANSWERING
         try:
-            reply = sessions.adopt(store, session, lambda old: sessions.end_displaced(ProtonClient(old)))
+            reply = sessions.adopt(
+                store, session, lambda old: sessions.end_displaced(ProtonClient(old)), retry=retry
+            )
             return "saved", reply
         except Superseded:
             return "superseded", SUPERSEDED
@@ -535,23 +542,42 @@ NOT_CURRENT = {
 }
 
 
+def _published_state() -> tuple[dict | None, str]:
+    """The snapshot the running bar published last, or None and why not.
+
+    The file outlives a process that died, and a standalone login or logout
+    holds the same lock as the bar, so only a daemon answering on its socket
+    makes it current, and only if it is the one that daemon published last:
+    not a predecessor's, and not an older one left by a failed write.
+    """
+    path = runtime_dir() / "state.json"
+    for attempt in range(3):
+        if attempt:
+            time.sleep(0.2)  # a write may have been in flight
+        try:
+            text = path.read_text()
+        except OSError:
+            text = ""
+        reply = control.ask({"cmd": "ping"}, timeout=3)
+        if reply is None or not (reply.get("alive") is True or reply.get("error") == "unsupported request"):
+            return None, "The Promarchy daemon is not running (is the bar widget enabled?)."
+        payload = text.rstrip("\n")
+        # A daemon from before 0.2.0 cannot say which file is current.
+        published = reply["snapshot"] if "snapshot" in reply else control.snapshot_digest(payload)
+        if payload and published == control.snapshot_digest(payload):
+            try:
+                state = json.loads(payload)
+            except ValueError:
+                state = None
+            if isinstance(state, dict):
+                return state, ""
+    return None, "Promarchy has no current snapshot (starting, or it could not write one); try again soon."
+
+
 def cmd_status(args: argparse.Namespace) -> int:
-    # The snapshot outlives a process that died, and a standalone login or
-    # logout holds the same lock as the bar: only a daemon answering on its
-    # socket makes a snapshot current, and only its own (a new daemon that is
-    # still starting must not vouch for its predecessor's file).
-    reply = control.ask({"cmd": "ping"}, timeout=3)
-    alive = reply is not None and (reply.get("alive") is True or reply.get("error") == "unsupported request")
-    try:
-        state = json.loads((runtime_dir() / "state.json").read_text())
-    except (OSError, ValueError):
-        state = None
-    if not alive or not isinstance(state, dict):
-        print("The Promarchy daemon is not running (is the bar widget enabled?).", file=sys.stderr)
-        return 1
-    instance = reply.get("instance")
-    if instance is not None and state.get("instance") != instance:
-        print("Promarchy is starting and has no current counts yet; try again in a moment.", file=sys.stderr)
+    state, why = _published_state()
+    if state is None:
+        print(why, file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(state, indent=2, ensure_ascii=False))

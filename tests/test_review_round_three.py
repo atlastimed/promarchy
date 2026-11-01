@@ -1,7 +1,9 @@
-"""Regressions from the ChatGPT Pro review of 111e7ff (findings C01 to C10)."""
+"""Regressions from the ChatGPT Pro review of 111e7ff (findings C01 to C10)
+and its follow-up on e07cc75 (V01 to V05)."""
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import threading
@@ -9,18 +11,19 @@ import threading
 import pytest
 from fakes import Clock, FakeProton
 from test_hardening import daemon_env  # noqa: F401  (fixture)
-from test_ownership import daemon_running, make_daemon, make_store, shared_api_factory
+from test_ownership import daemon_running, make_daemon, make_store, pending_sign_in, shared_api_factory
 from test_probe import ProbeAPI, probe
 from test_rereview import AuthServer, stored_session
 from test_review_round_two import recording_factory, session, two_account_daemon
 
 from promarchy import cli, control
+from promarchy import daemon as daemon_module
 from promarchy import store as store_module
 from promarchy.api import ProtonClient, ProtonError, RateLimited, Session
 from promarchy.auth import REVOKED
 from promarchy.mailbox import Mailbox
 from promarchy.paths import runtime_dir
-from promarchy.store import StoreUnavailable
+from promarchy.store import SessionStore, StoreUnavailable
 
 INBOX = "https://mail.proton.me/inbox"
 
@@ -307,9 +310,192 @@ def test_status_window_refuses_a_real_throttled_snapshot(tmp_path, monkeypatch, 
     daemon.emit(force=True)
     state = json.loads((runtime_dir() / "state.json").read_text())
     assert state["status"] == "throttled"
-    alive = {"alive": True, "instance": state.get("instance")}
+    alive = {"alive": True, "snapshot": daemon._published}
     monkeypatch.setattr(control, "ask", lambda request, **kw: alive)
     assert cli.main(["status", "--window", "1h"]) != 0
     assert capsys.readouterr().out == ""
     assert cli.main(["status", "--json"]) == 0  # the full picture, with its status, still prints
     assert json.loads(capsys.readouterr().out)["status"] == "throttled"
+
+
+# ===================================== follow-up review of e07cc75 (V01 to V05)
+
+
+def disk_full(*args, **kwargs):
+    raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def read_only(*args, **kwargs):
+    raise OSError(errno.EROFS, "Read-only file system")
+
+
+def answering(daemon):
+    """control.ask, answered by `daemon` in this thread (request parsing included)."""
+    return lambda request, **kw: daemon._answer(control.parse(json.dumps(request).encode()))
+
+
+def first_answer_lost(daemon):
+    """control.ask whose first answer never arrives; `daemon` answers the rest."""
+    answers = iter([{"error": "no answer"}])
+    return lambda request, **kw: next(answers, None) or answering(daemon)(request)
+
+
+def test_a_confirmed_sign_out_counts_even_if_the_state_directory_cannot_be_locked(tmp_path, monkeypatch):
+    """V01: removing the account failed before reaching the keyring, so the
+    sign-out was not recorded at all, and a late retry was told "saved"."""
+    store = make_store(tmp_path)
+    ended = []
+    daemon = make_daemon(store, tmp_path, recording_factory(ended))
+    a = session("a")
+    assert daemon._adopt(a)["saved"]
+    monkeypatch.setattr(store_module, "open_private", read_only)
+    result = daemon._logout(a.email)[0]
+    assert result["outcome"] == REVOKED and result["removeFailed"] and ended == ["a"]
+    reply = daemon._adopt(a)
+    assert reply.get("saved") is not True and reply.get("superseded") is True
+
+
+def test_a_saved_sign_in_is_never_revoked_over_a_bookkeeping_failure(tmp_path, monkeypatch):
+    """V02: the new session was saved, then remembering the one it replaced
+    failed; the owner answered "unchanged" and the CLI revoked the saved one."""
+    store = make_store(tmp_path)
+    daemon = make_daemon(store, tmp_path, recording_factory([]))
+    assert daemon._adopt(session("old"))["saved"]
+    real_open = store_module.open_private
+    opens = []
+
+    def fails_after_the_save(path):
+        opens.append(path)
+        if len(opens) == 2:  # the first is the save itself
+            raise OSError(errno.EROFS, "Read-only file system")
+        return real_open(path)
+
+    monkeypatch.setattr(store_module, "open_private", fails_after_the_save)
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", FakeProton)
+    monkeypatch.setattr(control, "ask", answering(daemon))
+    revoked = pending_sign_in(monkeypatch, uid="new", user_id="U")
+    with contextlib.suppress(cli.LoginFailed):
+        cli._login("me@proton.me")
+    assert len(opens) >= 2
+    assert store.load("me@proton.me").uid == "new" and revoked == []
+
+
+def test_a_retry_after_the_owner_restarted_never_replaces_a_newer_sign_in(tmp_path, monkeypatch):
+    """V03: A's answer is lost; B replaces A while the state directory is
+    full, so only the running bar remembers A is over; the bar restarts; A's
+    retry reaches the new one."""
+    store = make_store(tmp_path)
+    ended = []
+    first = make_daemon(store, tmp_path, recording_factory(ended))
+    a, b = session("a"), session("b", created_at=2.0)
+    assert first._adopt(a)["saved"]
+    with monkeypatch.context() as fault:
+        fault.setattr(store_module, "write_private", disk_full)
+        assert first._adopt(b)["saved"]
+    assert first._adopt(a).get("superseded") is True  # that bar remembers
+
+    reopened = SessionStore(secrets=store.secrets, root=store.root)
+    second = make_daemon(reopened, tmp_path, recording_factory(ended))
+    second._sync_accounts()
+    assert second.accounts[b.email].client.session.uid == "b"
+    monkeypatch.setattr(control, "ask", first_answer_lost(second))
+    with pytest.raises(cli.LoginFailed, match="newer sign-in"):
+        cli._hand_over(reopened, a)
+    assert ended == ["a"] and reopened.load(a.email).uid == "b"
+
+
+def test_a_retry_still_finishes_a_sign_in_whose_first_save_never_landed(tmp_path, monkeypatch):
+    """The other side of V03's rule: an older session is still replaced and
+    ended, so a retry recovers when the first attempt changed nothing."""
+    store = make_store(tmp_path)
+    ended = []
+    daemon = make_daemon(store, tmp_path, recording_factory(ended))
+    assert daemon._adopt(session("old"))["saved"]
+    monkeypatch.setattr(control, "ask", first_answer_lost(daemon))  # lost before the owner acted
+    reply = cli._hand_over(store, session("new", created_at=2.0))
+    assert reply["saved"] is True and ended == ["old"] and store.load("me@proton.me").uid == "new"
+
+
+def test_a_retry_never_ends_a_newer_sign_in_the_bar_holds(tmp_path):
+    """The same rule for a session the bar holds whose keyring entry is gone."""
+    store = make_store(tmp_path)
+    ended = []
+    daemon = make_daemon(store, tmp_path, recording_factory(ended))
+    a, b = session("a"), session("b", created_at=2.0)
+    assert daemon._adopt(b)["saved"]
+    store.secrets.delete(store_module._key(b.email))
+    reply = answering(daemon)({"cmd": "adopt", "session": a.to_dict(), "retry": True})
+    assert reply.get("superseded") is True and ended == []
+
+
+def test_a_later_retirement_write_carries_the_ones_that_failed(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    with monkeypatch.context() as fault:
+        fault.setattr(store_module, "write_private", disk_full)
+        store.retire(["a"])
+    assert "a" in store.retired()  # this process remembers at once
+    store.retire(["b"])
+    assert {"a", "b"} <= SessionStore(secrets=store.secrets, root=store.root).retired()
+
+
+@pytest.mark.parametrize("reset", ["refresh", "invalid_cursor"])
+def test_a_view_mode_owed_again_stops_steering_the_links(reset):
+    """V04: after a Refresh or a fresh cursor the mode may have changed; if
+    reading it again fails, links must not keep using the old one."""
+    clock = Clock()
+    api = FakeProton(clock=clock)
+    api.add(60, conversation="c1")
+    api.add(30, conversation="c1")
+    box = Mailbox(api, "me@proton.me", clock=clock)
+    box.full_sync()
+    assert box.recent[0]["url"] == INBOX + "/c1"
+
+    api.view_mode = 1
+    real_call = api.call
+
+    def unavailable(method, path, **kwargs):
+        if path == "/mail/v4/settings":
+            raise ProtonError("Internal server error", status=500)
+        return real_call(method, path, **kwargs)
+
+    api.call = unavailable
+    if reset == "refresh":
+        api.queue_event(Refresh=1)
+    else:
+        api.queue_event(**{"raise": ProtonError("Invalid ID", code=2061, status=400)})
+    assert box.poll()
+    assert box.settings_pending and box.synced and not box.dirty
+    assert {row["url"] for row in box.recent} == {INBOX}
+
+    api.call = real_call
+    clock.advance(301)
+    box.poll()
+    assert {row["kind"] for row in box.recent} == {"message"}
+    assert all(row["url"].startswith(INBOX + "/m") for row in box.recent)
+
+
+def test_status_never_vouches_for_a_snapshot_that_failed_to_save(tmp_path, monkeypatch, capsys):
+    """V05: the bar became paused, but writing that snapshot failed; the file
+    still said "ok", from the same bar."""
+    daemon, _, _ = two_account_daemon(tmp_path)
+    daemon.state_path = None
+    daemon.tick()
+    path = runtime_dir() / "state.json"
+    before = json.loads(path.read_text())
+    assert before["status"] == "ok" and before["counts"]["1h"] == 13
+    for account in daemon.accounts.values():
+        daemon._record_failure(account, RateLimited("wait", 600))
+    with monkeypatch.context() as fault:
+        fault.setattr(daemon_module, "write_private", disk_full)
+        daemon.emit()
+    assert json.loads(daemon.out.getvalue().splitlines()[-1])["status"] == "throttled"
+    assert json.loads(path.read_text()) == before
+
+    monkeypatch.setattr(control, "ask", lambda request, **kw: {"alive": True, "snapshot": daemon._published})
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    assert cli.main(["status", "--window", "1h"]) == 1
+    assert capsys.readouterr().out == ""
+
+    daemon.emit()  # storage is back: the unchanged snapshot is written after all
+    assert json.loads(path.read_text())["status"] == "throttled"
