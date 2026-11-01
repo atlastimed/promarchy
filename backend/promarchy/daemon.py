@@ -562,10 +562,12 @@ class Daemon:
         except SaveIndeterminate as exc:
             log_error("saving a new sign-in", exc)
             return {"saved": False, "indeterminate": True, "error": str(exc)}
-        except Exception as exc:  # raised before anything was written
+        except StoreUnavailable as exc:  # the keyring refused before anything changed
             log_error("saving a new sign-in", exc)
-            detail = str(exc) if isinstance(exc, StoreUnavailable) else exc.__class__.__name__
-            return {"saved": False, "unchanged": True, "error": detail}
+            return {"saved": False, "unchanged": True, "error": str(exc)}
+        except Exception as exc:  # nothing says it was not saved: never let it be revoked
+            log_error("saving a new sign-in", exc)
+            return {"saved": False, "indeterminate": True, "error": exc.__class__.__name__}
         # Switch to the new session now, from what we were given: a keyring
         # read that fails right after the save must not leave us polling the
         # session we just ended.
@@ -779,6 +781,10 @@ class Daemon:
                 account.error = ""
                 account.next_poll = now  # retry at once with the live tokens
                 return
+            # Proton rejected this session: never vouch for its sign-in again,
+            # whatever the status says later (offline after a refresh, say).
+            if account.client.session is not None:
+                self.attempted = [u for u in self.attempted if u != account.client.session.uid]
             account.status = "auth-expired"
             account.next_poll = float("inf")  # until a sign-in, or tokens appear (see tick)
             account.extra["auth_check_at"] = now + AUTH_RECHECK_SECONDS

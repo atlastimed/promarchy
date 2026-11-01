@@ -7,6 +7,8 @@ import argparse
 import contextlib
 import errno
 import json
+import os
+import sys
 import threading
 
 import pytest
@@ -20,7 +22,7 @@ from test_review_round_two import FlakyKeyring, recording_factory, session, two_
 from promarchy import cli, control, sessions
 from promarchy import daemon as daemon_module
 from promarchy import store as store_module
-from promarchy.api import AuthExpired, ProtonClient, ProtonError, RateLimited, Session
+from promarchy.api import AuthExpired, NetworkError, ProtonClient, ProtonError, RateLimited, Session
 from promarchy.auth import REVOKED, TWO_FACTOR_TOTP, PendingLogin
 from promarchy.mailbox import Mailbox
 from promarchy.paths import runtime_dir
@@ -967,3 +969,81 @@ def test_a_sign_out_ends_the_bars_word_for_earlier_sign_ins(tmp_path, monkeypatc
     monkeypatch.setattr(control, "ask", ask)
     result = cli._hand_over(store, a)
     assert ended.count(a.uid) == 1 and result.get("unconfirmed") is True
+
+
+# ============================================ sixth pass, on 14584ca (Z01, Z02)
+
+
+def test_a_failed_refresh_never_restores_the_bars_word_for_a_rejected_sign_in(tmp_path, monkeypatch, capsys):
+    """Z01: Proton rejected the new session; a refresh that then failed for
+    want of a network showed it offline instead. That is no recovery."""
+    store = make_store(tmp_path)
+    bar = make_daemon(store, tmp_path, recording_factory([]))
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", FakeProton)
+    pending_sign_in(monkeypatch, uid="a", user_id="U")
+    calls = []
+
+    def ask(request, **kw):
+        calls.append(request)
+        reply = answering(bar)(request)
+        if len(calls) == 1:
+            assert reply["saved"]
+            account = bar.accounts["me@proton.me"]
+            account.client.fail_with = AuthExpired("Session rejected")
+            bar.tick()
+            assert account.status == "auth-expired"
+            account.client.fail_with = NetworkError("Network unavailable")
+            bar.handle({"cmd": "refresh"})
+            bar.tick()
+            assert account.status == "offline"
+            return {"error": "no answer"}
+        return reply
+
+    monkeypatch.setattr(control, "ask", ask)
+    code = cli.cmd_login(argparse.Namespace(username="me@proton.me", wait=False))
+    assert len(calls) == 2 and code != 0 and "Signed in as" not in capsys.readouterr().out
+
+
+def test_a_diagnostic_that_cannot_be_written_never_gets_a_saved_sign_in_revoked(tmp_path, monkeypatch):
+    """Z02: the save was confirmed by reading it back; logging that to a
+    stderr whose reader had gone raised, and the CLI took it for a refusal."""
+    store = make_store(tmp_path)
+    real_set = store.secrets.set
+
+    def lands_without_acknowledgement(key, value):
+        real_set(key, value)
+        raise SaveIndeterminate("helper lost its acknowledgement")
+
+    monkeypatch.setattr(store.secrets, "set", lands_without_acknowledgement)
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", FakeProton)
+    monkeypatch.setattr(control, "ask", lambda request, **kw: None)
+    revoked = pending_sign_in(monkeypatch, uid="a", user_id="U")
+    reader, writer = os.pipe()
+    os.close(reader)  # whoever read stderr is gone
+    broken = os.fdopen(writer, "w")
+    try:
+        with monkeypatch.context() as redirect:
+            redirect.setattr(sys, "stderr", broken)
+            with contextlib.suppress(cli.LoginFailed, BrokenPipeError):
+                cli._login("me@proton.me")
+    finally:
+        with contextlib.suppress(OSError):
+            broken.close()
+    assert store.load("me@proton.me").uid == "a" and revoked == []
+
+
+def test_an_unexpected_error_in_a_hand_over_never_counts_as_nothing_saved(tmp_path, monkeypatch):
+    """Only the keyring's own refusal proves nothing was saved: anything else
+    unexpected keeps the sign-in, unconfirmed, and never has it revoked."""
+    store = make_store(tmp_path)
+    bar = make_daemon(store, tmp_path, recording_factory([]))
+
+    def broken(*args, **kw):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(sessions, "adopt", broken)
+    assert bar._adopt(session("a")).get("indeterminate") is True
+    monkeypatch.setattr(control, "ask", lambda request, **kw: None)
+    assert cli._attempt(store, session("b"))[0] == "unknown"

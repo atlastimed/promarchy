@@ -250,8 +250,10 @@ def _attempt(
             return "superseded", SUPERSEDED, True
         except SaveIndeterminate:
             return "unknown", None, True
-        except Exception as exc:  # nothing was written
+        except StoreUnavailable as exc:  # the keyring refused before anything changed
             return "refused", f"Signed in, but could not save the session to your keyring: {exc}", True
+        except Exception:  # nothing says it was not saved: never let it be revoked
+            return "unknown", None, True
         finally:
             if keep is None:
                 os.close(lock)

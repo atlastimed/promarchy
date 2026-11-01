@@ -8,6 +8,7 @@ location, which is enough to find a bug without copying data into logs.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import traceback
 from pathlib import Path
@@ -22,4 +23,7 @@ def describe(exc: BaseException) -> str:
 def log_error(context: str, exc: BaseException | None = None) -> None:
     exc = exc if exc is not None else sys.exc_info()[1]
     detail = describe(exc) if exc is not None else "unknown error"
-    print(f"promarchy: {context}: {detail}", file=sys.stderr, flush=True)
+    # Best effort: a diagnostic that cannot be written (stderr closed, its
+    # reader gone) must never change the outcome of what it describes.
+    with contextlib.suppress(OSError, ValueError):
+        print(f"promarchy: {context}: {detail}", file=sys.stderr, flush=True)
