@@ -777,14 +777,15 @@ class Daemon:
         now = self.mono()
         account.error = str(exc)
         if isinstance(exc, AuthExpired):
+            # Proton rejected this session: never vouch for its sign-in again,
+            # whatever happens next (a recovery attempt, offline after a
+            # refresh, ...); a pending retry of it stays unconfirmed.
+            if account.client.session is not None:
+                self.attempted = [u for u in self.attempted if u != account.client.session.uid]
             if self._adopt_stored_tokens(account):
                 account.error = ""
                 account.next_poll = now  # retry at once with the live tokens
                 return
-            # Proton rejected this session: never vouch for its sign-in again,
-            # whatever the status says later (offline after a refresh, say).
-            if account.client.session is not None:
-                self.attempted = [u for u in self.attempted if u != account.client.session.uid]
             account.status = "auth-expired"
             account.next_poll = float("inf")  # until a sign-in, or tokens appear (see tick)
             account.extra["auth_check_at"] = now + AUTH_RECHECK_SECONDS
@@ -818,6 +819,11 @@ class Daemon:
         if stored is None or current is None or stored.uid != current.uid:
             return False
         if stored.refresh_token == current.refresh_token:
+            return False
+        pending = self.unsaved.get(account.email)
+        if pending is not None and pending.uid == current.uid:
+            # We renewed it last and could not save that, so the saved pair
+            # is the older one, already used: taking it would roll back.
             return False
         account.client.session = stored
         self.unsaved.pop(account.email, None)

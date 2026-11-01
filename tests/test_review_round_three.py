@@ -14,9 +14,16 @@ import threading
 import pytest
 from fakes import Clock, FakeProton, MemorySecrets
 from test_hardening import daemon_env  # noqa: F401  (fixture)
-from test_ownership import daemon_running, make_daemon, make_store, pending_sign_in, shared_api_factory
+from test_ownership import (
+    auth_daemon,
+    daemon_running,
+    make_daemon,
+    make_store,
+    pending_sign_in,
+    shared_api_factory,
+)
 from test_probe import ProbeAPI, probe
-from test_rereview import AuthServer, stored_session
+from test_rereview import AuthServer, Resp, stored_session
 from test_review_round_two import FlakyKeyring, recording_factory, session, two_account_daemon
 
 from promarchy import cli, control, sessions
@@ -1047,3 +1054,64 @@ def test_an_unexpected_error_in_a_hand_over_never_counts_as_nothing_saved(tmp_pa
     assert bar._adopt(session("a")).get("indeterminate") is True
     monkeypatch.setattr(control, "ask", lambda request, **kw: None)
     assert cli._attempt(store, session("b"))[0] == "unknown"
+
+
+# =================================================== seventh pass, on dda588d (AA01)
+
+
+class RevokedAfterRenewal(AuthServer):
+    """The first mailbox request is rejected, renewal works, and by the time
+    the request is repeated with the new tokens the session has been revoked."""
+
+    def __init__(self):
+        super().__init__(uid="a")
+        self.sent = []
+
+    def request(self, method, url, **kw):
+        self.sent.append(method)
+        if url.endswith("/core/v4/events/latest"):
+            if kw["headers"].get("Authorization") == "Bearer acc1":
+                self.revoked = True
+            return Resp(401, {"Code": 401, "Error": "Session rejected"})
+        return super().request(method, url, **kw)
+
+
+def test_a_rejected_sign_in_is_not_confirmed_by_rolling_back_to_used_tokens(tmp_path, monkeypatch, capsys):
+    """AA01: the bar renewed the new session but could not save the renewal;
+    Proton then rejected it. Going back to the saved pair (older, already
+    used) is no recovery, and the retry must not be told it signed in."""
+    store = make_store(tmp_path)
+    server = RevokedAfterRenewal()
+    incoming = stored_session(server)
+    bar = auth_daemon(store, tmp_path, server)
+    monkeypatch.setattr(cli, "SessionStore", lambda: store)
+    monkeypatch.setattr(cli, "ProtonClient", FakeProton)
+    monkeypatch.setattr(cli, "begin_login", lambda *args: PendingLogin(incoming, 0))
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "pw")
+    revoked = []
+    monkeypatch.setattr(cli, "logout", lambda client: revoked.append(client.session.uid) or True)
+    calls = []
+
+    def cannot_save_the_renewal(key, value):
+        raise StoreUnavailable("keyring locked")
+
+    def ask(request, **kw):
+        calls.append(request)
+        reply = answering(bar)(request)
+        if len(calls) == 1:
+            assert reply["saved"]
+            with monkeypatch.context() as locked:
+                locked.setattr(store.secrets, "set", cannot_save_the_renewal)
+                bar.tick()
+            assert server.revoked and server.sent == ["GET", "POST", "GET"]
+            assert store.load(incoming.email).refresh_token == "ref0"  # the used pair
+            account = bar.accounts[incoming.email]
+            assert account.client.session.refresh_token == "ref1"  # no roll-back
+            assert account.status == "auth-expired"
+            return {"error": "no answer"}
+        return reply
+
+    monkeypatch.setattr(control, "ask", ask)
+    code = cli.cmd_login(argparse.Namespace(username=incoming.email, wait=False))
+    assert len(calls) == 2 and revoked == []
+    assert code != 0 and "Signed in as" not in capsys.readouterr().out
