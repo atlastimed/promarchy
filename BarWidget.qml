@@ -455,7 +455,7 @@ Panel {
     bar: root.bar
     labelVisible: false
     hasVisualContent: true
-    fixedWidth: root.vertical ? -1 : badgeLayout.implicitWidth + Style.space(14)
+    fixedWidth: root.vertical ? -1 : (badgeLayout.implicitWidth > Style.bar.iconCanvas ? Math.ceil(badgeLayout.implicitWidth + scaledHorizontalMargin * 2) : Style.bar.iconSlot)
     fixedHeight: root.vertical ? badgeLayout.implicitHeight + Style.space(12) : -1
     tooltipText: root.opened ? "" : Model.tooltip(root.status, root.badgeCount, root.countWindow, root.capped, root.warning)
 
@@ -474,38 +474,54 @@ Panel {
       horizontalItemAlignment: Grid.AlignHCenter
       verticalItemAlignment: Grid.AlignVCenter
 
-      ProtonMark {
-        size: Style.bar.iconCanvas - 1
-        // Unread mail takes the bar's attention colour only while the count
-        // is current; stale counts keep their shape but step back.
-        color: root.badgeCount > 0 && !root.stale ? root.highlight : root.barIconColor
-        filled: root.badgeCount > 0
+      // The bar's own icon canvas, with the mark's outline (including its
+      // stroke) scaled to the bar's icon size and centred, as Omarchy's
+      // BarIconContent normalises custom icons. Done here from the mark's own
+      // geometry so the widget also loads on Omarchy 4.0.
+      Item {
+        id: markCanvas
+        readonly property real iconSize: Style.bar.iconSize !== undefined ? Style.bar.iconSize : Math.min(Style.bar.iconCanvas, 12)
+        width: Style.bar.iconCanvas
+        height: Style.bar.iconCanvas
+        scale: button.pressScale !== undefined ? button.pressScale : 1
 
-        Behavior on color {
-          enabled: !root.bar || root.bar.foregroundAnimationEnabled
-          ColorAnimation { duration: 160 }
+        ProtonMark {
+          id: mark
+          size: Style.bar.iconCanvas
+          // The outline spans 19 by 14 of the mark's 24 units, centred on (12, 13).
+          readonly property real fit: markCanvas.iconSize / (19 * u + stroke)
+          transformOrigin: Item.TopLeft
+          scale: fit
+          x: markCanvas.width / 2 - 12 * u * fit
+          y: markCanvas.height / 2 - 13 * u * fit
+          // Unread mail takes the bar's attention colour only while the count
+          // is current; stale counts keep their shape but step back.
+          color: root.badgeCount > 0 && !root.stale ? root.highlight : root.barIconColor
+          filled: root.badgeCount > 0
+
+          Behavior on color {
+            enabled: !root.bar || root.bar.foregroundAnimationEnabled
+            ColorAnimation { duration: 160 }
+          }
         }
       }
 
-      Text {
-        textFormat: Text.PlainText
+      BarFigureText {
         visible: text !== ""
         text: Model.badgeText(root.badgeCount)
         color: root.stale ? root.barDim : root.highlight
-        font.family: root.fontFamily
-        font.pixelSize: root.vertical ? Style.font.caption : Style.font.bodySmall
-        font.bold: true
+        fontFamily: root.fontFamily
+        pixelSize: root.vertical ? Style.font.caption : button.fontSize
       }
 
       // Offline, paused by Proton, needs attention, or a sign-in not yet
       // saved: visible without opening the panel, and not by colour alone.
-      Text {
-        textFormat: Text.PlainText
+      BarFigureText {
         visible: text !== ""
         text: root.statusMark
         color: root.status === "offline" || root.status === "throttled" ? root.barDim : root.highlight
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
+        fontFamily: root.fontFamily
+        pixelSize: Style.font.caption
       }
     }
   }
