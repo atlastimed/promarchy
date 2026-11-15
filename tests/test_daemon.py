@@ -467,3 +467,10 @@ def test_sigterm_handler_uses_a_signal_safe_queue(env):
     import queue
 
     assert isinstance(env.daemon.commands, queue.SimpleQueue)
+
+
+def test_a_notification_click_opens_mail_where_the_dropdown_does(env):
+    env.daemon.handle({"cmd": "configure", "settings": {"openWith": "webapp"}})
+    assert env.notifier.opener == ["omarchy-launch-webapp"]
+    env.daemon.handle({"cmd": "configure", "settings": {"openWith": "--exec"}})
+    assert env.notifier.opener == ["omarchy-launch-browser"]

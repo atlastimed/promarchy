@@ -41,6 +41,15 @@ class Mark:
     def to_json(self) -> dict:
         return {"time": self.time, "seen": self.seen}
 
+    def without(self, ids: set[str]) -> Mark:
+        """This mark with `ids` not handled yet: a toast that waits must be
+        found again by whoever runs next, should this process end first."""
+        return Mark(self.time, {i: t for i, t in self.seen.items() if i not in ids})
+
+    def including(self, messages: list[dict]) -> Mark:
+        """This mark with `messages` handled."""
+        return Mark(self.time, {**self.seen, **{m["id"]: int(m["time"]) for m in messages}})
+
     @classmethod
     def from_json(cls, value: Any) -> Mark | None:
         if isinstance(value, (int, float)):  # 0.1.0 format: a bare timestamp
@@ -56,11 +65,16 @@ class Watermarks:
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or state_dir() / "notified.json"
+        self._marks: dict[str, Mark] = {}
+        self.reload()
+
+    def reload(self) -> None:
+        """Take what is on disk: another process may have written it since."""
         try:
             data = json.loads(self.path.read_text())
         except (OSError, ValueError):
             data = {}
-        self._marks: dict[str, Mark] = {}
+        self._marks = {}
         if isinstance(data, dict):
             for account, value in data.items():
                 mark = Mark.from_json(value)
@@ -84,7 +98,12 @@ class Watermarks:
 
 
 def select_new(
-    unread: dict[str, int], fresh: list[dict], mark: Mark | None, now: int, catch_up: int = 3600
+    unread: dict[str, int],
+    fresh: list[dict],
+    mark: Mark | None,
+    now: int,
+    catch_up: int = 3600,
+    held: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[list[dict], int, Mark]:
     """Decide what to announce.
 
@@ -94,13 +113,15 @@ def select_new(
 
     Returns (displayable new messages newest first, how many are new, new mark).
     The first run for an account announces nothing (old mail is not news),
-    and after a long sleep only the last hour is caught up on.
+    and after a long sleep only the last hour is caught up on. `held` are
+    messages whose toast is still waiting (see Mark.without): not new again,
+    and not handled yet either.
     """
     if mark is None:
         start = max([now, *unread.values()])
         return [], 0, Mark(start, {i: t for i, t in unread.items() if t >= start - GRACE})
     floor = max(mark.time - GRACE, now - catch_up)
-    new = {i: t for i, t in unread.items() if t >= floor and i not in mark.seen}
+    new = {i: t for i, t in unread.items() if t >= floor and i not in mark.seen and i not in held}
     advanced = max([mark.time, *new.values()])
     seen = {i: t for i, t in {**mark.seen, **new}.items() if t >= advanced - GRACE}
     shown = sorted((m for m in fresh if m["id"] in new), key=lambda m: m["time"], reverse=True)

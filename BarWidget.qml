@@ -37,6 +37,7 @@ Panel {
     groupThreads: flag("groupThreads", true),
     notify: notifyEnabled,
     senderImages: flag("senderImages", true),
+    openWith: openWith,
     // true, or a sample state such as "offline" (see backend/promarchy/demo.py)
     demo: String(setting("demo", "false"))
   })
@@ -501,7 +502,8 @@ Panel {
 
           Behavior on color {
             enabled: !root.bar || root.bar.foregroundAnimationEnabled
-            ColorAnimation { duration: 160 }
+            // 0 when animations are switched off (omarchy toggle animations).
+            ColorAnimation { duration: typeof Style.duration === "function" ? Style.duration(160) : 160 }
           }
         }
       }

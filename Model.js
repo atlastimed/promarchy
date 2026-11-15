@@ -31,10 +31,6 @@ function windowPhrase(windowKey) {
   }
 }
 
-function windowShort(windowKey) {
-  return windowKey === "all" ? "All" : windowKey
-}
-
 function headline(count, windowKey, capped) {
   var key = windowKey === "off" ? "24h" : windowKey
   if (!(count > 0)) return key === "all" ? "Inbox zero" : "Nothing new " + windowPhrase(key)
@@ -182,15 +178,6 @@ function secondary(fg, bg, floor, ease) {
     else hi = mid
   }
   return mix(fg, bg, lo)
-}
-
-// Middle-elide for monospace labels, where width is a character count.
-function middleElide(text, maxChars) {
-  var value = String(text || "")
-  if (!(maxChars > 3) || value.length <= maxChars) return value
-  var keep = maxChars - 1
-  var head = Math.ceil(keep / 2)
-  return value.slice(0, head) + "…" + value.slice(value.length - (keep - head))
 }
 
 // ---- accounts ------------------------------------------------------------------

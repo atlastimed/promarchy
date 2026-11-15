@@ -18,6 +18,17 @@ for field in id name version kinds entryPoints; do
   jq -e --arg f "$field" 'has($f)' "$manifest" >/dev/null || fail "manifest is missing '$field'"
 done
 
+jq -e '(.kinds | type) == "array" and (.kinds | length) > 0' "$manifest" >/dev/null || fail "'kinds' must be a non-empty array"
+jq -e '(.entryPoints | type) == "object"' "$manifest" >/dev/null || fail "'entryPoints' must be an object"
+jq -e '.barWidget.defaultSection as $s
+  | $s == null or (["left", "centerBegin", "center", "centerEnd", "tray", "right"] | index($s)) != null' "$manifest" >/dev/null \
+  || fail "barWidget.defaultSection must be left, centerBegin, center, centerEnd, tray or right"
+# The marketplace listing shows these, and cuts the version at 64 characters.
+for field in author description license; do
+  jq -e --arg f "$field" '(.[$f] | type) == "string" and (.[$f] | length) > 0' "$manifest" >/dev/null || fail "manifest is missing '$field'"
+done
+jq -e '(.version | type) == "string" and (.version | length) <= 64' "$manifest" >/dev/null || fail "version must be a string of at most 64 characters"
+
 id=$(jq -r .id "$manifest")
 [[ $id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $id != *..* && $id != omarchy.* ]] || fail "invalid plugin id '$id'"
 
@@ -26,7 +37,7 @@ while IFS= read -r entry; do
   [[ -f $entry ]] || fail "entry point not found: $entry"
 done < <(jq -r '.entryPoints[]' "$manifest")
 
-for pair in bar-widget:barWidget service:service; do
+for pair in bar:bar bar-widget:barWidget menu:menu overlay:overlay panel:panel service:service; do
   kind=${pair%%:*} key=${pair##*:}
   if jq -e --arg k "$kind" '.kinds | index($k) != null' "$manifest" >/dev/null; then
     jq -e --arg e "$key" '.entryPoints | has($e)' "$manifest" >/dev/null || fail "kind '$kind' needs entryPoints.$key"
@@ -42,6 +53,7 @@ jq -e '.barWidget as $w | all($w.schema[]; .defaultValue == $w.defaults[.key])' 
   || fail "a schema defaultValue disagrees with barWidget.defaults"
 
 version=$(jq -r .version "$manifest")
+grep -q "^## $version (" CHANGELOG.md || fail "CHANGELOG.md has no entry for $version"
 grep -q "^__version__ = \"$version\"" backend/promarchy/__init__.py || fail "backend version differs from manifest $version"
 grep -q "^version = \"$version\"" pyproject.toml || fail "pyproject version differs from manifest $version"
 grep -q "moduleName: \"$id\"" BarWidget.qml || fail "BarWidget moduleName must be $id"

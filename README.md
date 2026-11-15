@@ -13,7 +13,7 @@ Proton Mail in the [Omarchy](https://omarchy.org) bar: an unread count for the l
 
 - **Bar badge.** A Proton-style envelope with the number of unread inbox messages received in the **last hour, 24 hours or 7 days**, or all unread, or no number at all. Switch windows right in the dropdown (or press <kbd>1</kbd>–<kbd>4</kbd>), and the choice is saved to your bar settings. When Promarchy is offline, paused by Proton's rate limit, or needs you (a session to renew, an account not counted, a sign-in not yet saved), a small mark appears beside the envelope and a count from an earlier sync steps back, so an old number never passes for a current one.
 - **Recent mail dropdown.** Sender, subject and time; unread dots; sender logos; attachment and star markers; each conversation is one row with its exact message count (`×3`). Hover a row for the full sender, address and subject. Click a message to open it in Proton Mail; hover and click ✓ (or press <kbd>m</kbd> on the selected row) to mark it read. Secondary text keeps a readable contrast in every theme, light ones included.
-- **Notifications.** New mail shows up as a regular Omarchy toast (theme, Do Not Disturb and history included). Clicking it opens the message. A burst of mail collapses into one summary, and after a long sleep you only catch up on the last hour.
+- **Notifications.** New mail shows up as a regular Omarchy toast (theme, Do Not Disturb and history included). Clicking it opens the message. A burst of mail collapses into one summary, and after a long sleep you only catch up on the last hour. If Proton Mail is also open in a browser that announces mail itself, you get one toast per message rather than two (see [One notification per message](#one-notification-per-message)).
 - **Inbox categories.** Count only *Primary*, or any mix of Proton's categories.
 - **Multiple accounts.** Sign in to more than one (the same Proton account under two addresses counts once); counts and lists merge, and if one account stops working the dropdown says so instead of quietly showing partial totals. The accounts button in the dropdown's footer (or <kbd>s</kbd>) lists them and holds *Add account* and *Sign out*, which asks before ending every session. Clicking a message opens Proton Mail in whichever account is active in your browser, so with several accounts switch to the right one there first (Proton's web links cannot pick the account).
 - **Keyboard driven.** Like Omarchy's own panels: arrows or <kbd>j</kbd>/<kbd>k</kbd>, <kbd>Enter</kbd> to open, <kbd>←</kbd>/<kbd>→</kbd> to switch window, <kbd>m</kbd>/<kbd>x</kbd> mark the selected row read (when no row is selected, or it has scrolled out of view, the first press only shows which row), <kbd>a</kbd> mark all shown read, <kbd>s</kbd> accounts, <kbd>r</kbd> refresh, <kbd>o</kbd> inbox, <kbd>c</kbd> compose, <kbd>n</kbd> toggle notifications, <kbd>Esc</kbd> close, <kbd>Tab</kbd> next panel.
@@ -72,6 +72,24 @@ omarchy bar set atlastimed.promarchy notify false
 | `senderImages` | `true` | Sender logos, fetched through Proton's own logo proxy (as the web app does) and cached. |
 | `openWith` | `browser` | Open mail in your default `browser`, or as a standalone `webapp` window. |
 
+### One notification per message
+
+Proton's web app shows its own desktop notifications while it is open in a browser tab (or as a web app) that you allowed to. Promarchy cannot see your tabs, but Omarchy's notification service records which site each toast came from, so Promarchy reads that record and:
+
+- says nothing about a message the browser already announced (a toast from `mail.proton.me` naming the same sender and subject);
+- while the browser is announcing an account's mail, holds its own toast for up to 90 seconds and shows it only if the browser's does not come (and not at all if you read the mail meanwhile);
+- stops waiting as soon as one toast goes unanswered, which means the tab was closed.
+
+Each account is judged on its own: once Promarchy has seen that the browser does not announce an account's mail, that account's toasts no longer wait.
+
+What this does not do:
+
+- The first message after you open or close Proton Mail in a browser, or after the bar restarts, may still be announced twice, or up to 90 seconds late; after that it is one toast, on time.
+- Mail that looks like a sign-in code is always announced at once, also when a browser announces it too: Omarchy stores such toasts without their text, so the two cannot be matched, and a code should not wait. For the same reason, any program's sign-in-code toast that appears while a toast of Promarchy's is waiting ends the wait.
+- It works with Chromium-based browsers (Chromium, Chrome, Brave, Edge, Vivaldi, Opera, Helium) and web apps made from them, which label their toasts with the site. Firefox-based browsers do not, and neither does Proton's desktop app, so with those you still get both toasts.
+
+A waiting toast is never dropped on a guess: if the bar stops or restarts first, the mail is announced when it is back (within the usual limits for catching up: the last hour, and mail no more than ten minutes older than the newest already announced). To have only one of the two announce mail at all, turn off `notify` here, or *Desktop notifications* in Proton Mail's settings.
+
 **Mouse:** left click opens the dropdown, right click opens your inbox (an existing Proton window is focused rather than duplicated), and middle click refreshes.
 
 **Keyboard shortcut:** to toggle the dropdown with <kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>M</kbd>, the same pattern as Omarchy's own panels, add this to `~/.config/hypr/bindings.lua`:
@@ -111,7 +129,7 @@ What Promarchy does, stated precisely:
   | `$XDG_RUNTIME_DIR/promarchy/state.json` | the bar's current snapshot: senders, subjects, times, counts (in memory-backed storage, gone at logout/reboot) |
   | `~/.cache/promarchy/logos/` | sender logos, named by a hash of the address, expired after 14 days |
 
-  Omarchy's notification history also keeps the sender and subject of announced mail.
+  Omarchy's notification history also keeps the sender and subject of announced mail. Promarchy reads that history and the toasts on screen (`~/.local/state/omarchy/notifications/`), only to tell whether a browser already announced a message: it looks at entries from `mail.proton.me` (and at the times of the contentless placeholders Omarchy stores for toasts that carried a sign-in code), and keeps and logs none of it.
 - **Sender logos** are fetched from Proton's logo proxy, so Proton (not a third party) sees which sender address is looked up. Logos are requested as raster images and accepted only as PNG, JPEG or WebP (checked by file signature); SVG is never stored or shown.
 - **Signing out** ends the session on Proton's side first and only then forgets it here. While the bar runs, its background process owns the sessions: it signs out for the dropdown and for `promarchyctl logout` alike, and it saves a new sign-in from `promarchyctl login` and ends the session that sign-in replaces with its own current tokens (all over a private socket only your user can reach). If Proton cannot be reached, you are told and stay signed in (`--local` forgets it anyway). If Proton no longer accepts the saved credentials, or the keyring will not let Promarchy forget an account, you are told so rather than shown a plain success. Either way you can check under Proton's *Settings → Security → Session management*. Removing the plugin does not sign you out: run `promarchyctl logout --all` first.
 - **Writes to your mailbox:** only *mark as read*, and only when you ask.
@@ -127,7 +145,7 @@ What Promarchy does, stated precisely:
 
 ## Compatibility
 
-Built and tested on Omarchy 4.0.6 (Arch Linux) with Quickshell 0.3.2, Qt 6.12, Python 3.14 and python-proton-core 0.7.4, on a horizontal top bar across three monitors. CI checks the plugin contract, QML syntax and the backend and widget-model tests on Arch Linux; it does not drive a live Omarchy desktop. Other bar positions follow Omarchy's own layout code but have had less real-world use. An `http://` proxy in `https_proxy` (or `HTTPS_PROXY`) is used through a `CONNECT` tunnel, with Basic credentials if its URL has them, and `no_proxy` is respected. `https://` and SOCKS proxy URLs are refused with an error rather than used insecurely.
+Built and tested on Omarchy 4.5.0 (Arch Linux) with Quickshell 0.3.2, Qt 6.12, Python 3.14 and python-proton-core 0.7.4, on a horizontal top bar across three monitors. The fallbacks for Omarchy 4.0 are kept, but 4.0 was last tested with Promarchy 0.2.0. CI checks the plugin contract, QML syntax and the backend and widget-model tests on Arch Linux; it does not drive a live Omarchy desktop. Other bar positions follow Omarchy's own layout code but have had less real-world use. An `http://` proxy in `https_proxy` (or `HTTPS_PROXY`) is used through a `CONNECT` tunnel, with Basic credentials if its URL has them, and `no_proxy` is respected. `https://` and SOCKS proxy URLs are refused with an error rather than used insecurely.
 
 ## Uninstall
 
