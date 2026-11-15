@@ -25,7 +25,7 @@ import re
 import stat
 from pathlib import Path
 
-from .mailbox import clean_text
+from .mailbox import SUBJECT_LIMIT, clean_text
 
 HOSTS = ("mail.proton.me",)
 # Proton's web app polls about as often as Promarchy does, and a background tab
@@ -78,11 +78,16 @@ def announced(message: dict, rows: list[dict]) -> bool:
     sender = fold(message.get("senderName"))
     if not sender:
         return False
-    subject = fold(message.get("subject"))[:80]
+    raw = str(message.get("subject") or "")
+    subject = fold(raw)
     # "<sender> - <subject>": the sender from the start of a word (some
     # languages put no space after their "From:"), a dash of one or two
-    # characters with spaces around it, then the subject (or the end).
-    tail = r"\s" + re.escape(subject) if subject else r"$"
+    # characters with spaces around it, then the subject, which ends the
+    # toast: one for "Lunch? Moved to Saturday" is not one for "Lunch?". Only
+    # a subject Promarchy holds just the start of is matched as a start.
+    tail = r"\s" + re.escape(subject) if subject else ""
+    if len(raw) < SUBJECT_LIMIT:
+        tail += r"$"
     pattern = re.compile(r"(?<!\w)" + re.escape(sender) + r"\s\S{1,2}" + tail)
     after = int(message.get("time") or 0) - SKEW
     return any(not row["redacted"] and row["ts"] >= after and pattern.search(row["text"]) for row in rows)

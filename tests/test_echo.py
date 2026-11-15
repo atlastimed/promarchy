@@ -78,6 +78,18 @@ def test_a_toast_is_this_message_only_with_its_sender_and_its_subject(tmp_path):
     assert announced(message(subject="Booking confirmed, OK? Hi! Re: New", sender="Sophie"), rows)
 
 
+def test_a_toast_for_a_longer_subject_is_not_one_for_its_beginning(tmp_path):
+    rows = rows_for(
+        tmp_path, web("New email received", "From: Ada Lovelace - Lunch on Friday? moved to Saturday", NOW)
+    )
+    assert not announced(message(), rows)  # "Lunch on Friday?" was never announced
+    assert announced(message(subject="Lunch on Friday? moved to Saturday"), rows)
+    # A subject Promarchy holds only the start of can only be matched as a start.
+    long = "Minutes " * 60
+    rows = rows_for(tmp_path, web("New email received", f"From: Ada Lovelace - {long}", NOW))
+    assert announced(message(subject=long[:300]), rows)
+
+
 def test_other_languages_separators_and_invisible_characters_still_match(tmp_path):
     german = rows_for(tmp_path, web("Neue E-Mail erhalten", "Von: Ada Lovelace \u2013 Lunch on Friday?", NOW))
     assert announced(message(), german)
@@ -524,3 +536,39 @@ def test_a_restart_takes_the_watermark_its_predecessor_left(env):
     successor.tick()
     assert env.notifier.batches == [[new["ID"]]]
     assert isinstance(marks.get("me@proton.me"), Mark)
+
+
+def burst(env, count):
+    """`count` new messages found by one sync; the newest 50 come with details."""
+    env.clock.advance(31)
+    new = [env.api.add(count - i, subject=f"Report {i}") for i in range(count)]
+    env.api.queue_event(Messages=[{"ID": new[-1]["ID"], "Action": 1, "Message": {"LabelIDs": ["0"]}}])
+    return new
+
+
+def test_new_mail_without_details_is_announced_even_when_the_rest_was(env):
+    """More new mail than Promarchy holds details for: the browser announcing
+    every detailed message says nothing about the others."""
+    new = burst(env, 51)
+    write(env.desk, live=[env.browser(m) for m in new[1:]])  # the newest 50
+    env.daemon.tick()
+    assert env.notifier.batches == [[]] and env.notifier.totals == [1]
+    env.clock.advance(31)
+    env.api.queue_event(MessageCounts=[{"LabelID": "0", "Unread": 51}])
+    env.daemon.tick()
+    assert env.notifier.totals == [1]  # once
+
+
+def test_new_mail_without_details_survives_a_wait_the_browser_answered(env):
+    first = env.arrive()
+    write(env.desk, history=[env.browser(first)])
+    new = burst(env, 51)
+    env.daemon.tick()
+    assert len(env.daemon.held) == 1
+    extra = env.daemon.held[0].extra  # those of the burst too old for the 50 detailed
+    assert extra >= 1 and len(env.daemon.held[0].messages) == 51 - extra
+    write(env.desk, history=[env.browser(first)], live=[env.browser(m) for m in new])
+    env.clock.advance(10)
+    env.daemon.tick()
+    assert env.daemon.held == []
+    assert env.notifier.batches == [[first["ID"]], []] and env.notifier.totals == [1, extra]

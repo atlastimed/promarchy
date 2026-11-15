@@ -129,3 +129,12 @@ def test_flag_shaped_sender_and_subject_cannot_become_options(monkeypatch):
     assert not title.startswith("-") and not body.startswith("-")
     assert title.endswith("-urgency=critical") and body.endswith("r 5")
     assert "--urgency=critical" not in argv
+
+
+def test_a_summary_without_any_details_names_no_senders(monkeypatch):
+    calls = []
+    monkeypatch.setattr(notify.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: calls.append(argv))
+    Notifier().announce([], {}, "https://mail.proton.me/inbox", total=2)
+    exec_at = calls[0].index("--exec")
+    assert calls[0][exec_at - 2 : exec_at] == ["2 new messages", "Proton Mail"]

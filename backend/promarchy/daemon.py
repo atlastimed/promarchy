@@ -893,14 +893,17 @@ class Daemon:
             wait = self.echoes.present(account.email) and not any(carries_code(m) for m in fresh)
         except Exception as exc:  # a courtesy: it must never cost a notification
             log_error("reading the browser's notifications", exc)
-        if shown and not fresh:
+        # New mail beyond the messages we hold details for: nothing can tell
+        # whether a browser announced it, so it is never passed over.
+        extra = max(0, total - len(shown))
+        if shown and not fresh and not extra:
             return set()
         batch = Held(
             email=account.email,
             messages=fresh,
             urls={m["id"]: mailbox.web_url(m) for m in fresh},
             inbox_url=mailbox.web_url(),
-            extra=max(0, total - len(shown)),
+            extra=extra,
             deadline=self.mono() + HOLD_SECONDS,
             echoed=len(shown) - len(fresh),
         )
@@ -948,11 +951,14 @@ class Daemon:
             kept = False
             if give_up:
                 batch.messages = []
-            elif batch.messages and (unclear or now >= batch.deadline):
+            elif not batch.messages:
+                if batch.extra:  # what is left has no details to wait on
+                    self._show(batch)
+            elif unclear or now >= batch.deadline:
                 if not unclear and not batch.echoed:
                     self.echoes.missed(batch.email)
                 self._show(batch)
-            elif batch.messages:
+            else:
                 kept = True
                 self.held.append(batch)
             left = {m["id"] for m in batch.messages} if kept else set()

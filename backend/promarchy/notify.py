@@ -148,7 +148,7 @@ class Notifier:
                     senders.append(m["senderName"])
             shown = ", ".join(senders[:3])
             more = " and others" if len(senders) > 3 or len(messages) < total else ""
-            self._toast(f"{total} new messages", (shown + more) or "Proton Mail", inbox_url)
+            self._toast(f"{total} new messages", shown + more if shown else "Proton Mail", inbox_url)
             return
         for m in reversed(messages):  # oldest first, so the newest ends on top
             self._toast(
