@@ -11,8 +11,10 @@ record (read-only) and answers two questions:
   little for the browser's, and is shown only if none comes.
 
 Only rows from Proton's web app are looked at, nothing is kept or logged, and
-any failure (no such file, a format this does not know) means "no", so the
-worst case is the double toast this exists to prevent, never a lost one.
+a toast is given up only for a row that names the message's own sender and
+subject. Anything else (no such file, a format this does not know, a row
+Omarchy redacted) means "not announced", so the worst case is the double toast
+this exists to prevent.
 """
 
 from __future__ import annotations
@@ -20,7 +22,10 @@ from __future__ import annotations
 import html
 import json
 import re
+import stat
 from pathlib import Path
+
+from .mailbox import clean_text
 
 HOSTS = ("mail.proton.me",)
 # Proton's web app polls about as often as Promarchy does, and a background tab
@@ -35,8 +40,8 @@ MAX_BYTES = 4 * 1024 * 1024
 SHOWN_KEEP = 8  # of our own latest toasts per account, to spot a browser repeating them
 FILES = ("live.json", "history.json")
 
-# What Omarchy stores instead of a notification that carried a sign-in code
-# (its sender and text are gone, so it can only be matched by its time).
+# What Omarchy stores instead of a notification that carried a sign-in code:
+# its sender and text are gone, so nothing says which message it was for.
 REDACTED = ("Verification notification", "[redacted]")
 _CODE_WORD = re.compile(
     r"\b(code|otp|one[\s-]?time|verification|verify|passcode|pin|2fa|two[\s-]factor|security key"
@@ -44,39 +49,42 @@ _CODE_WORD = re.compile(
     re.IGNORECASE,
 )
 _CODE_SHAPE = re.compile(
-    r"(?<![\w-])(?:\d{2,4}[\s-]\d{2,5}|\d{4,8}|(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,8})(?![\w-])"
+    r"(?<![\w-])(?:[A-Za-z]-)?(?:\d{2,4}[\s-]\d{2,5}|\d{4,8}|(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,8})"
+    r"(?![\w-])"
 )
 
 
 def fold(text: object) -> str:
-    """Text as a browser may have re-spelled it: entities, case, spacing."""
-    return " ".join(html.unescape(str(text or "")).casefold().split())
+    """Text as both sides can be compared: a browser escapes markup, and
+    Promarchy's own copy has lost its invisible characters, case and spacing
+    aside."""
+    return " ".join(clean_text(html.unescape(str(text or "")), 20000).casefold().split())
 
 
 def carries_code(message: dict) -> bool:
-    """Whether Omarchy would store this message's toast as a redacted one."""
+    """Whether this looks like a sign-in code, whose toast Omarchy stores
+    redacted. Deliberately broad: such mail is never made to wait."""
     text = f"{message.get('senderName') or ''} - {message.get('subject') or ''}"
     return bool(_CODE_WORD.search(text) and _CODE_SHAPE.search(text))
 
 
-def announced(message: dict, rows: list[dict], own: tuple[float, ...] = ()) -> bool:
+def announced(message: dict, rows: list[dict]) -> bool:
     """True when one of `rows` is a browser's toast for `message`.
 
     Proton's web app writes "From: <sender> - <subject>" in the reader's own
-    language, so the match is on the subject (or, without one, the sender),
-    never on the wording around it. `own` holds the times of Promarchy's own
-    toasts, whose redacted rows look like anyone else's.
+    language (German uses a dash of its own), so the match is the sender,
+    a short separator and the subject, never the wording around them.
     """
-    after = int(message.get("time") or 0)
-    needle = fold(message.get("subject"))[:80] or fold(message.get("senderName"))[:80]
-    coded = carries_code(message)
-    for row in rows:
-        if row["redacted"]:
-            if coded and row["ts"] >= after - 5 and not any(abs(row["ts"] - t) <= OWN_MARGIN for t in own):
-                return True
-        elif needle and row["ts"] >= after - SKEW and needle in row["text"]:
-            return True
-    return False
+    sender = fold(message.get("senderName"))
+    if not sender:
+        return False
+    subject = fold(message.get("subject"))[:80]
+    # "<sender> - <subject>": the sender as a whole word, a dash of one or two
+    # characters with spaces around it, then the subject (or the end).
+    tail = r"\s" + re.escape(subject) if subject else r"$"
+    pattern = re.compile(r"(?:^|\s)" + re.escape(sender) + r"\s\S{1,2}" + tail)
+    after = int(message.get("time") or 0) - SKEW
+    return any(not row["redacted"] and row["ts"] >= after and pattern.search(row["text"]) for row in rows)
 
 
 class BrowserEchoes:
@@ -110,8 +118,8 @@ class BrowserEchoes:
 
     def unannounced(self, account: str, messages: list[dict]) -> list[dict]:
         """The messages no browser has announced yet."""
-        rows, own = self.rows(), tuple(self._own)
-        left = [m for m in messages if not announced(m, rows, own)]
+        rows = self.rows()
+        left = [m for m in messages if not announced(m, rows)]
         if len(left) < len(messages):
             self._present[account] = True
         return left
@@ -127,6 +135,18 @@ class BrowserEchoes:
             # any Proton mail lately is probably still there.
             return any(not row["redacted"] for row in self.rows())
         return known
+
+    def obscured(self, messages: list[dict]) -> bool:
+        """Whether a redacted toast, not one of ours, appeared since these
+        messages arrived. It may be the browser's for one of them, and nothing
+        can tell: waiting longer would only make a sign-in code late."""
+        since = min((int(m.get("time") or 0) for m in messages), default=0) - OWN_MARGIN
+        return any(
+            row["redacted"]
+            and row["ts"] >= since
+            and not any(abs(row["ts"] - t) <= OWN_MARGIN for t in self._own)
+            for row in self.rows()
+        )
 
     def missed(self, account: str) -> None:
         """A toast waited for the browser and it never came: the tab is gone."""
@@ -151,7 +171,10 @@ class BrowserEchoes:
     def _read(self, name: str) -> list[dict]:
         path = self.root / name
         try:
-            if path.stat().st_size > MAX_BYTES:
+            info = path.stat()
+            # Only a plain file of a sane size: anything else is not a record
+            # (and opening a FIFO would wait for ever).
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BYTES:
                 return []
             data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
         except (OSError, ValueError):
@@ -178,6 +201,9 @@ class NoEchoes:
         return messages
 
     def present(self, account: str) -> bool:
+        return False
+
+    def obscured(self, messages: list[dict]) -> bool:
         return False
 
     def missed(self, account: str) -> None:

@@ -10,7 +10,7 @@ import pytest
 from fakes import NOW, Clock, FakeProton, MemorySecrets
 
 from promarchy import echo
-from promarchy.api import Session
+from promarchy.api import NetworkError, Session
 from promarchy.avatars import Avatars
 from promarchy.daemon import Daemon
 from promarchy.echo import HOLD_SECONDS, BrowserEchoes, announced, carries_code
@@ -60,6 +60,32 @@ def test_a_message_without_a_subject_matches_on_its_sender(tmp_path):
     assert announced(message(subject=""), rows)
     assert not announced(message(subject="", sender="Grace Hopper"), rows)
     assert not announced(message(subject="", sender=""), rows)
+    # ... but not on a toast for another of that sender's messages.
+    assert not announced(
+        message(subject=""), rows_for(tmp_path, web("New email received", "From: Ada Lovelace - Hi", NOW))
+    )
+
+
+def test_a_toast_is_this_message_only_with_its_sender_and_its_subject(tmp_path):
+    """A browser signed in to another account announces other mail: a short
+    subject found somewhere in its toast must not silence this message."""
+    rows = rows_for(
+        tmp_path, web("New email received", "From: Sophie - Booking confirmed, OK? Hi! Re: New", NOW)
+    )
+    for subject in ("OK", "Hi", "New", "Re", "Booking confirmed, OK? Hi! Re: New"):
+        assert not announced(message(subject=subject, sender="Bo"), rows)
+    assert not announced(message(subject="Something else", sender="Sophie"), rows)
+    assert announced(message(subject="Booking confirmed, OK? Hi! Re: New", sender="Sophie"), rows)
+
+
+def test_other_languages_separators_and_invisible_characters_still_match(tmp_path):
+    german = rows_for(tmp_path, web("Neue E-Mail erhalten", "Von: Ada Lovelace \u2013 Lunch on Friday?", NOW))
+    assert announced(message(), german)
+    # Promarchy's copy of a subject has lost its zero-width characters (here
+    # the joiners of a family emoji); the browser's toast still has them.
+    family = "\U0001f468\u200d\U0001f469\u200d\U0001f467 photos"
+    rows = rows_for(tmp_path, web("New email received", f"From: Ada Lovelace - {family}", NOW))
+    assert announced(message(subject=family.replace("\u200d", "")), rows)
 
 
 def test_an_older_toast_with_the_same_subject_is_not_this_message(tmp_path):
@@ -77,16 +103,37 @@ def test_only_protons_web_app_counts(tmp_path):
     assert rows == []
 
 
-def test_a_redacted_toast_stands_in_for_a_message_with_a_sign_in_code(tmp_path):
+def test_a_redacted_toast_never_counts_as_the_browsers(tmp_path):
+    """Omarchy stores any program's toast with a sign-in code as the same
+    placeholder: it says nothing about who announced what."""
     coded = message(subject="Your verification code is 482913")
-    assert carries_code(coded)
-    assert not carries_code(message())
     rows = rows_for(tmp_path, web(*echo.REDACTED, NOW + 2, source="", app=""))
-    assert announced(coded, rows)
-    assert not announced(message(), rows)  # ordinary mail is matched by its text only
-    # One from before the message existed, or one of Promarchy's own, is not it.
-    assert not announced(message(subject="Your verification code is 482913", time=NOW + 60), rows)
-    assert not announced(coded, rows, own=(NOW + 3,))
+    assert not announced(coded, rows)
+    echoes = BrowserEchoes(tmp_path / "n")
+    assert echoes.unannounced("me@proton.me", [coded]) == [coded]
+    assert not echoes.present("me@proton.me")
+
+
+def test_mail_with_a_sign_in_code_is_recognised_broadly():
+    for subject in (
+        "Your verification code is 482913",
+        "G-482913 is your Google verification code",
+        "Use code A9F3K2 to sign in",
+        "Confirm your order 2026",
+    ):
+        assert carries_code(message(subject=subject)), subject
+    assert not carries_code(message())
+    assert not carries_code(message(subject="Minutes of 12 March"))
+
+
+def test_a_redacted_toast_since_the_mail_arrived_makes_the_wait_pointless(tmp_path):
+    write(tmp_path / "n", live=[web(*echo.REDACTED, NOW - 60, source="", app="")])
+    echoes = BrowserEchoes(tmp_path / "n")
+    assert not echoes.obscured([message()])  # older than the message
+    write(tmp_path / "n", live=[web(*echo.REDACTED, NOW + 20, source="", app="")])
+    assert echoes.obscured([message()])
+    echoes.sent("me@proton.me", [message(mid="m0")], NOW + 21)  # ... unless it is our own
+    assert not echoes.obscured([message()])
 
 
 # ------------------------------------------------------------------ reading
@@ -102,6 +149,16 @@ def test_unreadable_or_foreign_files_mean_nothing_was_announced(tmp_path):
     (root / "live.json").write_text(
         json.dumps([None, 3, {"ts": "soon"}, {"ts": True, "source": "mail.proton.me"}])
     )
+    assert BrowserEchoes(root).rows() == []
+
+
+def test_only_a_plain_file_is_read(tmp_path):
+    import os
+
+    root = tmp_path / "n"
+    write(root)
+    (root / "live.json").unlink()
+    os.mkfifo(root / "live.json")  # opening it would wait for ever
     assert BrowserEchoes(root).rows() == []
 
 
@@ -307,12 +364,104 @@ def test_a_waiting_toast_is_dropped_when_notifications_are_switched_off(env):
     assert env.daemon.held == []
 
 
-def test_a_waiting_toast_is_shown_when_the_daemon_stops(env):
+def successor(env):
+    """The daemon the shell starts next: same account, watermark file and desktop."""
+    return Daemon(
+        env.store,
+        out=io.StringIO(),
+        notifier=env.notifier,
+        watermarks=Watermarks(env.tmp / "notified.json"),
+        avatars=Avatars(root=env.tmp / "logos"),
+        echoes=BrowserEchoes(env.desk),
+        clock=env.clock,
+        mono=env.clock,
+        client_factory=lambda session, on_refresh=None, **kw: env.api,
+        state_path=str(env.tmp / "state2.json"),
+    )
+
+
+def test_a_toast_still_waiting_when_the_daemon_stops_is_announced_by_the_next(env):
+    """The shell that shows toasts may be going down with the daemon, so a
+    waiting toast is not shown on the way out: the watermark never covered
+    it, and whoever runs next finds the mail again."""
     first = env.arrive()
     write(env.desk, history=[env.browser(first)])
     second = env.arrive(subject="Minutes attached")
     env.daemon.run(io.StringIO(""))  # stdin at EOF: it quits straight away
+    assert env.notifier.batches == [[first["ID"]]]
+    nxt = successor(env)
+    nxt.tick()
+    env.clock.advance(HOLD_SECONDS + 1)  # it waits for the browser in its turn
+    nxt.tick()
     assert env.notifier.batches == [[first["ID"]], [second["ID"]]]
+    env.clock.advance(31)
+    env.api.queue_event(MessageCounts=[{"LabelID": "0", "Unread": 2}])
+    nxt.tick()
+    assert env.notifier.batches == [[first["ID"]], [second["ID"]]]  # once
+
+
+def test_a_killed_daemon_loses_no_waiting_toast(env):
+    first = env.arrive()
+    write(env.desk, history=[env.browser(first)])
+    second = env.arrive(subject="Minutes attached")
+    nxt = successor(env)  # the first one never got to run its exit path
+    nxt.tick()
+    env.clock.advance(HOLD_SECONDS + 1)
+    nxt.tick()
+    assert env.notifier.batches == [[first["ID"]], [second["ID"]]]
+
+
+def test_a_settled_toast_is_not_announced_again_after_a_restart(env):
+    first = env.arrive()
+    write(env.desk, history=[env.browser(first)])
+    second = env.arrive(subject="Minutes attached")
+    write(env.desk, history=[env.browser(first)], live=[env.browser(second)])
+    env.daemon.tick()  # the browser announced it: settled
+    write(env.desk, history=[env.browser(first)])  # ... and its toast has since left the record
+    nxt = successor(env)
+    nxt.tick()
+    env.clock.advance(HOLD_SECONDS + 1)
+    nxt.tick()
+    assert env.notifier.batches == [[first["ID"]]]
+
+
+def test_mail_with_a_sign_in_code_never_waits(env):
+    first = env.arrive()
+    write(env.desk, history=[env.browser(first)])
+    code = env.arrive(subject="Your verification code is 482913")
+    assert env.notifier.batches == [[first["ID"]], [code["ID"]]]
+    assert env.daemon.held == []
+
+
+def test_a_redacted_toast_ends_the_wait_without_writing_the_browser_off(env):
+    first = env.arrive()
+    write(env.desk, history=[env.browser(first)])
+    second = env.arrive(subject="Minutes attached")
+    env.clock.advance(10)
+    hidden = web(*echo.REDACTED, env.clock(), source="", app="")
+    write(env.desk, history=[env.browser(first)], live=[hidden])
+    env.daemon.tick()
+    assert env.notifier.batches == [[first["ID"]], [second["ID"]]]  # shown: nothing can tell whose it was
+    third = env.arrive(subject="One more thing")
+    assert [m["id"] for held in env.daemon.held for m in held.messages] == [third["ID"]]  # still there
+
+
+def test_a_waiting_toast_survives_signing_in_again(env):
+    """A new sign-in starts with an empty mailbox: that is not "read"."""
+    first = env.arrive()
+    write(env.desk, history=[env.browser(first)])
+    second = env.arrive(subject="Minutes attached")
+    env.store.save(Session(uid="u2", access_token="a2", refresh_token="r2", email="me@proton.me"))
+    env.api.fail_with = NetworkError("offline")  # the new session has not synced yet
+    env.clock.advance(6)
+    env.daemon.tick()
+    assert [m["id"] for held in env.daemon.held for m in held.messages] == [second["ID"]]
+    env.api.fail_with = None
+    env.clock.advance(HOLD_SECONDS)
+    env.daemon.handle({"cmd": "refresh"})
+    env.daemon.tick()
+    env.daemon.tick()
+    assert env.notifier.batches.count([second["ID"]]) == 1
 
 
 def test_a_browser_that_announces_part_of_a_burst_is_still_there(env):

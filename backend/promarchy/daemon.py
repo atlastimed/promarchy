@@ -38,7 +38,7 @@ from .api import AuthExpired, NetworkError, ProtonClient, ProtonError, RateLimit
 from .auth import REJECTED, REVOKED, UNCONFIRMED, end_session
 from .avatars import Avatars
 from .demo import demo_state, variant
-from .echo import HOLD_SECONDS, NoEchoes
+from .echo import HOLD_SECONDS, NoEchoes, carries_code
 from .log import log_error
 from .mailbox import WEB_BASE, Mailbox, parse_categories
 from .notify import Notifier, Watermarks, select_new
@@ -249,9 +249,8 @@ class Daemon:
                 with contextlib.suppress(OSError):
                     os.unlink(control.socket_path())
             self._persist_unsaved(force=True)
-            # Their watermark has moved on, so a toast still waiting for a
-            # browser would be lost: show it now.
-            self._release_held(force=True)
+            # A toast still waiting for a browser is left to the next process:
+            # the shell that shows toasts may be going down with us.
             for account in self.accounts.values():
                 account.client.close()
             os.close(lock_fd)
@@ -864,11 +863,14 @@ class Daemon:
     def _after_sync(self, account: Account) -> None:
         mailbox = account.mailbox
         now = int(self.clock())
+        waiting = {m["id"] for batch in self.held if batch.email == account.email for m in batch.messages}
         shown, total, mark = select_new(
-            mailbox.unread_times, mailbox.fresh, self.watermarks.get(account.email), now
+            mailbox.unread_times, mailbox.fresh, self.watermarks.get(account.email), now, held=waiting
         )
         if self.config.notify and total:
-            self._announce(account, shown, total)
+            # A toast that now waits for a browser is not handled yet: were
+            # this process to end first, its successor must find it again.
+            mark = mark.without(self._announce(account, shown, total))
         try:
             self.watermarks.set(account.email, mark)
         except OSError as exc:
@@ -877,20 +879,22 @@ class Daemon:
             self.emit()  # show the list now; logos follow
             self._attach_logos(account)
 
-    def _announce(self, account: Account, shown: list[dict], total: int) -> None:
+    def _announce(self, account: Account, shown: list[dict], total: int) -> set[str]:
         """Show a toast for new mail, unless a browser with Proton Mail open
         already did. While one is announcing this account's mail, ours waits
         for it instead (see _release_held), so one message is not announced
-        twice."""
+        twice. Returns the IDs of the messages that now wait."""
         mailbox = account.mailbox
-        fresh, waiting = shown, False
+        fresh, wait = shown, False
         try:
             fresh = self.echoes.unannounced(account.email, shown)
-            waiting = self.echoes.present(account.email)
+            # A sign-in code is wanted now, and its toast could not be told
+            # from the browser's anyway (Omarchy stores both redacted).
+            wait = self.echoes.present(account.email) and not any(carries_code(m) for m in fresh)
         except Exception as exc:  # a courtesy: it must never cost a notification
             log_error("reading the browser's notifications", exc)
         if shown and not fresh:
-            return
+            return set()
         batch = Held(
             email=account.email,
             messages=fresh,
@@ -900,10 +904,11 @@ class Daemon:
             deadline=self.mono() + HOLD_SECONDS,
             echoed=len(shown) - len(fresh),
         )
-        if waiting:
+        if wait and fresh:
             self.held.append(batch)
-        else:
-            self._show(batch)
+            return {m["id"] for m in fresh}
+        self._show(batch)
+        return set()
 
     def _show(self, batch: Held) -> None:
         self.notifier.announce(
@@ -911,35 +916,57 @@ class Daemon:
         )
         self.echoes.sent(batch.email, batch.messages, self.clock())
 
-    def _release_held(self, force: bool = False) -> None:
+    def _release_held(self) -> None:
         """Settle the toasts that wait for a browser: dropped once the browser
         announced the mail (or it was read meanwhile), shown when the wait
         runs out. A wait nobody answered means the tab is gone, so the next
-        toast does not wait at all."""
+        toast does not wait at all.
+
+        Until a message is settled here its watermark does not cover it, so
+        one still waiting when this process ends is announced by the next."""
         if not self.held:
             return
         held, self.held = self.held, []
         now = self.mono()
         for batch in held:
             account = self.accounts.get(batch.email)
-            if account is None or not self.config.notify:
-                continue  # signed out, or notifications were switched off meanwhile
-            detailed = bool(batch.messages)
+            if account is None:
+                continue  # signed out: its watermark went with it
+            before = batch.messages
+            give_up = not self.config.notify  # switched off meanwhile: say nothing
+            unclear = False
             try:
-                unread = [m for m in batch.messages if m["id"] in account.mailbox.unread_times]
+                if account.mailbox.synced:  # else nothing says what was read
+                    batch.messages = [m for m in before if m["id"] in account.mailbox.unread_times]
+                unread = batch.messages
                 batch.messages = self.echoes.unannounced(batch.email, unread)
                 batch.echoed += len(unread) - len(batch.messages)
+                unclear = self.echoes.obscured(batch.messages)
             except Exception as exc:
                 log_error("reading the browser's notifications", exc)
-                force = True
-            if detailed and not batch.messages:
-                continue
-            if force or now >= batch.deadline:
-                if not force and not batch.echoed:
+                unclear = True
+            kept = False
+            if give_up:
+                batch.messages = []
+            elif batch.messages and (unclear or now >= batch.deadline):
+                if not unclear and not batch.echoed:
                     self.echoes.missed(batch.email)
                 self._show(batch)
-            else:
+            elif batch.messages:
+                kept = True
                 self.held.append(batch)
+            left = {m["id"] for m in batch.messages} if kept else set()
+            self._settle(batch.email, [m for m in before if m["id"] not in left])
+
+    def _settle(self, email: str, messages: list[dict]) -> None:
+        """Record that these were announced (by us or a browser) or read."""
+        mark = self.watermarks.get(email)
+        if mark is None or not messages:
+            return
+        try:
+            self.watermarks.set(email, mark.including(messages))
+        except OSError as exc:
+            log_error("saving the notification watermark", exc)
 
     def _attach_logos(self, account: Account) -> bool:
         """Fetch a bounded batch of logos for the shown rows. True if any changed."""
