@@ -41,6 +41,7 @@ MAX_RECENT = 50
 FRESH_KEEP = 50
 
 WEB_BASE = "https://mail.proton.me"
+SUBJECT_LIMIT = 300  # characters of a subject kept
 VIEW_MODE_MESSAGES = 1
 SETTINGS_RETRY = 300  # seconds before asking again after an odd settings reply
 
@@ -89,7 +90,7 @@ def summarize(message: dict, account: str) -> dict:
         "account": account,
         "senderName": name or address,
         "senderAddress": address,
-        "subject": clean_text(message.get("Subject"), 300),
+        "subject": clean_text(message.get("Subject"), SUBJECT_LIMIT),
         "time": int(message.get("Time") or 0),
         "unread": bool(message.get("Unread")),
         "starred": STARRED in labels,
@@ -137,7 +138,7 @@ def summarize_conversation(conversation: dict, account: str) -> dict:
         "account": account,
         "senderName": clean_text(", ".join(dict.fromkeys(n for n in names if n)), 200),
         "senderAddress": clean_text(first.get("Address"), 200),
-        "subject": clean_text(conversation.get("Subject"), 300),
+        "subject": clean_text(conversation.get("Subject"), SUBJECT_LIMIT),
         "time": context("ContextTime", "Time"),
         "unread": unread > 0,
         "starred": STARRED in labels,
