@@ -85,10 +85,10 @@ Each account is judged on its own: once Promarchy has seen that the browser does
 What this does not do:
 
 - The first message after you open or close Proton Mail in a browser, or after the bar restarts, may still be announced twice, or up to 90 seconds late; after that it is one toast, on time.
-- Mail that looks like a sign-in code is always announced at once, also when a browser announces it too: Omarchy stores such toasts without their text, so the two cannot be matched, and a code should not wait.
+- Mail that looks like a sign-in code is always announced at once, also when a browser announces it too: Omarchy stores such toasts without their text, so the two cannot be matched, and a code should not wait. For the same reason, any program's sign-in-code toast that appears while a toast of Promarchy's is waiting ends the wait.
 - It works with Chromium-based browsers (Chromium, Chrome, Brave, Edge, Vivaldi, Opera, Helium) and web apps made from them, which label their toasts with the site. Firefox-based browsers do not, and neither does Proton's desktop app, so with those you still get both toasts.
 
-A waiting toast is never dropped on a guess: if the bar stops or restarts first, the mail is announced when it is back. To have only one of the two announce mail at all, turn off `notify` here, or *Desktop notifications* in Proton Mail's settings.
+A waiting toast is never dropped on a guess: if the bar stops or restarts first, the mail is announced when it is back (within the usual limits for catching up: the last hour, and mail no more than ten minutes older than the newest already announced). To have only one of the two announce mail at all, turn off `notify` here, or *Desktop notifications* in Proton Mail's settings.
 
 **Mouse:** left click opens the dropdown, right click opens your inbox (an existing Proton window is focused rather than duplicated), and middle click refreshes.
 

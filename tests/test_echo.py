@@ -81,6 +81,12 @@ def test_a_toast_is_this_message_only_with_its_sender_and_its_subject(tmp_path):
 def test_other_languages_separators_and_invisible_characters_still_match(tmp_path):
     german = rows_for(tmp_path, web("Neue E-Mail erhalten", "Von: Ada Lovelace \u2013 Lunch on Friday?", NOW))
     assert announced(message(), german)
+    # Chinese: a full-width colon with no space before the sender.
+    chinese = rows_for(
+        tmp_path,
+        web("\u6536\u5230\u65b0\u90ae\u4ef6", "\u53d1\u4ef6\u4eba\uff1aAda Lovelace - Lunch on Friday?", NOW),
+    )
+    assert announced(message(), chinese)
     # Promarchy's copy of a subject has lost its zero-width characters (here
     # the joiners of a family emoji); the browser's toast still has them.
     family = "\U0001f468\u200d\U0001f469\u200d\U0001f467 photos"

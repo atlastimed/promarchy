@@ -79,10 +79,11 @@ def announced(message: dict, rows: list[dict]) -> bool:
     if not sender:
         return False
     subject = fold(message.get("subject"))[:80]
-    # "<sender> - <subject>": the sender as a whole word, a dash of one or two
+    # "<sender> - <subject>": the sender from the start of a word (some
+    # languages put no space after their "From:"), a dash of one or two
     # characters with spaces around it, then the subject (or the end).
     tail = r"\s" + re.escape(subject) if subject else r"$"
-    pattern = re.compile(r"(?:^|\s)" + re.escape(sender) + r"\s\S{1,2}" + tail)
+    pattern = re.compile(r"(?<!\w)" + re.escape(sender) + r"\s\S{1,2}" + tail)
     after = int(message.get("time") or 0) - SKEW
     return any(not row["redacted"] and row["ts"] >= after and pattern.search(row["text"]) for row in rows)
 
