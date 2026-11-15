@@ -40,6 +40,9 @@ Item {
 
   property var _settings: null
   property string _settingsJson: ""
+  property string _accountsJson: ""
+  property string _countsJson: ""
+  property string _messagesJson: ""
   property int _restarts: 0
   property bool _stopping: false
 
@@ -121,10 +124,25 @@ Item {
     message = String(state.message || "")
     warning = String(state.warning || "")
     demo = state.demo === true
-    accounts = Array.isArray(state.accounts) ? state.accounts : []
-    counts = state.counts || counts
+    // A snapshot repeats what did not change, and assigning an equal list
+    // would still rebuild every row that shows it (and drop a hovered
+    // tooltip): take a list only when it differs.
+    var text = JSON.stringify(Array.isArray(state.accounts) ? state.accounts : [])
+    if (text !== _accountsJson) {
+      _accountsJson = text
+      accounts = JSON.parse(text)
+    }
+    text = JSON.stringify(state.counts || counts)
+    if (text !== _countsJson) {
+      _countsJson = text
+      counts = JSON.parse(text)
+    }
     capped = state.capped === true
-    messages = Array.isArray(state.messages) ? state.messages : []
+    text = JSON.stringify(Array.isArray(state.messages) ? state.messages : [])
+    if (text !== _messagesJson) {
+      _messagesJson = text
+      messages = JSON.parse(text)
+    }
     inboxUrl = String(state.inboxUrl || inboxUrl)
     multiAccount = state.multiAccount === true
     syncing = false

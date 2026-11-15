@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs"
 
 const source = readFileSync(new URL("../Model.js", import.meta.url), "utf8").replace(/^\.pragma library$/m, "")
 const M = new Function(
-  `${source}; return { WINDOWS, normalizeWindow, countFor, badgeText, headline, shortTime, initial, tooltip, statusLine, noticeText, emptyText, statusMark, secondary, contrast, middleElide, accountState, signOutQuestion, wrapLines }`
+  `${source}; return { WINDOWS, normalizeWindow, countFor, badgeText, headline, shortTime, initial, tooltip, statusLine, noticeText, emptyText, statusMark, secondary, contrast, accountState, signOutQuestion, wrapLines }`
 )()
 
 test("window setting falls back to 24h", () => {
@@ -123,11 +123,6 @@ test("secondary text stays readable and subordinate in every stock pair", () => 
   // A weak theme pair is never weakened further.
   const weak = M.secondary(hex("#777777"), hex("#555555"))
   assert.equal(M.contrast(weak, hex("#555555")).toFixed(4), M.contrast(hex("#777777"), hex("#555555")).toFixed(4))
-})
-
-test("long addresses are elided in the middle", () => {
-  assert.equal(M.middleElide("you@example.com", 20), "you@example.com")
-  assert.equal(M.middleElide("ada.lovelace.engine@example.org", 18), "ada.lovel…mple.org")
 })
 
 test("account rows and sign-out say what will happen", () => {

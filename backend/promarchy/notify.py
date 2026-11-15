@@ -56,11 +56,16 @@ class Watermarks:
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or state_dir() / "notified.json"
+        self._marks: dict[str, Mark] = {}
+        self.reload()
+
+    def reload(self) -> None:
+        """Take what is on disk: another process may have written it since."""
         try:
             data = json.loads(self.path.read_text())
         except (OSError, ValueError):
             data = {}
-        self._marks: dict[str, Mark] = {}
+        self._marks = {}
         if isinstance(data, dict):
             for account, value in data.items():
                 mark = Mark.from_json(value)

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0 (2026-11-15)
+
+Checked against Omarchy 4.5. One message is now one notification, however many places could announce it.
+
+Notifications:
+
+- With Proton Mail open in a browser that shows its own notifications, a message used to be announced twice: once by the web app and once by Promarchy. Promarchy now reads what Omarchy's notification service recorded for Proton's web app and stays quiet about mail the browser already announced. While a browser is announcing mail, Promarchy's own toast waits up to 90 seconds for the browser's and is shown only if none comes (or dropped if the mail was read meanwhile). One toast the browser never shows tells Promarchy the tab is gone, and the next one is immediate again. A toast still waiting when the bar stops is shown rather than lost.
+- A restart of the bar (a plugin update, `omarchy restart shell`) could announce the same mail twice: the new background process read its notification progress while the old one was still announcing. It now reads it once the old one has gone.
+- Clicking a notification opens the message where the dropdown does. With *Open mail in* set to `webapp` it opened the default browser.
+
+Interface:
+
+- The bar mark and count are drawn as Omarchy 4.5 draws its own icons: the envelope is scaled to the bar's icon size and centred on the icon canvas (it sat about a pixel high), and the count is centred on its figures.
+- The dropdown's rows are no longer rebuilt when only a count changed, so a hovered row keeps its tooltip and selection while mail ages out of a window or a logo arrives.
+- The badge's colour change follows `omarchy toggle animations`.
+
+Housekeeping:
+
+- Removed an unused icon component and two unused helpers; the plugin check mirrors the current `omarchy plugin validate` rules.
+
+
 ## 0.2.0 (2026-11-01)
 
 Design refinements from an Omarchy design review, and fixes from several code reviews.

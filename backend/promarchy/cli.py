@@ -679,10 +679,11 @@ def cmd_notify_test(_: argparse.Namespace) -> int:
 
 def cmd_daemon(args: argparse.Namespace) -> int:
     from .daemon import Daemon
+    from .echo import BrowserEchoes
     from .notify import Notifier
 
     sys.stdout.reconfigure(line_buffering=True)
-    return Daemon(SessionStore(), notifier=Notifier(icon=args.icon)).run()
+    return Daemon(SessionStore(), notifier=Notifier(icon=args.icon), echoes=BrowserEchoes()).run()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -312,9 +312,9 @@ class Mailbox:
         now = int(self.clock() if now is None else now)
         best: int | None = None
         for span in WINDOWS.values():
-            inside = [t for t in self.unread_times.values() if t >= now - span]
-            if inside:
-                candidate = min(inside) + span + 1
+            oldest = min((t for t in self.unread_times.values() if t >= now - span), default=None)
+            if oldest is not None:
+                candidate = oldest + span + 1
                 best = candidate if best is None else min(best, candidate)
         return best
 
