@@ -474,3 +474,46 @@ def test_a_notification_click_opens_mail_where_the_dropdown_does(env):
     assert env.notifier.opener == ["omarchy-launch-webapp"]
     env.daemon.handle({"cmd": "configure", "settings": {"openWith": "--exec"}})
     assert env.notifier.opener == ["omarchy-launch-browser"]
+
+
+def test_everything_done_for_an_account_in_one_turn_has_a_time_limit(env):
+    """A sync, its logos and a mark-as-read all run on the one loop."""
+    from promarchy.daemon import STEP_SECONDS
+
+    message = env.api.add(60, logo=True)
+    env.sign_in()
+    env.daemon.tick()  # first sync, logos included
+    env.clock.advance(31)
+    env.daemon.tick()  # an idle poll
+    env.daemon.handle({"cmd": "markRead", "account": "me@proton.me", "ids": [message["ID"]]})
+    env.daemon.handle({"cmd": "refresh"})
+    env.daemon.tick()  # a forced re-read
+    paths = {path for _, path, _, _ in env.api.calls}
+    assert {"/core/v4/images/logo", "/mail/v4/messages/read", "/mail/v4/settings"} <= paths
+    assert env.api.unlimited == []
+    assert set(env.api.limits) == {STEP_SECONDS}
+    assert env.api.limited == 0
+
+
+def test_a_step_that_ran_out_of_time_reads_as_offline_and_is_retried(env):
+    env.api.add(60)
+    env.sign_in()
+    env.daemon.tick()
+    env.clock.advance(31)
+    env.api.queue_event(MessageCounts=[{"LabelID": "0", "Unread": 1}])
+    real = env.api.call
+
+    def out_of_time(method, path, **kw):
+        if path == "/mail/v4/messages/count":
+            raise NetworkError("Proton did not respond in time")
+        return real(method, path, **kw)
+
+    env.api.call = out_of_time
+    env.daemon.tick()
+    state = env.states()[-1]
+    assert (state["status"], state["message"]) == ("offline", "Proton did not respond in time")
+    assert state["counts"]["24h"] == 1  # what was last seen, marked as not current
+    env.api.call = real
+    env.clock.advance(11)  # the first backoff
+    env.daemon.tick()
+    assert env.states()[-1]["status"] == "ok"

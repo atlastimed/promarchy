@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 
 from promarchy.api import ProtonError
@@ -20,6 +21,9 @@ class FakeProton:
         self.messages: list[dict] = []
         self.events: list[dict] = []
         self.calls: list[tuple[str, str, object, object]] = []
+        self.limits: list[float] = []  # every within() block opened
+        self.limited = 0  # how many are open now
+        self.unlimited: list[str] = []  # requests made outside one
         self.view_mode = 0
         self.session = None
         self.fail_with: ProtonError | None = None
@@ -73,6 +77,8 @@ class FakeProton:
 
     def call(self, method, path, *, params=None, body=None, auth=True, headers=None, _retry_auth=True):
         self.calls.append((method, path, params, body))
+        if not self.limited:
+            self.unlimited.append(f"{method} {path}")
         if self.fail_with is not None:
             raise self.fail_with
         if path == "/core/v4/events/latest":
@@ -111,12 +117,23 @@ class FakeProton:
 
     def fetch_bytes(self, path, *, params=None, max_bytes, timeout=None):
         self.calls.append(("GET", path, params, None))
+        if not self.limited:
+            self.unlimited.append(f"GET {path}")
         if self.logo_error is not None:
             raise self.logo_error
         return self.logo_status, "image/png", b"\x89PNG\r\n\x1a\n fake"
 
     def close(self) -> None:
         pass
+
+    @contextlib.contextmanager
+    def within(self, seconds):
+        self.limits.append(seconds)
+        self.limited += 1
+        try:
+            yield
+        finally:
+            self.limited -= 1
 
     # ------------------------------------------------------------- internals
 

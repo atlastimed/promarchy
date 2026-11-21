@@ -3,13 +3,15 @@
 The daemon lives as long as your desktop session, so it avoids heavier HTTP
 stacks: this keeps its resident memory at roughly a third of what
 ``requests`` costs. Connections are reused within a sync burst, responses
-are gzip-compressed on the wire, and every socket operation has a timeout.
+are gzip-compressed on the wire, and every request has a deadline for the
+whole of it, from connecting to the last byte of the reply.
 """
 
 from __future__ import annotations
 
 import base64
 import http.client
+import io
 import json as jsonlib
 import os
 import ssl
@@ -39,12 +41,101 @@ class Response:
         return jsonlib.loads(self.content)
 
 
+class _Deadline:
+    """When the request under way has to be over, on the monotonic clock."""
+
+    def __init__(self) -> None:
+        self.at = 0.0
+
+    def left(self) -> float:
+        left = self.at - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("request deadline passed")
+        return left
+
+
+class _TimedSocket:
+    """The connection's socket as http.client uses it: it sends, hands out a
+    reader for the reply, and closes.
+
+    Before every send and receive the socket's timeout is set to what is left
+    of the request. A timeout on its own restarts with each operation, so a
+    reply that keeps trickling in would never run into it; this way the
+    request as a whole has a deadline.
+    """
+
+    def __init__(self, sock: ssl.SSLSocket, deadline: _Deadline) -> None:
+        self._sock = sock
+        self._deadline = deadline
+
+    def sendall(self, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            self._sock.settimeout(self._deadline.left())
+            view = view[self._sock.send(view) :]
+
+    def makefile(self, mode: str = "rb") -> io.BufferedReader:
+        return io.BufferedReader(_Reader(self._sock, self._deadline))
+
+    def close(self) -> None:
+        self._sock.close()  # takes effect once no reader is left open
+
+
+class _Reader(io.RawIOBase):
+    """The socket's own reader, with the timeout set before each read.
+
+    http.client closes the connection before it hands out a reply that ends
+    it (`Connection: close`) and reads the body afterwards. The socket's
+    reader is what keeps the socket open until then, so reads go through it.
+    """
+
+    def __init__(self, sock: ssl.SSLSocket, deadline: _Deadline) -> None:
+        self._sock = sock
+        self._deadline = deadline
+        self._raw = sock.makefile("rb", buffering=0)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int | None:
+        self._sock.settimeout(self._deadline.left())
+        return self._raw.readinto(buffer)
+
+    def close(self) -> None:
+        self._raw.close()
+        super().close()
+
+
+class _Connection(http.client.HTTPSConnection):
+    """An HTTPS connection whose every request has to be over by `deadline`."""
+
+    def __init__(self, host: str, port: int, context: ssl.SSLContext, server_name: str) -> None:
+        super().__init__(host, port, context=context)
+        self.deadline = _Deadline()
+        self._tls = (context, server_name)
+
+    def connect(self) -> None:
+        # Reaching the server is http.client's own code. The name lookup is
+        # the system resolver's, each address it returns (Proton's name has
+        # one) may take the time left, and so may each read of a proxy's
+        # answer to CONNECT. If that overran, left() says so here; the TLS
+        # handshake and everything after it are held to the one deadline.
+        self.timeout = self.deadline.left()
+        http.client.HTTPConnection.connect(self)
+        self.sock.settimeout(self.deadline.left())
+        context, server_name = self._tls
+        self.sock = _TimedSocket(context.wrap_socket(self.sock, server_hostname=server_name), self.deadline)
+
+
 class HttpTransport:
+    """`timeout` is what one request may take in all: connecting, sending it,
+    and reading the whole reply."""
+
     def __init__(self, timeout: float = 20.0) -> None:
         self.timeout = timeout
         self.headers: dict[str, str] = {}
         self._context = ssl.create_default_context()
-        self._conn: http.client.HTTPSConnection | None = None
+        self._conn: _Connection | None = None
         self._origin: tuple[str, int] | None = None
         self._last_used = 0.0
 
@@ -76,18 +167,19 @@ class HttpTransport:
             merged["Content-Type"] = "application/json"
 
         origin = (parts.hostname, parts.port or 443)
-        reused = self._conn is not None and self._origin == origin
         attempts = 2 if method.upper() in IDEMPOTENT else 1
+        # One deadline for the request, a retry on a fresh connection included.
+        over_at = time.monotonic() + (float(timeout) if timeout else self.timeout)
         for attempt in range(attempts):
+            held = self._conn
             conn = self._connection(origin)
-            # Per request: a reused connection keeps whatever the last caller set.
-            limit = float(timeout) if timeout else self.timeout
-            conn.timeout = limit
-            if getattr(conn, "sock", None) is not None:
-                conn.sock.settimeout(limit)
+            reused = conn is held
+            conn.deadline.at = over_at
             try:
                 try:
                     conn.request(method, path, body=body, headers=merged)
+                except OSError:
+                    raise  # a refused certificate is a ValueError as well
                 except ValueError:
                     # http.client quotes the offending header (maybe a token).
                     raise TransportError("invalid request header") from None
@@ -110,12 +202,11 @@ class HttpTransport:
                 # A reused connection may have been dropped by the server
                 # while idle; one retry on a fresh connection is safe for GETs.
                 if reused and attempt + 1 < attempts:
-                    reused = False
                     continue
                 raise TransportError(_describe(exc)) from exc
         raise TransportError("request failed")  # pragma: no cover - loop always returns or raises
 
-    def _connection(self, origin: tuple[str, int]) -> http.client.HTTPSConnection:
+    def _connection(self, origin: tuple[str, int]) -> _Connection:
         stale = time.monotonic() - self._last_used > IDLE_REUSE_SECONDS
         if self._conn is not None and (self._origin != origin or stale):
             self.close()
@@ -123,13 +214,11 @@ class HttpTransport:
             host, port = origin
             proxy = _proxy_for(host)
             if proxy:
-                conn = http.client.HTTPSConnection(
-                    proxy[0], proxy[1], context=self._context, timeout=self.timeout
-                )
+                conn = _Connection(proxy[0], proxy[1], self._context, server_name=host)
                 # Credentials in the proxy URL go to the proxy only, on CONNECT.
                 conn.set_tunnel(host, port, headers=proxy[2] or None)
             else:
-                conn = http.client.HTTPSConnection(host, port, context=self._context, timeout=self.timeout)
+                conn = _Connection(host, port, self._context, server_name=host)
             self._conn = conn
             self._origin = origin
         return self._conn

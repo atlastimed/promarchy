@@ -35,6 +35,8 @@ Proton Mail in the [Omarchy](https://omarchy.org) bar: an unread count for the l
 
 The daemon signs in with its own Proton session, so there is no browser window to keep open and no scraping. It reads message **metadata** (sender, subject, time, flags), which Proton stores unencrypted. It never requests message bodies and contains no code to unlock keys or decrypt mail.
 
+It does everything on one loop, so nothing is allowed to hold that loop for long: a request to Proton has 20 seconds from connecting to the last byte of the reply, and all the requests for one account in one pass have 60 seconds between them. A connection that stalls or slows to a trickle shows as offline and is tried again later, instead of freezing the counts or keeping a sign-out waiting.
+
 ## Install
 
 Promarchy needs Proton's own SRP library for signing in (from Arch's official repos) and `secret-tool`, which Omarchy already ships:

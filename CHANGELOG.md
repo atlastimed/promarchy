@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 (2026-11-21)
+
+A fix from the marketplace's security review.
+
+- The 20-second timeout on a request to Proton applied to each read and write on its own, so a reply that kept arriving a little at a time never ran into it. The background process does everything on one loop, so such a reply could hold it far longer than 20 seconds: the counts went stale, and a sign-out or mark-as-read waited behind it. A request now has one deadline for the whole of it, from connecting to the last byte of the reply, and a retry on a fresh connection gets no extra time.
+- A sync is several requests, and each could still take almost its full 20 seconds. Everything done for one account in one turn of the loop (a sync and its logos, or marking mail read and the re-read after it) now has 60 seconds in all. When they run out, the account shows as offline with "Proton did not respond in time" and is retried with the usual backoff. A session renewal still gets a full request's time whatever is left, because one that is cut short may already have used up its single-use token.
+- A certificate Promarchy refuses (from a proxy that inspects TLS, say) is reported as a TLS error. It was refused before as well, but the message read "invalid request header".
+- A request that failed on a connection opened for it (the previous one having sat idle too long) is no longer repeated as if the server had dropped a kept-alive connection.
+
+Two waits are still not Promarchy's to cut short: looking up Proton's address is the system resolver's, and with an `http://` proxy each read of the proxy's answer to `CONNECT` has the request's remaining time to itself.
+
 ## 0.3.0 (2026-11-15)
 
 Checked against Omarchy 4.5. One message is now one notification, however many places could announce it.

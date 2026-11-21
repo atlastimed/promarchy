@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import urlsplit
 
 import pytest
+from fakes import FakeProton
 
+from promarchy import api
 from promarchy.api import (
     APP_VERSION,
+    TIMEOUT,
     AuthExpired,
     HumanVerificationRequired,
     NetworkError,
@@ -15,6 +19,7 @@ from promarchy.api import (
     Session,
     WrongCredentials,
 )
+from promarchy.transport import TransportError
 
 
 class Response:
@@ -169,3 +174,119 @@ def test_fetch_bytes_through_real_client():
     )
     assert (status, ctype, body) == (200, "image/png", b"\x89PNG")
     assert http.sent[0]["headers"]["Authorization"] == "Bearer old-access"
+
+
+# ------------------------------------------------ a time limit for a whole step
+
+
+class SlowHttp:
+    """Answers every request, each one taking `cost` seconds of a fake clock."""
+
+    def __init__(self, monkeypatch, cost, answer=None):
+        self.now = 5000.0
+        self.cost = cost
+        self.answer = answer or (lambda method, path, json: Response(200, {"Code": 1000}))
+        self.limits = []  # the timeout each request was given
+        self.paths = []
+        self.headers = {}
+        monkeypatch.setattr(api.time, "monotonic", lambda: self.now)
+
+    def request(self, method, url, params=None, json=None, headers=None, timeout=None, max_bytes=None):
+        self.limits.append(timeout)
+        self.paths.append(urlsplit(url).path)
+        assert timeout > 0
+        if self.cost > timeout:
+            self.now += timeout
+            raise TransportError("Proton did not respond in time")
+        self.now += self.cost
+        return self.answer(method, urlsplit(url).path, json)
+
+    def close(self):
+        pass
+
+
+def test_requests_in_a_step_share_its_time(monkeypatch):
+    http = SlowHttp(monkeypatch, cost=15)
+    client = ProtonClient(session(), http=http)
+    started = http.now
+    with client.within(40):
+        client.call("GET", "/a")
+        client.call("GET", "/b")
+        with pytest.raises(NetworkError, match="did not respond in time"):
+            client.call("GET", "/c")  # 10 s left, and it takes 15
+        with pytest.raises(NetworkError, match="did not respond in time"):
+            client.call("GET", "/d")  # nothing left: not even sent
+    assert http.limits == [TIMEOUT, TIMEOUT, 10]
+    assert http.now - started == 40
+    client.call("GET", "/e")  # the limit ends with its block
+    assert http.limits[-1] == TIMEOUT
+
+
+def test_a_step_never_lengthens_a_request_or_an_outer_step(monkeypatch):
+    http = SlowHttp(monkeypatch, cost=1)
+    client = ProtonClient(session(), http=http)
+    with client.within(600):
+        client.fetch_bytes("/logo", max_bytes=10, timeout=8)
+        with client.within(5):
+            client.call("GET", "/a")
+            with client.within(600):
+                client.call("GET", "/b")
+        client.call("GET", "/c")
+    assert http.limits == [8, 5, 4, TIMEOUT]
+
+
+def test_a_renewal_gets_a_full_request_whatever_the_step_has_left(monkeypatch):
+    """Cut short, it could still use up the single-use refresh token."""
+
+    def answer(method, path, json):
+        if path == "/auth/v4/refresh":
+            return Response(200, {"Code": 1000, "AccessToken": "new-access", "RefreshToken": "new-refresh"})
+        return Response(401, {"Code": 401}) if client.session.access_token == "old-access" else ok
+
+    ok = Response(200, {"Code": 1000})
+    http = SlowHttp(monkeypatch, cost=8, answer=answer)
+    saved = []
+    client = ProtonClient(session(), http=http, on_refresh=lambda s: saved.append(s.refresh_token))
+    with client.within(18), pytest.raises(NetworkError):
+        client.call("GET", "/core/v4/events/x")
+    # The 401 took 8 of the 18 seconds; the renewal still got a request's 20
+    # rather than the 10 that were left, and only the repeat of the request
+    # was held to what remained after it.
+    assert http.paths == ["/core/v4/events/x", "/auth/v4/refresh", "/core/v4/events/x"]
+    assert http.limits == [18, TIMEOUT, 2]
+    assert saved == ["new-refresh"]
+    assert client._over_at is None
+
+
+def test_a_sync_of_slow_answers_stops_at_the_step_limit(monkeypatch):
+    """Every answer arrives inside its own deadline, yet the sync as a whole
+    is cut off, and the next one starts over."""
+    from promarchy.mailbox import Mailbox
+
+    proton = FakeProton()
+    proton.add(60)
+
+    def answer(method, path, json):
+        params = http.params.pop(0)
+        return Response(200, proton.call(method, path, params=params, body=json))
+
+    class Http(SlowHttp):
+        params: list = []
+
+        def request(self, method, url, params=None, **kw):
+            self.params.append(params)
+            return super().request(method, url, params=params, **kw)
+
+    http = Http(monkeypatch, cost=TIMEOUT - 1, answer=answer)
+    client = ProtonClient(session(), http=http)
+    mailbox = Mailbox(client, "me@proton.me", clock=lambda: proton.now)
+    started = http.now
+    with client.within(60), pytest.raises(NetworkError):
+        mailbox.poll()
+    assert http.now - started == 60
+    assert not mailbox.synced and mailbox.dirty  # so nothing of it is shown
+
+    http.cost = 1
+    with client.within(60):
+        assert mailbox.poll() is True
+    assert mailbox.synced and len(mailbox.unread_times) == 1

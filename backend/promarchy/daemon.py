@@ -12,7 +12,9 @@ Protocol (one JSON object per line):
   sessions while it runs, so sign-outs and new sign-ins go through it.
 
 Between polls the process sleeps in a blocking queue read, so it costs
-nothing while idle.
+nothing while idle. Everything happens on that one loop, so the network time
+one account may take in one turn of it is limited (STEP_SECONDS): a slow
+server delays the other accounts and queued commands by no more than that.
 """
 
 from __future__ import annotations
@@ -48,6 +50,11 @@ from .store import SaveIndeterminate, SessionStore, StoreUnavailable, Superseded
 STAMP_CHECK_SECONDS = 5
 LOCK_WAIT_SECONDS = 15
 MAX_BACKOFF = 300
+# What one account may spend on the network in one turn of the loop (a sync
+# and its logos, or marking mail read and the re-read after it). A healthy
+# sync takes a few seconds. A session renewal is not held to it (see
+# ProtonClient.within), so one can add its own request's time.
+STEP_SECONDS = 60
 STORE_RETRY_MAX = 120
 AUTH_RECHECK_SECONDS = 120
 SHUTDOWN_GRACE = 10  # seconds a SIGTERM waits for the current step
@@ -348,7 +355,8 @@ class Daemon:
             # over whatever set next_poll (a command, a settings change).
             if account.next_poll <= now and now >= account.rate_limited_until:
                 try:
-                    self._poll(account)
+                    with account.client.within(STEP_SECONDS):
+                        self._poll(account)
                 except Exception as exc:  # a bug must not kill the bar's data source
                     log_error("polling", exc)
                     self._record_failure(account, ProtonError(f"Internal error: {exc.__class__.__name__}"))
@@ -640,8 +648,9 @@ class Daemon:
             self.emit()
             return
         try:
-            account.mailbox.mark_read([str(i) for i in ids if isinstance(i, str)], kind)
-            self._after_sync(account)
+            with account.client.within(STEP_SECONDS):
+                account.mailbox.mark_read([str(i) for i in ids if isinstance(i, str)], kind)
+                self._after_sync(account)
         except ProtonError as exc:
             self._record_failure(account, exc)
         except Exception as exc:
