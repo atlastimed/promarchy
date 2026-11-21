@@ -19,6 +19,12 @@ import pytest
 
 from promarchy.transport import HttpTransport, TransportError
 
+# A socket dropped without being closed fails the test that dropped it.
+pytestmark = [
+    pytest.mark.filterwarnings("error::ResourceWarning"),
+    pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning"),
+]
+
 BUDGET = 0.5  # seconds a request may take in these tests
 PROMPT = 3.0  # "gave up at the deadline", with room for a busy machine
 TRICKLE = 0.05  # seconds between a slow server's bytes: far below BUDGET
@@ -53,6 +59,7 @@ class Server:
         self.behave, self.tls = behave, tls
         self.connections = 0
         self.requests = []
+        self.clients = []
         self.stop = threading.Event()
         self.listener = socket.create_server(("127.0.0.1", 0))
         self.url = f"https://127.0.0.1:{self.listener.getsockname()[1]}/x"
@@ -68,9 +75,10 @@ class Server:
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
     def _serve(self, conn):
-        with contextlib.suppress(OSError), conn:
+        with contextlib.suppress(OSError), contextlib.ExitStack() as stack:
+            stack.enter_context(conn)
             if self.tls:
-                conn = self.context.wrap_socket(conn, server_side=True)
+                conn = stack.enter_context(self.context.wrap_socket(conn, server_side=True))
             self.behave(self, conn)
 
     def trickle(self, conn, data):
@@ -84,11 +92,14 @@ class Server:
     def client(self, timeout=BUDGET):
         transport = HttpTransport(timeout=timeout)
         transport._context = self.trust
+        self.clients.append(transport)
         return transport
 
     def close(self):
         self.stop.set()
         self.listener.close()
+        for transport in self.clients:
+            transport.close()
 
 
 @pytest.fixture(autouse=True)
@@ -273,3 +284,56 @@ def test_a_certificate_nobody_vouches_for_is_refused(serve):
     with pytest.raises(TransportError, match="TLS error"):
         HttpTransport(timeout=BUDGET).request("GET", server.url)  # the system's trust store
     assert server.requests == []
+
+
+# http.client closes the connection before it hands out a reply that ends the
+# connection; the body is read afterwards, through the reader it already has.
+
+
+def closes_after(head, body=b"{}"):
+    def behave(server, conn):
+        read_request(conn)
+        conn.sendall(head)
+        time.sleep(0.1)  # the body is not in the same packet as the headers
+        conn.sendall(body)
+        if b"Content-Length" in head:  # then it is the client's turn to hang up
+            conn.settimeout(PROMPT)
+            server.hung_up = conn.recv(1) == b""
+
+    return behave
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",  # the body ends where the connection does
+        b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n",
+    ],
+)
+def test_a_reply_that_ends_the_connection_is_still_read_in_full(serve, head):
+    server = serve(closes_after(head))
+    client = server.client()
+    assert client.request("GET", server.url).content == b"{}"
+    assert client.request("GET", server.url).content == b"{}"
+    assert server.connections == 2
+
+
+def test_the_socket_is_closed_once_such_a_reply_has_been_read(serve):
+    server = serve(closes_after(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\n"))
+    assert server.client().request("GET", server.url).content == b"{}"
+    deadline = time.monotonic() + PROMPT
+    while not hasattr(server, "hung_up") and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.hung_up is True
+
+
+def test_a_trickling_reply_that_ends_the_connection_ends_at_the_deadline(serve):
+    def behave(server, conn):
+        read_request(conn)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+        server.trickle(conn, b"x" * 100000)
+
+    server = serve(behave)
+    took = timed_out(server.client(), server.url)
+    assert BUDGET * 0.9 <= took < PROMPT

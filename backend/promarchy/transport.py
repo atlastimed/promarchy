@@ -74,26 +74,36 @@ class _TimedSocket:
             self._sock.settimeout(self._deadline.left())
             view = view[self._sock.send(view) :]
 
-    def recv_into(self, buffer: Any) -> int:
-        self._sock.settimeout(self._deadline.left())
-        return self._sock.recv_into(buffer)
-
     def makefile(self, mode: str = "rb") -> io.BufferedReader:
-        return io.BufferedReader(_Reader(self))
+        return io.BufferedReader(_Reader(self._sock, self._deadline))
 
     def close(self) -> None:
-        self._sock.close()
+        self._sock.close()  # takes effect once no reader is left open
 
 
 class _Reader(io.RawIOBase):
-    def __init__(self, sock: _TimedSocket) -> None:
+    """The socket's own reader, with the timeout set before each read.
+
+    http.client closes the connection before it hands out a reply that ends
+    it (`Connection: close`) and reads the body afterwards. The socket's
+    reader is what keeps the socket open until then, so reads go through it.
+    """
+
+    def __init__(self, sock: ssl.SSLSocket, deadline: _Deadline) -> None:
         self._sock = sock
+        self._deadline = deadline
+        self._raw = sock.makefile("rb", buffering=0)
 
     def readable(self) -> bool:
         return True
 
-    def readinto(self, buffer: Any) -> int:
-        return self._sock.recv_into(buffer)
+    def readinto(self, buffer: Any) -> int | None:
+        self._sock.settimeout(self._deadline.left())
+        return self._raw.readinto(buffer)
+
+    def close(self) -> None:
+        self._raw.close()
+        super().close()
 
 
 class _Connection(http.client.HTTPSConnection):
