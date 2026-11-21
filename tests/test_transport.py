@@ -9,7 +9,7 @@ import pytest
 from promarchy import transport
 from promarchy.transport import HttpTransport, TransportError
 
-REAL_HTTPS_CONNECTION = http.client.HTTPSConnection
+REAL_CONNECTION = transport._Connection
 
 
 class FakeResponse:
@@ -36,8 +36,10 @@ class FakeConnection:
     instances: list[FakeConnection] = []
     script: list = []
 
-    def __init__(self, host, port, context=None, timeout=None):
-        self.host, self.port, self.timeout = host, port, timeout
+    def __init__(self, host, port, context=None, server_name=None):
+        self.host, self.port, self.server_name = host, port, server_name
+        self.deadline = transport._Deadline()
+        self.deadlines = []  # what each request was given
         self.sent = []
         self.closed = False
         self.tunnel = None
@@ -49,7 +51,10 @@ class FakeConnection:
 
     def request(self, method, path, body=None, headers=None):
         self.sent.append((method, path, body, headers))
+        self.deadlines.append(self.deadline.at)
         item = FakeConnection.script.pop(0)
+        if callable(item):
+            item = item()
         if isinstance(item, Exception):
             raise item
         self._next = item
@@ -65,7 +70,7 @@ class FakeConnection:
 def fake_connections(monkeypatch):
     FakeConnection.instances = []
     FakeConnection.script = []
-    monkeypatch.setattr(http.client, "HTTPSConnection", FakeConnection)
+    monkeypatch.setattr(transport, "_Connection", FakeConnection)
     # An inherited proxy setting (lowercase wins) must never steer these tests.
     for name in ("https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
         monkeypatch.delenv(name, raising=False)
@@ -90,7 +95,6 @@ def test_encodes_query_json_and_decodes_gzip():
     assert headers["Content-Type"] == "application/json"
     assert headers["x-pm-appversion"] == "Other"
     assert headers["Accept-Encoding"] == "gzip"
-    assert FakeConnection.instances[0].timeout == 20.0
 
 
 def test_connection_is_reused_within_a_burst():
@@ -147,6 +151,7 @@ def test_https_proxy_is_tunnelled(monkeypatch):
     HttpTransport().request("GET", "https://mail-api.proton.me/a")
     conn = FakeConnection.instances[0]
     assert (conn.host, conn.port, conn.tunnel) == ("proxy.lan", 3128, ("mail-api.proton.me", 443))
+    assert conn.server_name == "mail-api.proton.me"  # TLS is with Proton, not the proxy
 
 
 def test_proxy_credentials_go_to_the_proxy_only(monkeypatch):
@@ -192,7 +197,7 @@ def test_an_https_proxy_url_never_puts_credentials_on_the_wire(monkeypatch):
     """Real sockets: a loopback listener posing as the proxy must receive nothing."""
     import socket as socketlib
 
-    monkeypatch.setattr(http.client, "HTTPSConnection", REAL_HTTPS_CONNECTION)
+    monkeypatch.setattr(transport, "_Connection", REAL_CONNECTION)
     with socketlib.socket(socketlib.AF_INET, socketlib.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
@@ -205,11 +210,63 @@ def test_an_https_proxy_url_never_puts_credentials_on_the_wire(monkeypatch):
             listener.accept()
 
 
-def test_each_request_gets_its_own_timeout():
-    """A reused connection must not keep the previous caller's timeout."""
+def test_each_request_gets_its_own_deadline(monkeypatch):
+    """A reused connection must not keep the previous caller's deadline."""
+    clock = [1000.0]
+    monkeypatch.setattr(transport.time, "monotonic", lambda: clock[0])
     FakeConnection.script = [FakeResponse(), FakeResponse()]
     t = HttpTransport(timeout=20)
     t.request("GET", "https://mail-api.proton.me/a", timeout=8)
-    assert FakeConnection.instances[0].timeout == 8
+    clock[0] += 5
     t.request("GET", "https://mail-api.proton.me/b")
-    assert len(FakeConnection.instances) == 1 and FakeConnection.instances[0].timeout == 20
+    assert len(FakeConnection.instances) == 1
+    assert FakeConnection.instances[0].deadlines == [1008.0, 1025.0]
+
+
+def test_a_retry_gets_no_extra_time(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(transport.time, "monotonic", lambda: clock[0])
+
+    def dropped_after_a_while():
+        clock[0] += 3
+        return http.client.RemoteDisconnected("bye")
+
+    FakeConnection.script = [FakeResponse(), dropped_after_a_while, FakeResponse()]
+    t = HttpTransport(timeout=20)
+    t.request("GET", "https://mail-api.proton.me/a")
+    assert t.request("GET", "https://mail-api.proton.me/b").status_code == 200
+    first, second = FakeConnection.instances
+    # The three seconds the first attempt lost are not given back.
+    assert first.deadlines == [1020.0, 1020.0] and second.deadlines == [1020.0]
+
+
+def test_only_a_connection_that_was_reused_earns_a_retry(monkeypatch):
+    """An idle connection is replaced before the request: its failure is the
+    new connection's own, not a keep-alive the server dropped."""
+    clock = [1000.0]
+    monkeypatch.setattr(transport.time, "monotonic", lambda: clock[0])
+    FakeConnection.script = [FakeResponse(), http.client.RemoteDisconnected("bye"), FakeResponse()]
+    t = HttpTransport()
+    t.request("GET", "https://mail-api.proton.me/a")
+    clock[0] += transport.IDLE_REUSE_SECONDS + 1
+    with pytest.raises(TransportError):
+        t.request("GET", "https://mail-api.proton.me/b")
+    assert len(FakeConnection.script) == 1  # the third answer was never asked for
+
+
+def test_a_passed_deadline_stops_before_anything_is_sent():
+    deadline = transport._Deadline()
+    deadline.at = transport.time.monotonic() - 1
+    sent = []
+
+    class Sock:
+        def settimeout(self, value):
+            raise AssertionError("no time left to set")
+
+        def send(self, data):
+            sent.append(bytes(data))
+            return len(data)
+
+    with pytest.raises(TimeoutError):
+        transport._TimedSocket(Sock(), deadline).sendall(b"secret")
+    assert sent == []

@@ -7,9 +7,10 @@ ever downloaded or decrypted.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -25,7 +26,7 @@ API_BASE = "https://mail-api.proton.me"
 APP_VERSION = "Other"
 USER_AGENT = f"Promarchy/{__version__} (Linux; Omarchy)"
 
-TIMEOUT = 20  # seconds per socket operation; the daemon must never hang.
+TIMEOUT = 20  # seconds for one request, from connecting to the last byte of the reply
 
 CODE_OK = (1000, 1001)
 CODE_WRONG_CREDENTIALS = 8002
@@ -151,6 +152,7 @@ class ProtonClient:
         self.session = session
         self.base = base.rstrip("/")
         self._on_refresh = on_refresh
+        self._over_at: float | None = None  # see within()
         self._http = http or HttpTransport(timeout=TIMEOUT)
         self._http.headers.update(
             {
@@ -162,6 +164,24 @@ class ProtonClient:
 
     def close(self) -> None:
         self._http.close()
+
+    @contextlib.contextmanager
+    def within(self, seconds: float) -> Iterator[None]:
+        """Give the requests made inside the block `seconds` between them.
+
+        One request has its own deadline (TIMEOUT), but a sync is many
+        requests, and a server that answers each one just in time would hold
+        the caller for all of them. Inside the block a request gets what is
+        left of the shared time, and none is sent once it is used up
+        (NetworkError). The exception is a session renewal, see _renew().
+        """
+        outer = self._over_at
+        mine = time.monotonic() + seconds
+        self._over_at = mine if outer is None else min(outer, mine)
+        try:
+            yield
+        finally:
+            self._over_at = outer
 
     # ------------------------------------------------------------------ core
 
@@ -214,31 +234,38 @@ class ProtonClient:
             "GrantType": "refresh_token",
             "RedirectURI": "https://protonmail.ch",
         }
-        for attempt in range(2):
-            try:
-                payload = self.call(
-                    "POST",
-                    "/auth/v4/refresh",
-                    body=body,
-                    auth=False,
-                    headers={"x-pm-uid": session.uid},
-                    _retry_auth=False,
-                )
-                break
-            except RateLimited as exc:
-                exc.during_refresh = True
-                raise
-            except NetworkError:
-                raise
-            except ProtonError as exc:
-                # 409: the refresh raced another one server-side; retry once.
-                if exc.status == 409 and attempt == 0:
-                    continue
-                # Any refusal of the refresh token itself (including code
-                # 8002, whatever the HTTP status) means the session is over.
-                if exc.status in (400, 401, 403, 422) or isinstance(exc, WrongCredentials):
-                    raise AuthExpired("Your Proton session expired. Sign in again.") from exc
-                raise
+        # Proton may act on a renewal we stopped waiting for, and that uses up
+        # the single-use refresh token: a renewal always gets a request's full
+        # time, never the remainder of a step's (see within()).
+        over_at, self._over_at = self._over_at, None
+        try:
+            for attempt in range(2):
+                try:
+                    payload = self.call(
+                        "POST",
+                        "/auth/v4/refresh",
+                        body=body,
+                        auth=False,
+                        headers={"x-pm-uid": session.uid},
+                        _retry_auth=False,
+                    )
+                    break
+                except RateLimited as exc:
+                    exc.during_refresh = True
+                    raise
+                except NetworkError:
+                    raise
+                except ProtonError as exc:
+                    # 409: the refresh raced another one server-side; retry once.
+                    if exc.status == 409 and attempt == 0:
+                        continue
+                    # Any refusal of the refresh token itself (including code
+                    # 8002, whatever the HTTP status) means the session is over.
+                    if exc.status in (400, 401, 403, 422) or isinstance(exc, WrongCredentials):
+                        raise AuthExpired("Your Proton session expired. Sign in again.") from exc
+                    raise
+        finally:
+            self._over_at = over_at
         try:
             access, refresh = checked_token(payload["AccessToken"]), checked_token(payload["RefreshToken"])
         except (KeyError, ValueError) as exc:
@@ -258,6 +285,11 @@ class ProtonClient:
             request_headers["Authorization"] = f"Bearer {self.session.access_token}"
         if headers:
             request_headers.update(headers)
+        limit = float(timeout or TIMEOUT)
+        if self._over_at is not None:
+            limit = min(limit, self._over_at - time.monotonic())
+            if limit <= 0:
+                raise NetworkError("Proton did not respond in time")
         try:
             extra = {"max_bytes": max_bytes} if max_bytes else {}
             return self._http.request(
@@ -266,7 +298,7 @@ class ProtonClient:
                 params=params,
                 json=body,
                 headers=request_headers,
-                timeout=timeout or TIMEOUT,
+                timeout=limit,
                 **extra,
             )
         except (TransportError, OSError) as exc:

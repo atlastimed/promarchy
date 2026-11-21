@@ -12,7 +12,6 @@ import stat
 import pytest
 from fakes import NOW, Clock, FakeProton, MemorySecrets
 from test_daemon import RecordingNotifier
-from test_transport import FakeConnection
 
 from promarchy import cli, transport
 from promarchy.api import AuthExpired, NetworkError, ProtonClient, RateLimited, Session, checked_token
@@ -91,16 +90,13 @@ def test_corrupted_keyring_value_is_treated_as_missing(tmp_path):
     assert store.load("me@proton.me") is None
 
 
-def test_bad_header_error_does_not_quote_the_header(monkeypatch):
-    FakeConnection.instances, FakeConnection.script = [], []
-    monkeypatch.setattr(http.client, "HTTPSConnection", FakeConnection)
-
-    def reject(self, method, path, body=None, headers=None):
-        raise ValueError(f"Invalid header value {headers['Authorization']!r}")
-
-    monkeypatch.setattr(FakeConnection, "request", reject)
+def test_bad_header_error_does_not_quote_the_header():
+    """http.client refuses such a header before it connects, quoting it in full."""
+    bad = SECRET + "\nInjected: 1"
+    with pytest.raises(ValueError, match=SECRET):
+        http.client.HTTPSConnection("mail-api.proton.me").request("GET", "/x", headers={"Authorization": bad})
     with pytest.raises(TransportError) as err:
-        HttpTransport().request("GET", "https://mail-api.proton.me/x", headers={"Authorization": SECRET})
+        HttpTransport().request("GET", "https://mail-api.proton.me/x", headers={"Authorization": bad})
     assert SECRET not in str(err.value) and err.value.__cause__ is None
 
 
